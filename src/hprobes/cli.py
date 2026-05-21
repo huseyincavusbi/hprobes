@@ -201,6 +201,192 @@ def _print_score(results):
     print(f"  Balanced acc:    {_fmt(results['balanced_accuracy'])}")
 
 
+def _extract_answer_letter(text: str, options: dict) -> str | None:
+    """Extract the answer letter (A/B/C/D...) from generated text."""
+    import re
+
+    text_clean = text.strip()
+    valid_letters = list(options.keys())
+
+    for letter in valid_letters:
+        if text_clean.startswith(letter) or text_clean.startswith(letter.lower()):
+            if len(text_clean) > len(letter):
+                next_char = text_clean[len(letter)]
+                if next_char in (")", ".", ",", " ", ":", "-"):
+                    return letter
+
+    patterns = [
+        r"(?:the\s+)?(?:correct\s+)?(?:answer|choice|option)\s+(?:is\s+)?([A-Z])\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text_clean, re.IGNORECASE)
+        if m and m.group(1) in valid_letters:
+            return m.group(1)
+
+    words = re.findall(r'\b([A-Z])\b', text_clean.upper())
+    for w in reversed(words):
+        if w in valid_letters:
+            return w
+
+    return None
+
+
+def _build_prompt(sample: dict, options_key: str, mode: str = "mcq") -> str:
+    """Build a text prompt. MCQ: question + options. Open: question only."""
+    question = sample.get("question", "")
+    if mode == "mcq":
+        options = sample.get(options_key, {})
+        opt_lines = [f"{k}) {v}" for k, v in options.items()]
+        return question + "\n" + "\n".join(opt_lines) + "\nAnswer:"
+    else:
+        return question.strip() + "\n\nAnswer:"
+
+
+def _judge_open_ended(response: str, ground_truth) -> bool:
+    """Judge if response contains the ground truth answer (open-ended).
+
+    ground_truth can be a string or list of acceptable answers.
+    """
+    if isinstance(ground_truth, str):
+        candidates = [ground_truth]
+    elif isinstance(ground_truth, list):
+        candidates = ground_truth
+    elif isinstance(ground_truth, dict):
+        candidates = ground_truth.get("aliases", []) + [ground_truth.get("value", "")]
+    else:
+        candidates = [str(ground_truth)]
+
+    response_lower = response.strip().lower()
+    for candidate in candidates:
+        c = str(candidate).strip().lower()
+        if c and c in response_lower:
+            return True
+    return False
+
+
+def _parse_bioasq_answer(text: str) -> str:
+    """Extract answer from BioASQ text field (<answer>...</answer>)."""
+    import re
+    m = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _filter_consistent(
+    samples: list,
+    model,
+    tokenizer,
+    options_key: str,
+    answer_key: str,
+    num_samples: int = 10,
+    seed: int = 42,
+    mode: str = "mcq",
+    max_new_tokens: int = 20,
+    open_answer_key: str = "answer",
+) -> list:
+    """Consistency filter: keep only questions where model is 100% consistent.
+
+    mode='mcq': extract answer letter, compare to answer_idx. Expects options dict.
+    mode='open': open-ended text matching judge. Uses open_answer_key for ground truth.
+
+    Returns balanced list with _response and _judge fields.
+    """
+    import random as _random
+    from tqdm import tqdm
+
+    import torch
+
+    _random.seed(seed)
+    torch.manual_seed(seed)
+
+    faithful = []
+    hallucinatory = []
+
+    for sample in tqdm(samples, desc="Consistency filtering"):
+        if mode == "mcq":
+            ground_truth = sample.get(answer_key, "")
+            options = sample.get(options_key, {})
+            if not ground_truth or not options:
+                continue
+            valid_letters = list(options.keys())
+            if ground_truth not in valid_letters:
+                continue
+            prompt = _build_prompt(sample, options_key, "mcq")
+        else:
+            gt = sample.get(open_answer_key)
+            if gt is None:
+                gt = sample.get(answer_key)
+            if gt is None:
+                continue
+            if isinstance(gt, dict) and "text" in gt:
+                gt_val = _parse_bioasq_answer(gt.get("text", "")) or gt.get("value", "")
+                gt = gt_val if gt_val else gt
+            if isinstance(gt, dict) and "value" in gt:
+                gt_aliases = gt.get("aliases", [])
+                gt = [gt["value"]] + (list(gt_aliases) if gt_aliases else [])
+            if not gt or (isinstance(gt, str) and not gt.strip()):
+                continue
+            prompt = _build_prompt(sample, options_key, "open")
+
+        try:
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=1.0,
+                    top_p=0.9,
+                    top_k=50,
+                    num_return_sequences=num_samples,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            responses = [
+                tokenizer.decode(
+                    outputs[i][inputs["input_ids"].shape[1]:],
+                    skip_special_tokens=True,
+                ).strip()
+                for i in range(num_samples)
+            ]
+        except Exception as e:
+            print(f"  Generation failed: {e}")
+            continue
+
+        judges = []
+        for resp in responses:
+            if mode == "mcq":
+                letter = _extract_answer_letter(resp, sample[options_key])
+                judges.append("true" if letter == ground_truth else "false")
+            else:
+                judges.append("true" if _judge_open_ended(resp, gt) else "false")
+
+        true_count = judges.count("true")
+
+        if true_count == num_samples:
+            sample_copy = dict(sample)
+            sample_copy["_response"] = responses[0]
+            sample_copy["_judge"] = "true"
+            faithful.append(sample_copy)
+        elif true_count == 0:
+            sample_copy = dict(sample)
+            sample_copy["_response"] = responses[0]
+            sample_copy["_judge"] = "false"
+            hallucinatory.append(sample_copy)
+
+    n = min(len(faithful), len(hallucinatory))
+    if n == 0:
+        print(f"  Warning: No consistent samples "
+              f"(faithful={len(faithful)}, hallucinatory={len(hallucinatory)})")
+        return []
+
+    _random.shuffle(faithful)
+    _random.shuffle(hallucinatory)
+    balanced = faithful[:n] + hallucinatory[:n]
+    _random.shuffle(balanced)
+
+    print(f"  Balanced: {n} faithful + {n} hallucinatory = {len(balanced)} total")
+    return balanced
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     from hprobes import HProbes, __version__
 
@@ -229,6 +415,25 @@ def cmd_run(args: argparse.Namespace) -> None:
     tokenizer, model = _load_model(args)
     print(" done")
 
+    if args.consistency:
+        consistency_mode = args.consistency_mode
+        if consistency_mode == "auto":
+            has_options = any(s.get(options_key) for s in samples[:5])
+            consistency_mode = "mcq" if has_options else "open"
+            print(f"  Mode:        consistency ({consistency_mode})")
+        else:
+            print(f"  Mode:        consistency ({consistency_mode})")
+
+        max_tokens = args.max_new_tokens_consistency or (20 if consistency_mode == "mcq" else 100)
+        open_answer = options_key if consistency_mode == "mcq" else answer_key
+        samples = _filter_consistent(
+            samples, model, tokenizer, options_key, answer_key,
+            num_samples=args.consistency_samples, seed=args.seed,
+            mode=consistency_mode, max_new_tokens=max_tokens,
+            open_answer_key=open_answer,
+        )
+        print(f"  Consistent:  {len(samples)} samples after filtering")
+
     alphas = [float(a) for a in args.alphas.split(",")] if args.alphas else None
 
     print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
@@ -243,7 +448,16 @@ def cmd_run(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         top_k=args.top_k,
     )
-    probe.fit(samples, options_key=options_key, answer_key=answer_key)
+    if args.consistency:
+        probe.fit_from_responses(
+            samples,
+            question_key="question",
+            response_key="_response",
+            label_key="_judge",
+            answer_tokens_key="__none__",  # no explicit answer tokens
+        )
+    else:
+        probe.fit(samples, options_key=options_key, answer_key=answer_key)
     probe.model_id = args.model
     probe.dataset_name = Path(args.data).name
     probe.n_samples_used = len(samples)
@@ -560,6 +774,34 @@ def main() -> None:
     )
     _add_common_model_args(run_p)
     _add_common_probe_args(run_p)
+    run_p.add_argument(
+        "--consistency",
+        action="store_true",
+        help="Enable consistency filtering: generate N responses per question "
+        "(temp=1.0), keep only questions where model is 100%% consistent "
+        "(all correct or all wrong), balanced sample. Default N=10.",
+    )
+    run_p.add_argument(
+        "--consistency-samples",
+        type=int,
+        default=10,
+        dest="consistency_samples",
+        help="Number of responses to generate per question for consistency check (default: 10)",
+    )
+    run_p.add_argument(
+        "--consistency-mode",
+        choices=["auto", "mcq", "open"],
+        default="auto",
+        dest="consistency_mode",
+        help="Consistency judging mode: auto (detect from dataset), mcq (letter extraction), open (text matching). Default: auto.",
+    )
+    run_p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        dest="max_new_tokens_consistency",
+        help="Max new tokens for consistency generation (default: 20 for mcq, 100 for open)",
+    )
 
     # ── hprobes responses ──────────────────────────────────────────────────────
     resp_p = subparsers.add_parser(
