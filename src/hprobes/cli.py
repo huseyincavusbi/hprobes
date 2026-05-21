@@ -223,7 +223,7 @@ def _extract_answer_letter(text: str, options: dict) -> str | None:
         if m and m.group(1) in valid_letters:
             return m.group(1)
 
-    words = re.findall(r'\b([A-Z])\b', text_clean.upper())
+    words = re.findall(r"\b([A-Z])\b", text_clean.upper())
     for w in reversed(words):
         if w in valid_letters:
             return w
@@ -267,6 +267,7 @@ def _judge_open_ended(response: str, ground_truth) -> bool:
 def _parse_bioasq_answer(text: str) -> str:
     """Extract answer from BioASQ text field (<answer>...</answer>)."""
     import re
+
     m = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
     return m.group(1).strip() if m else ""
 
@@ -342,7 +343,7 @@ def _filter_consistent(
                 )
             responses = [
                 tokenizer.decode(
-                    outputs[i][inputs["input_ids"].shape[1]:],
+                    outputs[i][inputs["input_ids"].shape[1] :],
                     skip_special_tokens=True,
                 ).strip()
                 for i in range(num_samples)
@@ -374,8 +375,10 @@ def _filter_consistent(
 
     n = min(len(faithful), len(hallucinatory))
     if n == 0:
-        print(f"  Warning: No consistent samples "
-              f"(faithful={len(faithful)}, hallucinatory={len(hallucinatory)})")
+        print(
+            f"  Warning: No consistent samples "
+            f"(faithful={len(faithful)}, hallucinatory={len(hallucinatory)})"
+        )
         return []
 
     _random.shuffle(faithful)
@@ -427,9 +430,15 @@ def cmd_run(args: argparse.Namespace) -> None:
         max_tokens = args.max_new_tokens_consistency or (20 if consistency_mode == "mcq" else 100)
         open_answer = options_key if consistency_mode == "mcq" else answer_key
         samples = _filter_consistent(
-            samples, model, tokenizer, options_key, answer_key,
-            num_samples=args.consistency_samples, seed=args.seed,
-            mode=consistency_mode, max_new_tokens=max_tokens,
+            samples,
+            model,
+            tokenizer,
+            options_key,
+            answer_key,
+            num_samples=args.consistency_samples,
+            seed=args.seed,
+            mode=consistency_mode,
+            max_new_tokens=max_tokens,
             open_answer_key=open_answer,
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
