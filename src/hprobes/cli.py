@@ -454,7 +454,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             question_key="question",
             response_key="_response",
             label_key="_judge",
-            answer_tokens_key="__none__",  # no explicit answer tokens
+            answer_tokens_key="__none__",
         )
     else:
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
@@ -469,17 +469,20 @@ def cmd_run(args: argparse.Namespace) -> None:
     print("\n  Scoring...")
     _print_score(probe.score())
 
-    print("\n  Causal validation (alpha → accuracy):")
-    cv = probe.causal_validate(alphas=alphas)
-    for alpha, acc in sorted(cv.items()):
-        tag = ""
-        if alpha == 0.0:
-            tag = "  ← full suppression"
-        elif alpha == 1.0:
-            tag = "  ← baseline"
-        elif alpha == 2.0:
-            tag = "  ← amplification"
-        print(f"    {alpha:.1f} → {acc:.3f}{tag}")
+    if args.consistency:
+        print("\n  Causal validation skipped (open-ended; use behavioral benchmarks)")
+    else:
+        print("\n  Causal validation (alpha → accuracy):")
+        cv = probe.causal_validate(alphas=alphas)
+        for alpha, acc in sorted(cv.items()):
+            tag = ""
+            if alpha == 0.0:
+                tag = "  ← full suppression"
+            elif alpha == 1.0:
+                tag = "  ← baseline"
+            elif alpha == 2.0:
+                tag = "  ← amplification"
+            print(f"    {alpha:.1f} → {acc:.3f}{tag}")
 
     out_path = args.output or _default_output_path(args.model, args.data)
     saved = probe.save(out_path)
