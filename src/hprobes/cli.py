@@ -265,10 +265,10 @@ def _judge_open_ended(response: str, ground_truth) -> bool:
 
 
 def _parse_bioasq_answer(text: str) -> str:
-    """Extract answer from BioASQ text field (<answer>...</answer>)."""
+    """Extract answer from BioASQ text field (<answer>...<context> or <answer>...</answer>)."""
     import re
 
-    m = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.DOTALL)
+    m = re.search(r"<answer>\s*(.*?)\s*(?:</answer>|<context>|$)", text, re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
@@ -283,6 +283,7 @@ def _filter_consistent(
     mode: str = "mcq",
     max_new_tokens: int = 20,
     open_answer_key: str = "answer",
+    batch_size: int = 1,
 ) -> list:
     """Consistency filter: keep only questions where model is 100% consistent.
 
@@ -299,10 +300,15 @@ def _filter_consistent(
     _random.seed(seed)
     torch.manual_seed(seed)
 
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+
     faithful = []
     hallucinatory = []
+    valid = []
 
-    for sample in tqdm(samples, desc="Consistency filtering"):
+    for sample in samples:
         if mode == "mcq":
             ground_truth = sample.get(answer_key, "")
             options = sample.get(options_key, {})
@@ -317,7 +323,11 @@ def _filter_consistent(
             if gt is None:
                 gt = sample.get(answer_key)
             if gt is None:
-                continue
+                raw_text = sample.get("text", "")
+                if raw_text:
+                    gt = {"text": raw_text}
+                else:
+                    continue
             if isinstance(gt, dict) and "text" in gt:
                 gt_val = _parse_bioasq_answer(gt.get("text", "")) or gt.get("value", "")
                 gt = gt_val if gt_val else gt
@@ -328,8 +338,17 @@ def _filter_consistent(
                 continue
             prompt = _build_prompt(sample, options_key, "open")
 
+        valid.append((sample, prompt, gt))
+
+    gen_batch = max(1, batch_size)
+
+    for batch_start in tqdm(range(0, len(valid), gen_batch), desc="Consistency filtering"):
+        batch = valid[batch_start : batch_start + gen_batch]
+        prompts = [item[1] for item in batch]
+
         try:
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+            input_len = inputs["input_ids"].shape[1]
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
@@ -341,37 +360,40 @@ def _filter_consistent(
                     num_return_sequences=num_samples,
                     pad_token_id=tokenizer.eos_token_id,
                 )
-            responses = [
-                tokenizer.decode(
-                    outputs[i][inputs["input_ids"].shape[1] :],
-                    skip_special_tokens=True,
-                ).strip()
-                for i in range(num_samples)
-            ]
+
+            for i, (sample, _prompt, gt) in enumerate(batch):
+                responses = []
+                for j in range(num_samples):
+                    idx = i * num_samples + j
+                    resp = tokenizer.decode(
+                        outputs[idx][input_len:],
+                        skip_special_tokens=True,
+                    ).strip()
+                    responses.append(resp)
+
+                judges = []
+                for resp in responses:
+                    if mode == "mcq":
+                        letter = _extract_answer_letter(resp, sample[options_key])
+                        judges.append("true" if letter == gt else "false")
+                    else:
+                        judges.append("true" if _judge_open_ended(resp, gt) else "false")
+
+                true_count = judges.count("true")
+                if true_count == num_samples:
+                    sample_copy = dict(sample)
+                    sample_copy["_response"] = responses[0]
+                    sample_copy["_judge"] = "true"
+                    faithful.append(sample_copy)
+                elif true_count == 0:
+                    sample_copy = dict(sample)
+                    sample_copy["_response"] = responses[0]
+                    sample_copy["_judge"] = "false"
+                    hallucinatory.append(sample_copy)
+
         except Exception as e:
             print(f"  Generation failed: {e}")
             continue
-
-        judges = []
-        for resp in responses:
-            if mode == "mcq":
-                letter = _extract_answer_letter(resp, sample[options_key])
-                judges.append("true" if letter == ground_truth else "false")
-            else:
-                judges.append("true" if _judge_open_ended(resp, gt) else "false")
-
-        true_count = judges.count("true")
-
-        if true_count == num_samples:
-            sample_copy = dict(sample)
-            sample_copy["_response"] = responses[0]
-            sample_copy["_judge"] = "true"
-            faithful.append(sample_copy)
-        elif true_count == 0:
-            sample_copy = dict(sample)
-            sample_copy["_response"] = responses[0]
-            sample_copy["_judge"] = "false"
-            hallucinatory.append(sample_copy)
 
     n = min(len(faithful), len(hallucinatory))
     if n == 0:
@@ -440,6 +462,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             mode=consistency_mode,
             max_new_tokens=max_tokens,
             open_answer_key=open_answer,
+            batch_size=args.batch_size,
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
@@ -738,7 +761,7 @@ def _add_common_probe_args(p):
         type=int,
         default=1,
         dest="batch_size",
-        help="Batch size for CETT extraction (default: 1). Use 8-16 on GPU.",
+        help="Batch size for generation and CETT extraction (default: 1). Use 4-8 on GPU for speedup.",
     )
 
 
