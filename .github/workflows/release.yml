@@ -18,6 +18,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
 
       - name: Display system information
         run: |
@@ -38,8 +40,25 @@ jobs:
         run: uv publish
         # Uses OIDC trusted publishing — no token needed if configured on PyPI
 
+      - name: Generate changelog
+        run: |
+          CURRENT_TAG=$(git describe --tags --abbrev=0 HEAD)
+          PREVIOUS_TAG=$(git tag --sort=-v:refname | grep -A1 "$CURRENT_TAG" | tail -1)
+          {
+            if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "$CURRENT_TAG" ]; then
+              echo "## Changelog"
+            else
+              echo "## Changelog (${PREVIOUS_TAG}...${CURRENT_TAG})"
+            fi
+            echo ""
+            git log "${PREVIOUS_TAG:-$(git rev-list --max-parents=0 HEAD)}..HEAD" \
+              --no-merges --format="- %s (%h)"
+          } > RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
-          generate_release_notes: true
-          files: dist/*
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
