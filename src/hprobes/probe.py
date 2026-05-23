@@ -1186,6 +1186,8 @@ class HProbes:
             "random_baseline_auroc": rand_auroc,
             "auroc_gap": gap,
             "n_samples": len(X),
+            "y_true": y_arr.tolist(),
+            "y_score": scores.tolist() if auroc is not None else None,
         }
         self.score_results_ = result
         return result
