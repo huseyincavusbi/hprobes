@@ -83,6 +83,25 @@ def _default_output_path(model: str, dataset_path: str) -> str:
     return f"{model_safe}_{dataset_name}_{ts}"
 
 
+class _Tee:
+    """Duplicate writes to stdout and a log file."""
+
+    def __init__(self, log_path: str):
+        self.stdout = sys.stdout
+        self.log = open(log_path, "w", buffering=1)
+
+    def write(self, data):
+        self.stdout.write(data)
+        self.log.write(data)
+
+    def flush(self):
+        self.stdout.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+
+
 _MCQ_LETTERS = "ABCDEFGHIJ"
 
 _NUDGE_TEMPLATES = {
@@ -384,11 +403,15 @@ def _filter_consistent(
                     sample_copy = dict(sample)
                     sample_copy["_response"] = responses[0]
                     sample_copy["_judge"] = "true"
+                    sample_copy["_responses"] = responses
+                    sample_copy["_judges"] = judges
                     faithful.append(sample_copy)
                 elif true_count == 0:
                     sample_copy = dict(sample)
                     sample_copy["_response"] = responses[0]
                     sample_copy["_judge"] = "false"
+                    sample_copy["_responses"] = responses
+                    sample_copy["_judges"] = judges
                     hallucinatory.append(sample_copy)
 
         except Exception as e:
@@ -429,6 +452,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"  Mode:        MCQ  (format={fmt or 'auto'})")
         print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
         print(f"  Keys:        options_key={options_key!r}  answer_key={answer_key!r}")
+
+        out_path = args.output or _default_output_path(args.model, args.data)
 
         if args.nudge:
             samples = apply_nudge(samples, args.nudge, options_key, answer_key, seed=args.seed)
@@ -477,6 +502,11 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     else:
         # ── Open-ended mode (default) ─────────────────────────────────────
+        out_path = args.output or _default_output_path(args.model, args.data)
+        log_path = Path(out_path).with_suffix(".log")
+        tee = _Tee(str(log_path))
+        sys.stdout = tee
+
         print("  Mode:        open-ended (consistency)")
         print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
 
@@ -503,8 +533,19 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
+        # Save all generated responses
+        responses_path = Path(out_path).with_suffix(".responses.jsonl")
+        with open(responses_path, "w") as rf:
+            for s in samples:
+                json.dump({k: v for k, v in s.items()}, rf)
+                rf.write("\n")
+        print(f"  Responses:   saved to {responses_path}")
+
         if not samples:
             print("  Error: no consistent samples — try more input samples or lower l1_C")
+            tee.flush()
+            sys.stdout = tee.stdout
+            tee.close()
             return
 
         print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
@@ -539,9 +580,14 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         print("\n  Causal validation skipped (open-ended; use behavioral benchmarks)")
 
-    out_path = args.output or _default_output_path(args.model, args.data)
     saved = probe.save(out_path)
     print(f"\n  Saved → {saved}  +  {Path(out_path).with_suffix('.pkl').name}")
+
+    if not args.mcq:
+        tee.flush()
+        sys.stdout = tee.stdout
+        tee.close()
+
     print(sep + "\n")
 
 
@@ -634,6 +680,11 @@ def cmd_transfer(args: argparse.Namespace) -> None:
     probe = HProbes.load(args.probe, model, tokenizer)
     print(f" done  ({probe.n_neurons_} H-Neurons)")
 
+    out_path = args.output or _default_output_path(args.model, args.data)
+    log_path = Path(out_path).with_suffix(".log")
+    tee = _Tee(str(log_path))
+    sys.stdout = tee
+
     if args.responses:
         print("\n  Scoring on pre-generated responses...")
         result = probe.score_on_responses(
@@ -669,8 +720,19 @@ def cmd_transfer(args: argparse.Namespace) -> None:
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
+        # Save all generated responses
+        responses_path = Path(out_path).with_suffix(".responses.jsonl")
+        with open(responses_path, "w") as rf:
+            for s in samples:
+                json.dump({k: v for k, v in s.items()}, rf)
+                rf.write("\n")
+        print(f"  Responses:   saved to {responses_path}")
+
         if not samples:
             print("  Error: no consistent samples found")
+            tee.flush()
+            sys.stdout = tee.stdout
+            tee.close()
             return
 
         print("\n  Scoring (transfer)...")
@@ -683,10 +745,13 @@ def cmd_transfer(args: argparse.Namespace) -> None:
 
     _print_score(result)
 
-    out_path = args.output or _default_output_path(args.model, args.data)
     probe.score_results_ = result
     saved = probe.save(out_path)
     print(f"\n  Saved → {saved}  +  {Path(out_path).with_suffix('.pkl').name}")
+
+    tee.flush()
+    sys.stdout = tee.stdout
+    tee.close()
 
     print(sep + "\n")
 
