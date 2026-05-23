@@ -499,7 +499,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             mode="open",
             max_new_tokens=max_tokens,
             open_answer_key=open_answer,
-            batch_size=args.batch_size,
+            batch_size=args.gen_batch_size or args.batch_size,
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
@@ -665,7 +665,7 @@ def cmd_transfer(args: argparse.Namespace) -> None:
             mode="open",
             max_new_tokens=max_tokens,
             open_answer_key=open_answer,
-            batch_size=args.batch_size,
+            batch_size=args.gen_batch_size or args.batch_size,
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
@@ -827,7 +827,14 @@ def _add_common_probe_args(p):
         type=int,
         default=1,
         dest="batch_size",
-        help="Batch size for generation and CETT extraction (default: 1). Use 4-8 on GPU for speedup.",
+        help="Batch size for CETT extraction (default: 1). Use 8-16 on GPU.",
+    )
+    p.add_argument(
+        "--gen-batch-size",
+        type=int,
+        default=None,
+        dest="gen_batch_size",
+        help="Batch size for consistency generation (default: same as --batch-size). Use 4-8 on GPU.",
     )
 
 
@@ -1019,7 +1026,14 @@ def main() -> None:
         type=int,
         default=1,
         dest="batch_size",
-        help="Batch size for generation (default: 1). Use 4-8 for speedup.",
+        help="Batch size for CETT extraction (default: 1). Use 8-16 on GPU.",
+    )
+    transfer_p.add_argument(
+        "--gen-batch-size",
+        type=int,
+        default=None,
+        dest="gen_batch_size",
+        help="Batch size for consistency generation (default: same as --batch-size). Use 4-8 on GPU.",
     )
     _add_common_model_args(transfer_p)
 
