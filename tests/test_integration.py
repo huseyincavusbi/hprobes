@@ -119,6 +119,7 @@ def test_cli_run_command(gpt2_setup):
                 output_base,
                 "--samples",
                 "2",
+                "--mcq",
                 "--format",
                 "mmlu",
             ],
