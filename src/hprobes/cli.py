@@ -422,88 +422,44 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(sep)
 
     samples = load_samples(args.data, args.samples)
-    fmt, options_key, answer_key = _resolve_format(args, samples)
 
-    print(
-        f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples, format={fmt or 'auto'})"
-    )
-    print(f"  Keys:        options_key={options_key!r}  answer_key={answer_key!r}")
-    print(f"  Contrastive: {not args.no_contrastive}")
-
-    if args.nudge:
-        samples = apply_nudge(samples, args.nudge, options_key, answer_key, seed=args.seed)
-        print(f"  Nudge:       {args.nudge}")
-    else:
-        print("  Nudge:       none")
-
-    print(f"  Loading {args.model}...", end="", flush=True)
-    tokenizer, model = _load_model(args)
-    print(" done")
-
-    if args.consistency:
-        consistency_mode = args.consistency_mode
-        if consistency_mode == "auto":
-            has_options = any(s.get(options_key) for s in samples[:5])
-            consistency_mode = "mcq" if has_options else "open"
-            print(f"  Mode:        consistency ({consistency_mode})")
-        else:
-            print(f"  Mode:        consistency ({consistency_mode})")
-
-        max_tokens = args.max_new_tokens_consistency or (20 if consistency_mode == "mcq" else 100)
-        open_answer = options_key if consistency_mode == "mcq" else answer_key
-        samples = _filter_consistent(
-            samples,
-            model,
-            tokenizer,
-            options_key,
-            answer_key,
-            num_samples=args.consistency_samples,
-            seed=args.seed,
-            mode=consistency_mode,
-            max_new_tokens=max_tokens,
-            open_answer_key=open_answer,
-            batch_size=args.batch_size,
+    if args.mcq:
+        # ── MCQ mode (opt-in) ──────────────────────────────────────────────
+        fmt, options_key, answer_key = _resolve_format(args, samples)
+        print(
+            f"  Mode:        MCQ  (format={fmt or 'auto'})"
         )
-        print(f"  Consistent:  {len(samples)} samples after filtering")
+        print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
+        print(f"  Keys:        options_key={options_key!r}  answer_key={answer_key!r}")
 
-    alphas = [float(a) for a in args.alphas.split(",")] if args.alphas else None
+        if args.nudge:
+            samples = apply_nudge(samples, args.nudge, options_key, answer_key, seed=args.seed)
+            print(f"  Nudge:       {args.nudge}")
 
-    print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
-    probe = HProbes(
-        model,
-        tokenizer,
-        l1_C=args.l1_c,
-        layer_stride=args.layer_stride,
-        validation_split=args.validation_split,
-        seed=args.seed,
-        max_tokens=args.max_tokens,
-        batch_size=args.batch_size,
-        top_k=args.top_k,
-    )
-    if args.consistency:
-        probe.fit_from_responses(
-            samples,
-            question_key="question",
-            response_key="_response",
-            label_key="_judge",
-            answer_tokens_key="__none__",
+        print(f"  Loading {args.model}...", end="", flush=True)
+        tokenizer, model = _load_model(args)
+        print(" done")
+
+        print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
+        probe = HProbes(
+            model, tokenizer,
+            l1_C=args.l1_c, layer_stride=args.layer_stride,
+            validation_split=args.validation_split, seed=args.seed,
+            max_tokens=args.max_tokens, batch_size=args.batch_size, top_k=args.top_k,
         )
-    else:
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
-    probe.model_id = args.model
-    probe.dataset_name = Path(args.data).name
-    probe.n_samples_used = len(samples)
-    print(" done")
-    print(f"  H-Neurons:   {probe.n_neurons_}  ({probe.neuron_ratio_:.3f}‰ of all features)")
-    print(f"  Accuracy:    {probe.accuracy_:.3f}")
-    print(f"  Layers:      {dict(sorted(probe.layer_distribution_.items()))}")
+        probe.model_id = args.model
+        probe.dataset_name = Path(args.data).name
+        probe.n_samples_used = len(samples)
+        print(" done")
+        print(f"  H-Neurons:   {probe.n_neurons_}  ({probe.neuron_ratio_:.3f}‰ of all features)")
+        print(f"  Accuracy:    {probe.accuracy_:.3f}")
+        print(f"  Layers:      {dict(sorted(probe.layer_distribution_.items()))}")
 
-    print("\n  Scoring...")
-    _print_score(probe.score())
+        print("\n  Scoring...")
+        _print_score(probe.score())
 
-    if args.consistency:
-        print("\n  Causal validation skipped (open-ended; use behavioral benchmarks)")
-    else:
+        alphas = [float(a) for a in args.alphas.split(",")] if args.alphas else None
         print("\n  Causal validation (alpha → accuracy):")
         cv = probe.causal_validate(alphas=alphas)
         for alpha, acc in sorted(cv.items()):
@@ -515,6 +471,62 @@ def cmd_run(args: argparse.Namespace) -> None:
             elif alpha == 2.0:
                 tag = "  ← amplification"
             print(f"    {alpha:.1f} → {acc:.3f}{tag}")
+
+    else:
+        # ── Open-ended mode (default) ─────────────────────────────────────
+        print("  Mode:        open-ended (consistency)")
+        print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
+
+        print(f"  Loading {args.model}...", end="", flush=True)
+        tokenizer, model = _load_model(args)
+        print(" done")
+
+        max_tokens = args.max_new_tokens_consistency or 100
+        fmt, options_key, answer_key = _resolve_format(args, samples)
+        open_answer = options_key if any(s.get(options_key) for s in samples[:5]) else answer_key
+
+        samples = _filter_consistent(
+            samples, model, tokenizer,
+            options_key, answer_key,
+            num_samples=args.consistency_samples,
+            seed=args.seed,
+            mode="open",
+            max_new_tokens=max_tokens,
+            open_answer_key=open_answer,
+            batch_size=args.batch_size,
+        )
+        print(f"  Consistent:  {len(samples)} samples after filtering")
+
+        if not samples:
+            print("  Error: no consistent samples — try more input samples or lower l1_C")
+            return
+
+        print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
+        probe = HProbes(
+            model, tokenizer,
+            l1_C=args.l1_c, layer_stride=args.layer_stride,
+            validation_split=args.validation_split, seed=args.seed,
+            max_tokens=args.max_tokens, batch_size=args.batch_size, top_k=args.top_k,
+        )
+        probe.fit_from_responses(
+            samples,
+            question_key="question",
+            response_key="_response",
+            label_key="_judge",
+            answer_tokens_key="__none__",
+        )
+        probe.model_id = args.model
+        probe.dataset_name = Path(args.data).name
+        probe.n_samples_used = len(samples)
+        print(" done")
+        print(f"  H-Neurons:   {probe.n_neurons_}  ({probe.neuron_ratio_:.3f}‰ of all features)")
+        print(f"  Accuracy:    {probe.accuracy_:.3f}")
+        print(f"  Layers:      {dict(sorted(probe.layer_distribution_.items()))}")
+
+        print("\n  Scoring...")
+        _print_score(probe.score())
+
+        print("\n  Causal validation skipped (open-ended; use behavioral benchmarks)")
 
     out_path = args.output or _default_output_path(args.model, args.data)
     saved = probe.save(out_path)
@@ -601,10 +613,7 @@ def cmd_transfer(args: argparse.Namespace) -> None:
     print(sep)
 
     samples = load_samples(args.data, args.samples)
-    fmt, options_key, answer_key = _resolve_format(args, samples)
-
-    print(f"  Dataset:  {Path(args.data).name}  ({len(samples)} samples, format={fmt or 'auto'})")
-    print(f"  Keys:     options_key={options_key!r}  answer_key={answer_key!r}")
+    print(f"  Dataset:  {Path(args.data).name}  ({len(samples)} samples)")
 
     print(f"  Loading {args.model}...", end="", flush=True)
     tokenizer, model = _load_model(args)
@@ -614,11 +623,54 @@ def cmd_transfer(args: argparse.Namespace) -> None:
     probe = HProbes.load(args.probe, model, tokenizer)
     print(f" done  ({probe.n_neurons_} H-Neurons)")
 
-    print("\n  Scoring (transfer)...")
-    result = probe.score_on(samples, options_key=options_key, answer_key=answer_key)
+    if args.responses:
+        print("\n  Scoring on pre-generated responses...")
+        result = probe.score_on_responses(
+            samples,
+            question_key="question",
+            response_key=args.response_key,
+            label_key=args.label_key,
+        )
+    elif args.mcq:
+        fmt, options_key, answer_key = _resolve_format(args, samples)
+        print(f"  Mode:     MCQ transfer (format={fmt or 'auto'})")
+        print(f"  Keys:     options_key={options_key!r}  answer_key={answer_key!r}")
+        print("\n  Scoring (MCQ transfer)...")
+        result = probe.score_on(samples, options_key=options_key, answer_key=answer_key)
+    else:
+        print("  Mode:     open-ended transfer (consistency)")
+        max_tokens = args.max_new_tokens_consistency or 100
+        fmt, options_key, answer_key = _resolve_format(args, samples)
+        open_answer = options_key if any(s.get(options_key) for s in samples[:5]) else answer_key
+
+        samples = _filter_consistent(
+            samples, model, tokenizer,
+            options_key, answer_key,
+            num_samples=args.consistency_samples,
+            seed=42,
+            mode="open",
+            max_new_tokens=max_tokens,
+            open_answer_key=open_answer,
+            batch_size=args.batch_size,
+        )
+        print(f"  Consistent:  {len(samples)} samples after filtering")
+
+        if not samples:
+            print("  Error: no consistent samples found")
+            return
+
+        print("\n  Scoring (transfer)...")
+        result = probe.score_on_responses(
+            samples,
+            question_key="question",
+            response_key="_response",
+            label_key="_judge",
+        )
+
     _print_score(result)
 
     out_path = args.output or _default_output_path(args.model, args.data)
+    probe.score_results_ = result
     saved = probe.save(out_path)
     print(f"\n  Saved → {saved}  +  {Path(out_path).with_suffix('.pkl').name}")
 
@@ -776,31 +828,38 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # ── hprobes run ────────────────────────────────────────────────────────────
-    run_p = subparsers.add_parser("run", help="Fit, score, and causal-validate on an MCQ dataset")
+    run_p = subparsers.add_parser("run", help="Discover H-Neurons on open-ended QA datasets")
     run_p.add_argument("--model", required=True, help="HuggingFace model ID")
-    run_p.add_argument("--data", required=True, help="Path to .jsonl or .json dataset file")
     run_p.add_argument(
-        "--format",
-        choices=["auto", "mmlu", "medqa", "medmcqa"],
-        default="auto",
-        help="Dataset format (default: auto-detect)",
+        "--data", required=True, help="Path to .jsonl, .json, or .parquet dataset file"
     )
     run_p.add_argument(
         "--samples", type=int, default=-1, help="Number of samples, -1 for all (default: -1)"
     )
     run_p.add_argument(
+        "--mcq",
+        action="store_true",
+        default=False,
+        help="MCQ mode: use format detection instead of consistency filtering "
+        "(only use if you need MCQ detection)",
+    )
+    run_p.add_argument(
+        "--format",
+        choices=["auto", "mmlu", "medqa", "medmcqa"],
+        default="auto",
+        help="MCQ dataset format (only used with --mcq; default: auto-detect)",
+    )
+    run_p.add_argument(
         "--no-contrastive",
         action="store_true",
         dest="no_contrastive",
-        help="Disable contrastive labeling (use binary correct/incorrect instead)",
+        help="Disable contrastive labeling (MCQ mode only)",
     )
     run_p.add_argument(
         "--nudge",
         choices=["basic", "expert"],
         default=None,
-        help="Sycophancy test: append a wrong-answer nudge to each question. "
-        "'basic' = 'I think the answer is X', "
-        "'expert' = 'I am a senior medical consultant and I believe the answer is X'",
+        help="Sycophancy nudge (MCQ mode only): append a wrong-answer nudge to each question",
     )
     run_p.add_argument(
         "--output",
@@ -810,32 +869,18 @@ def main() -> None:
     _add_common_model_args(run_p)
     _add_common_probe_args(run_p)
     run_p.add_argument(
-        "--consistency",
-        action="store_true",
-        help="Enable consistency filtering: generate N responses per question "
-        "(temp=1.0), keep only questions where model is 100%% consistent "
-        "(all correct or all wrong), balanced sample. Default N=10.",
-    )
-    run_p.add_argument(
         "--consistency-samples",
         type=int,
         default=10,
         dest="consistency_samples",
-        help="Number of responses to generate per question for consistency check (default: 10)",
-    )
-    run_p.add_argument(
-        "--consistency-mode",
-        choices=["auto", "mcq", "open"],
-        default="auto",
-        dest="consistency_mode",
-        help="Consistency judging mode: auto (detect from dataset), mcq (letter extraction), open (text matching). Default: auto.",
+        help="Number of responses per question for consistency check (default: 10)",
     )
     run_p.add_argument(
         "--max-new-tokens",
         type=int,
         default=None,
         dest="max_new_tokens_consistency",
-        help="Max new tokens for consistency generation (default: 20 for mcq, 100 for open)",
+        help="Max new tokens for generation (default: 20 for mcq, 100 for open)",
     )
 
     # ── hprobes responses ──────────────────────────────────────────────────────
@@ -887,21 +932,63 @@ def main() -> None:
 
     # ── hprobes transfer ───────────────────────────────────────────────────────
     transfer_p = subparsers.add_parser(
-        "transfer", help="Score a saved probe on a different model (transfer experiment)"
+        "transfer", help="Score a saved probe on new data (cross-dataset transfer)"
     )
     transfer_p.add_argument(
-        "--probe", required=True, help="Base path of saved probe (e.g. results/gemma_medqa)"
+        "--probe", required=True, help="Base path of saved probe (e.g. results/gemma_triviaqa)"
     )
-    transfer_p.add_argument("--model", required=True, help="HuggingFace model ID for target model")
-    transfer_p.add_argument("--data", required=True, help="Path to .jsonl or .json dataset file")
+    transfer_p.add_argument(
+        "--model", required=True, help="HuggingFace model ID for target model"
+    )
+    transfer_p.add_argument(
+        "--data", required=True, help="Path to .jsonl, .json, or .parquet dataset file"
+    )
+    transfer_p.add_argument(
+        "--samples", type=int, default=-1, help="Number of samples, -1 for all (default: -1)"
+    )
+    transfer_p.add_argument(
+        "--responses",
+        action="store_true",
+        default=False,
+        help="Data contains pre-generated responses (skip consistency generation)",
+    )
+    transfer_p.add_argument(
+        "--mcq",
+        action="store_true",
+        default=False,
+        help="MCQ transfer mode (uses format detection, no consistency)",
+    )
     transfer_p.add_argument(
         "--format",
         choices=["auto", "mmlu", "medqa", "medmcqa"],
         default="auto",
-        help="Dataset format (default: auto-detect)",
+        help="MCQ dataset format (only used with --mcq; default: auto-detect)",
     )
     transfer_p.add_argument(
-        "--samples", type=int, default=-1, help="Number of samples, -1 for all (default: -1)"
+        "--response-key",
+        default="response",
+        dest="response_key",
+        help="Key for response text in pre-generated data (default: response)",
+    )
+    transfer_p.add_argument(
+        "--label-key",
+        default="judge",
+        dest="label_key",
+        help="Key for correctness label (default: judge)",
+    )
+    transfer_p.add_argument(
+        "--consistency-samples",
+        type=int,
+        default=10,
+        dest="consistency_samples",
+        help="Number of responses per question for consistency (default: 10)",
+    )
+    transfer_p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        dest="max_new_tokens_consistency",
+        help="Max new tokens for generation (default: 100)",
     )
     transfer_p.add_argument(
         "--output",
@@ -914,6 +1001,13 @@ def main() -> None:
         default=1024,
         dest="max_tokens",
         help="Max input tokens before truncation (default: 1024)",
+    )
+    transfer_p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        dest="batch_size",
+        help="Batch size for generation (default: 1). Use 4-8 for speedup.",
     )
     _add_common_model_args(transfer_p)
 
