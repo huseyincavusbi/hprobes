@@ -76,11 +76,14 @@ def load_samples(path: str, n: int) -> List[Dict]:
 
 
 def _default_output_path(model: str, dataset_path: str) -> str:
-    """Build a default output base path (no extension — save() adds .json and .pkl)."""
+    """Build a default output base path (no extension) under results/YYYY-MM-DD/."""
+    date_str = datetime.now().strftime("%Y-%m-%d")
     model_safe = re.sub(r"[^a-zA-Z0-9_-]", "_", model)
     dataset_name = Path(dataset_path).stem
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{model_safe}_{dataset_name}_{ts}"
+    ts = datetime.now().strftime("%H%M%S")
+    results_dir = Path("results") / date_str
+    results_dir.mkdir(parents=True, exist_ok=True)
+    return str(results_dir / f"{model_safe}_{dataset_name}_{ts}")
 
 
 class _Tee:
@@ -291,6 +294,18 @@ def _parse_bioasq_answer(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _save_responses_jsonl(samples: list, base_path: str, tag: str) -> None:
+    """Save list of samples to {base_path}.{tag}.responses.jsonl."""
+    if not samples:
+        return
+    path = Path(base_path).with_suffix(f".{tag}.responses.jsonl")
+    with open(path, "w") as f:
+        for s in samples:
+            json.dump({k: v for k, v in s.items()}, f)
+            f.write("\n")
+    print(f"  {tag.capitalize()}:  {len(samples)} samples → {path}")
+
+
 def _filter_consistent(
     samples: list,
     model,
@@ -303,6 +318,7 @@ def _filter_consistent(
     max_new_tokens: int = 20,
     open_answer_key: str = "answer",
     batch_size: int = 1,
+    save_path: str = "",
 ) -> list:
     """Consistency filter: keep only questions where model is 100% consistent.
 
@@ -310,6 +326,7 @@ def _filter_consistent(
     mode='open': open-ended text matching judge. Uses open_answer_key for ground truth.
 
     Returns balanced list with _response and _judge fields.
+    If save_path is given, saves all samples (faithful, hallucinatory, mixed) to JSONL.
     """
     import random as _random
     from tqdm import tqdm
@@ -325,6 +342,7 @@ def _filter_consistent(
 
     faithful = []
     hallucinatory = []
+    mixed = []
     valid = []
 
     for sample in samples:
@@ -413,10 +431,22 @@ def _filter_consistent(
                     sample_copy["_responses"] = responses
                     sample_copy["_judges"] = judges
                     hallucinatory.append(sample_copy)
+                else:
+                    sample_copy = dict(sample)
+                    sample_copy["_response"] = responses[0]
+                    sample_copy["_responses"] = responses
+                    sample_copy["_judges"] = judges
+                    sample_copy["_judge"] = "mixed"
+                    mixed.append(sample_copy)
 
         except Exception as e:
             print(f"  Generation failed: {e}")
             continue
+
+    if save_path:
+        _save_responses_jsonl(faithful, save_path, "faithful")
+        _save_responses_jsonl(hallucinatory, save_path, "hallucinatory")
+        _save_responses_jsonl(mixed, save_path, "mixed")
 
     n = min(len(faithful), len(hallucinatory))
     if n == 0:
@@ -507,6 +537,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         tee = _Tee(str(log_path))
         sys.stdout = tee
 
+        print(f"  Command:     hprobes {' '.join(sys.argv[1:])}")
         print("  Mode:        open-ended (consistency)")
         print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
 
@@ -530,16 +561,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             max_new_tokens=max_tokens,
             open_answer_key=open_answer,
             batch_size=args.gen_batch_size or args.batch_size,
+            save_path=out_path,
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
-
-        # Save all generated responses
-        responses_path = Path(out_path).with_suffix(".responses.jsonl")
-        with open(responses_path, "w") as rf:
-            for s in samples:
-                json.dump({k: v for k, v in s.items()}, rf)
-                rf.write("\n")
-        print(f"  Responses:   saved to {responses_path}")
 
         if not samples:
             print("  Error: no consistent samples — try more input samples or lower l1_C")
@@ -685,6 +709,8 @@ def cmd_transfer(args: argparse.Namespace) -> None:
     tee = _Tee(str(log_path))
     sys.stdout = tee
 
+    print(f"  Command:     hprobes {' '.join(sys.argv[1:])}")
+
     if args.responses:
         print("\n  Scoring on pre-generated responses...")
         result = probe.score_on_responses(
@@ -717,16 +743,9 @@ def cmd_transfer(args: argparse.Namespace) -> None:
             max_new_tokens=max_tokens,
             open_answer_key=open_answer,
             batch_size=args.gen_batch_size or args.batch_size,
+            save_path=out_path,
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
-
-        # Save all generated responses
-        responses_path = Path(out_path).with_suffix(".responses.jsonl")
-        with open(responses_path, "w") as rf:
-            for s in samples:
-                json.dump({k: v for k, v in s.items()}, rf)
-                rf.write("\n")
-        print(f"  Responses:   saved to {responses_path}")
 
         if not samples:
             print("  Error: no consistent samples found")
