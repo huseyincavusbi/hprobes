@@ -1007,6 +1007,189 @@ class HProbes:
         self.score_results_ = result
         return result
 
+    def score_on_responses(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        response_key: str = "response",
+        label_key: str = "judge",
+        aggregation: str = "mean",
+    ) -> Dict:
+        """Score a fitted probe on pre-generated open-ended responses.
+
+        Used for cross-dataset transfer: the classifier was fitted on one dataset
+        and we evaluate it on another dataset's pre-generated Q+A pairs.
+
+        Parameters
+        ----------
+        samples : list of dict
+            Each dict must contain question, response, and a correctness label.
+        question_key : str
+            Key for the question string.
+        response_key : str
+            Key for the generated response string.
+        label_key : str
+            Key for the correctness label.
+        aggregation : str
+            How to aggregate CETT over token spans ("mean" or "max").
+
+        Returns
+        -------
+        dict with auroc, balanced_accuracy, random_baseline_auroc, auroc_gap
+        """
+        if not self.is_fitted_:
+            raise RuntimeError(_NOT_FITTED_MSG)
+        if self._clf is None:
+            return {
+                "auroc": None,
+                "balanced_accuracy": None,
+                "random_baseline_auroc": None,
+                "random_baseline_balanced_accuracy": None,
+                "auroc_gap": None,
+                "n_h_neurons": 0,
+                "neuron_ratio_permille": 0.0,
+                "threshold": None,
+            }
+
+        X, y = [], []
+        skipped = 0
+
+        for sample in tqdm(samples, desc="CETT extraction (transfer)"):
+            raw_label = sample.get(label_key)
+            if raw_label is None:
+                skipped += 1
+                continue
+            is_correct = str(raw_label).lower() in ("true", "1", "t")
+
+            question = sample.get(question_key, "")
+            response = sample.get(response_key, "")
+
+            if (
+                hasattr(self.tokenizer, "apply_chat_template")
+                and self.tokenizer.chat_template is not None
+            ):
+                msgs = [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": response},
+                ]
+                full_text = self.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=False
+                )
+                user_only = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": question}],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                user_tokens = self._tokenize(user_only)
+                input_len = user_tokens["input_ids"].shape[1] - 1
+                span_start = input_len + 1
+            else:
+                full_text = f"{question}\n{response}"
+                span_start = -1
+
+            tokens = self._tokenize(full_text)
+            seq_len = tokens["input_ids"].shape[1]
+
+            if span_start < 0:
+                span_start, span_end = 0, seq_len
+            else:
+                span_end = seq_len
+
+            try:
+                vec_ans, _vec_other = forward_cett_dual_span(
+                    self.model,
+                    tokens,
+                    span_start,
+                    span_end,
+                    self._layers,
+                    self._col_norms,
+                    aggregation,
+                )
+            except (ValueError, KeyError, RuntimeError, IndexError, TypeError):
+                skipped += 1
+                continue
+
+            ans = np.nan_to_num(vec_ans.numpy().astype(np.float32))
+            X.append(ans)
+            y.append(0 if is_correct else 1)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if skipped:
+            print(f"[hprobes] Skipped transfer samples: {skipped}")
+
+        if not X:
+            return {
+                "auroc": None,
+                "balanced_accuracy": None,
+                "random_baseline_auroc": None,
+                "random_baseline_balanced_accuracy": None,
+                "auroc_gap": None,
+                "n_samples": 0,
+            }
+
+        X_arr = np.array(X)
+        y_arr = np.array(y)
+
+        if self._col_mean is not None and self._col_std is not None:
+            X_norm = (X_arr[:, self._top_k_idx] - self._col_mean) / (self._col_std + 1e-8)
+        else:
+            X_norm = X_arr[:, self._top_k_idx]
+
+        try:
+            scores = self._clf.predict_proba(X_norm)[:, 1]
+            auroc = roc_auc_score(y_arr, scores)
+        except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+            logging.warning(f"Error computing AUROC: {e}")
+            auroc = None
+
+        try:
+            preds = self._clf.predict(X_norm)
+            bal_acc = balanced_accuracy_score(y_arr, preds)
+        except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+            logging.warning(f"Error computing balanced accuracy: {e}")
+            bal_acc = None
+
+        rand_auroc = None
+        if self.n_neurons_ > 0:
+            rng = np.random.RandomState(self.seed + 1)
+            rand_idx = rng.choice(
+                self._top_k_idx.shape[0],
+                size=min(self.n_neurons_, self._top_k_idx.shape[0]),
+                replace=False,
+            )
+            clf_rand = LogisticRegression(
+                solver="liblinear",
+                penalty="l1",
+                C=self.l1_C,
+                max_iter=1000,
+                random_state=self.seed,
+            )
+            try:
+                n_half = len(X_norm) // 2
+                if n_half >= 2 and len(set(y_arr[:n_half])) >= 2:
+                    clf_rand.fit(X_norm[:n_half, rand_idx], y_arr[:n_half])
+                    rand_scores = clf_rand.predict_proba(X_norm[n_half:, rand_idx])[:, 1]
+                    rand_auroc = roc_auc_score(y_arr[n_half:], rand_scores)
+            except (ValueError, KeyError, RuntimeError, IndexError, TypeError):
+                pass
+
+        gap = (auroc - rand_auroc) if (auroc is not None and rand_auroc is not None) else None
+        rand_str = f"{rand_auroc:.3f}" if rand_auroc is not None else "n/a"
+        gap_str = f"{gap:+.3f}" if gap is not None else "n/a"
+        print(f"[hprobes transfer] AUROC: {auroc:.3f}  |  Random: {rand_str}  |  Gap: {gap_str}")
+
+        result = {
+            "auroc": auroc,
+            "balanced_accuracy": bal_acc,
+            "random_baseline_auroc": rand_auroc,
+            "auroc_gap": gap,
+            "n_samples": len(X),
+        }
+        self.score_results_ = result
+        return result
+
     def detect(
         self,
         prompt: str,
