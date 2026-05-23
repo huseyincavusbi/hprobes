@@ -426,9 +426,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.mcq:
         # ── MCQ mode (opt-in) ──────────────────────────────────────────────
         fmt, options_key, answer_key = _resolve_format(args, samples)
-        print(
-            f"  Mode:        MCQ  (format={fmt or 'auto'})"
-        )
+        print(f"  Mode:        MCQ  (format={fmt or 'auto'})")
         print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
         print(f"  Keys:        options_key={options_key!r}  answer_key={answer_key!r}")
 
@@ -442,10 +440,15 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
         probe = HProbes(
-            model, tokenizer,
-            l1_C=args.l1_c, layer_stride=args.layer_stride,
-            validation_split=args.validation_split, seed=args.seed,
-            max_tokens=args.max_tokens, batch_size=args.batch_size, top_k=args.top_k,
+            model,
+            tokenizer,
+            l1_C=args.l1_c,
+            layer_stride=args.layer_stride,
+            validation_split=args.validation_split,
+            seed=args.seed,
+            max_tokens=args.max_tokens,
+            batch_size=args.batch_size,
+            top_k=args.top_k,
         )
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
         probe.model_id = args.model
@@ -486,8 +489,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         open_answer = options_key if any(s.get(options_key) for s in samples[:5]) else answer_key
 
         samples = _filter_consistent(
-            samples, model, tokenizer,
-            options_key, answer_key,
+            samples,
+            model,
+            tokenizer,
+            options_key,
+            answer_key,
             num_samples=args.consistency_samples,
             seed=args.seed,
             mode="open",
@@ -503,10 +509,15 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         print(f"  Fitting (l1_C={args.l1_c})...", end="", flush=True)
         probe = HProbes(
-            model, tokenizer,
-            l1_C=args.l1_c, layer_stride=args.layer_stride,
-            validation_split=args.validation_split, seed=args.seed,
-            max_tokens=args.max_tokens, batch_size=args.batch_size, top_k=args.top_k,
+            model,
+            tokenizer,
+            l1_C=args.l1_c,
+            layer_stride=args.layer_stride,
+            validation_split=args.validation_split,
+            seed=args.seed,
+            max_tokens=args.max_tokens,
+            batch_size=args.batch_size,
+            top_k=args.top_k,
         )
         probe.fit_from_responses(
             samples,
@@ -644,8 +655,11 @@ def cmd_transfer(args: argparse.Namespace) -> None:
         open_answer = options_key if any(s.get(options_key) for s in samples[:5]) else answer_key
 
         samples = _filter_consistent(
-            samples, model, tokenizer,
-            options_key, answer_key,
+            samples,
+            model,
+            tokenizer,
+            options_key,
+            answer_key,
             num_samples=args.consistency_samples,
             seed=42,
             mode="open",
@@ -937,9 +951,7 @@ def main() -> None:
     transfer_p.add_argument(
         "--probe", required=True, help="Base path of saved probe (e.g. results/gemma_triviaqa)"
     )
-    transfer_p.add_argument(
-        "--model", required=True, help="HuggingFace model ID for target model"
-    )
+    transfer_p.add_argument("--model", required=True, help="HuggingFace model ID for target model")
     transfer_p.add_argument(
         "--data", required=True, help="Path to .jsonl, .json, or .parquet dataset file"
     )
