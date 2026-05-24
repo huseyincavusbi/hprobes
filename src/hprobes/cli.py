@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import string
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -264,11 +265,34 @@ def _build_prompt(sample: dict, options_key: str, mode: str = "mcq") -> str:
         return question.strip() + "\n\nAnswer:"
 
 
-def _judge_open_ended(response: str, ground_truth) -> bool:
-    """Judge if response contains the ground truth answer (open-ended).
+def _normalize_answer(s: str) -> str:
+    """Standardize answer strings: lowercase, strip punctuation/articles, collapse whitespace.
 
-    ground_truth can be a string or list of acceptable answers.
+    Follows the TriviaQA / NQ-Open evaluation protocol used in the H-Neurons paper.
     """
+    if not s:
+        return ""
+    text = str(s).lower().replace("_", " ")
+    exclude = set(string.punctuation + "'`")
+    text = "".join(ch if ch not in exclude else " " for ch in text)
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    return " ".join(text.split()).strip()
+
+
+def _judge_open_ended(response: str, ground_truth) -> bool:
+    """Judge if response contains the ground truth answer using normalized substring match.
+
+    Applies normalize_answer to both response and ground truth, then checks
+    whether any ground-truth candidate appears as a substring of the response.
+    Responses containing uncertainty terms (don't know, cannot, etc.) are rejected.
+    """
+    resp_lower = response.lower()
+    uncertain_terms = ["don't know", "don't know", "cannot", "not provided", "no information"]
+    if any(term in resp_lower for term in uncertain_terms):
+        return False
+
+    norm_resp = _normalize_answer(response)
+
     if isinstance(ground_truth, str):
         candidates = [ground_truth]
     elif isinstance(ground_truth, list):
@@ -278,10 +302,9 @@ def _judge_open_ended(response: str, ground_truth) -> bool:
     else:
         candidates = [str(ground_truth)]
 
-    response_lower = response.strip().lower()
-    for candidate in candidates:
-        c = str(candidate).strip().lower()
-        if c and c in response_lower:
+    for c in candidates:
+        norm_c = _normalize_answer(str(c))
+        if norm_c and norm_c in norm_resp:
             return True
     return False
 
