@@ -654,9 +654,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
                         return hook
 
-                    handles.append(
-                        down_proj.register_forward_pre_hook(make_hook(indices, alpha))
-                    )
+                    handles.append(down_proj.register_forward_pre_hook(make_hook(indices, alpha)))
 
                 correct = 0
                 max_tk = args.max_new_tokens_consistency or 40
@@ -699,7 +697,9 @@ def cmd_run(args: argparse.Namespace) -> None:
                 tag = (
                     "  ← baseline"
                     if alpha == 1.0
-                    else "  ← suppression" if alpha < 1.0 else "  ← amplification"
+                    else "  ← suppression"
+                    if alpha < 1.0
+                    else "  ← amplification"
                 )
                 print(f"    α={alpha:.1f} → {rate:.3f}{tag}")
 
