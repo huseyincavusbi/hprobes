@@ -625,7 +625,88 @@ def cmd_run(args: argparse.Namespace) -> None:
         print("\n  Scoring...")
         _print_score(probe.score())
 
-        print("\n  Causal validation skipped (open-ended; use behavioral benchmarks)")
+        if not probe.h_neurons_:
+            print("\n  Causal validation: no H-Neurons found")
+        else:
+            import torch
+
+            print("\n  Causal validation (α → correctness rate):")
+            val_n = min(100, len(samples))
+            val_subset = samples[:val_n]
+            alphas = [0.0, 1.0, 2.0]
+
+            from hprobes.cett import get_mlp_down_proj
+
+            for alpha in alphas:
+                neurons_by_layer: dict = {}
+                for layer_idx, neuron_idx in probe.h_neurons_:
+                    neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
+
+                handles = []
+                for layer_idx in probe._layers:
+                    if layer_idx not in neurons_by_layer:
+                        continue
+                    indices = torch.tensor(
+                        neurons_by_layer[layer_idx], dtype=torch.long, device=model.device
+                    )
+                    down_proj = get_mlp_down_proj(model, layer_idx)
+
+                    def make_hook(idx, a):
+                        def hook(module, input):
+                            z = input[0].clone()
+                            z[..., idx.to(z.device)] *= a
+                            return (z,) + input[1:]
+
+                        return hook
+
+                    handles.append(
+                        down_proj.register_forward_pre_hook(make_hook(indices, alpha))
+                    )
+
+                correct = 0
+                max_tk = args.max_new_tokens_consistency or 40
+                for s in val_subset:
+                    prompt = _build_prompt(s, "options", "open")
+                    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=max_tk,
+                            do_sample=True,
+                            temperature=1.0,
+                            top_p=0.9,
+                            top_k=50,
+                            num_return_sequences=1,
+                            pad_token_id=tokenizer.eos_token_id,
+                        )
+                    resp = tokenizer.decode(
+                        outputs[0][inputs["input_ids"].shape[1] :],
+                        skip_special_tokens=True,
+                    ).strip()
+
+                    gt = s.get(open_answer)
+                    if gt is None:
+                        gt = s.get(answer_key)
+                    if gt is None:
+                        raw_text = s.get("text", "")
+                        if raw_text:
+                            gt = {"text": raw_text}
+                    if isinstance(gt, dict) and "text" in gt:
+                        gt = _parse_bioasq_answer(gt["text"]) or gt.get("value", "")
+
+                    if _judge_open_ended(resp, gt):
+                        correct += 1
+
+                for h in handles:
+                    h.remove()
+
+                rate = correct / val_n if val_n > 0 else 0.0
+                tag = (
+                    "  ← baseline"
+                    if alpha == 1.0
+                    else "  ← suppression" if alpha < 1.0 else "  ← amplification"
+                )
+                print(f"    α={alpha:.1f} → {rate:.3f}{tag}")
 
     saved = probe.save(out_path)
     print(f"\n  Saved → {saved}  +  {Path(out_path).with_suffix('.pkl').name}")
