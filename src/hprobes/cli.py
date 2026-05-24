@@ -251,7 +251,7 @@ def _extract_answer_letter(text: str, options: dict) -> str | None:
 
 def _build_prompt(sample: dict, options_key: str, mode: str = "mcq") -> str:
     """Build a text prompt. MCQ: question + options. Open: question only."""
-    question = sample.get("question", "")
+    question = sample.get("question") or sample.get("prompt", "")
     if mode == "mcq":
         options = sample.get(options_key, {})
         opt_lines = [f"{k}) {v}" for k, v in options.items()]
@@ -274,16 +274,37 @@ def _normalize_answer(s: str) -> str:
     return " ".join(text.split()).strip()
 
 
-def _judge_open_ended(response: str, ground_truth) -> bool:
-    """Judge if response contains the ground truth answer using normalized substring match.
+def _judge_open_ended(response: str, ground_truth=None, refusal_mode: bool = False) -> bool:
+    """Judge if response is correct.
 
-    Applies normalize_answer to both response and ground truth, then checks
-    whether any ground-truth candidate appears as a substring of the response.
-    Responses containing uncertainty terms (don't know, cannot, etc.) are rejected.
+    Normal mode: normalize both response and ground truth, substring match.
+    Refusal mode: response is correct if it contains refusal/uncertainty language.
     """
     resp_lower = response.lower()
-    uncertain_terms = ["don't know", "don't know", "cannot", "not provided", "no information"]
-    if any(term in resp_lower for term in uncertain_terms):
+    uncertain_terms = [
+        "don't know",
+        "doesn't exist",
+        "not aware",
+        "not sure",
+        "cannot",
+        "not provided",
+        "no information",
+        "not familiar",
+        "unable to",
+        "sorry",
+        "not real",
+        "fictional",
+        "made up",
+    ]
+    is_refusal = any(term in resp_lower for term in uncertain_terms)
+
+    if refusal_mode:
+        return is_refusal
+
+    if is_refusal:
+        return False
+
+    if ground_truth is None:
         return False
 
     norm_resp = _normalize_answer(response)
@@ -337,6 +358,7 @@ def _filter_consistent(
     open_answer_key: str = "answer",
     batch_size: int = 1,
     save_path: str = "",
+    refusal_mode: bool = False,
 ) -> list:
     """Consistency filter: keep only questions where model is 100% consistent.
 
@@ -374,23 +396,25 @@ def _filter_consistent(
                 continue
             prompt = _build_prompt(sample, options_key, "mcq")
         else:
-            gt = sample.get(open_answer_key)
-            if gt is None:
-                gt = sample.get(answer_key)
-            if gt is None:
-                raw_text = sample.get("text", "")
-                if raw_text:
-                    gt = {"text": raw_text}
-                else:
+            gt = None
+            if not refusal_mode:
+                gt = sample.get(open_answer_key)
+                if gt is None:
+                    gt = sample.get(answer_key)
+                if gt is None:
+                    raw_text = sample.get("text", "")
+                    if raw_text:
+                        gt = {"text": raw_text}
+                    else:
+                        continue
+                if isinstance(gt, dict) and "text" in gt:
+                    gt_val = _parse_bioasq_answer(gt.get("text", "")) or gt.get("value", "")
+                    gt = gt_val if gt_val else gt
+                if isinstance(gt, dict) and "value" in gt:
+                    gt_aliases = gt.get("aliases", [])
+                    gt = [gt["value"]] + (list(gt_aliases) if gt_aliases else [])
+                if not gt or (isinstance(gt, str) and not gt.strip()):
                     continue
-            if isinstance(gt, dict) and "text" in gt:
-                gt_val = _parse_bioasq_answer(gt.get("text", "")) or gt.get("value", "")
-                gt = gt_val if gt_val else gt
-            if isinstance(gt, dict) and "value" in gt:
-                gt_aliases = gt.get("aliases", [])
-                gt = [gt["value"]] + (list(gt_aliases) if gt_aliases else [])
-            if not gt or (isinstance(gt, str) and not gt.strip()):
-                continue
             prompt = _build_prompt(sample, options_key, "open")
 
         valid.append((sample, prompt, gt))
@@ -432,7 +456,11 @@ def _filter_consistent(
                         letter = _extract_answer_letter(resp, sample[options_key])
                         judges.append("true" if letter == gt else "false")
                     else:
-                        judges.append("true" if _judge_open_ended(resp, gt) else "false")
+                        judges.append(
+                            "true"
+                            if _judge_open_ended(resp, gt, refusal_mode=refusal_mode)
+                            else "false"
+                        )
 
                 true_count = judges.count("true")
                 if true_count == num_samples:
@@ -580,6 +608,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             open_answer_key=open_answer,
             batch_size=args.gen_batch_size or args.batch_size,
             save_path=out_path,
+            refusal_mode=args.judge == "refusal",
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
@@ -843,6 +872,7 @@ def cmd_transfer(args: argparse.Namespace) -> None:
             open_answer_key=open_answer,
             batch_size=args.gen_batch_size or args.batch_size,
             save_path=out_path,
+            refusal_mode=args.judge == "refusal",
         )
         print(f"  Consistent:  {len(samples)} samples after filtering")
 
@@ -1086,6 +1116,12 @@ def main() -> None:
         dest="max_new_tokens_consistency",
         help="Max new tokens for generation (default: 20 for mcq, 100 for open)",
     )
+    run_p.add_argument(
+        "--judge",
+        choices=["rule", "refusal"],
+        default="rule",
+        help="Judge method: rule (normalized substring match) or refusal (uncertainty detection for NonExist). Default: rule.",
+    )
 
     # ── hprobes responses ──────────────────────────────────────────────────────
     resp_p = subparsers.add_parser(
@@ -1217,6 +1253,12 @@ def main() -> None:
         default=None,
         dest="gen_batch_size",
         help="Batch size for consistency generation (default: same as --batch-size). Use 4-8 on GPU.",
+    )
+    transfer_p.add_argument(
+        "--judge",
+        choices=["rule", "refusal"],
+        default="rule",
+        help="Judge method: rule (normalized substring match) or refusal (uncertainty detection for NonExist). Default: rule.",
     )
     _add_common_model_args(transfer_p)
 
