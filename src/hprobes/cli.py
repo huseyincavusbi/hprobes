@@ -168,11 +168,6 @@ def _resolve_format(args, samples):
     if fmt == "auto":
         fmt = detect_format(samples[0])
         if fmt is None:
-            print(
-                "  Warning: could not auto-detect format. "
-                "Falling back to options_key='options', answer_key='answer'.",
-                file=sys.stderr,
-            )
             return None, "options", "answer"
         return fmt, *format_keys(fmt)
     return fmt, *format_keys(fmt)
