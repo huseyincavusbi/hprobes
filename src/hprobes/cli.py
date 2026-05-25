@@ -976,6 +976,57 @@ def cmd_compare(args: argparse.Namespace) -> None:
     print(sep + "\n")
 
 
+def cmd_edit(args: argparse.Namespace) -> None:
+    """Permanently zero out H-Neuron down_proj weights."""
+    from hprobes import HProbes, __version__
+    from hprobes.cett import get_mlp_down_proj
+
+    import torch
+
+    sep = "─" * 68
+    print(f"\nhprobes v{__version__}  |  edit: {args.probe}")
+    print(sep)
+
+    print(f"  Loading {args.model}...", end="", flush=True)
+    tokenizer, model = _load_model(args)
+    print(" done")
+
+    print(f"  Loading probe from {args.probe}...", end="", flush=True)
+    probe = HProbes.load(args.probe, model, tokenizer)
+    print(f" done  ({probe.n_neurons_} H-Neurons)")
+
+    if not probe.h_neurons_:
+        print("  Error: no H-Neurons in probe — nothing to edit")
+        return
+
+    neurons_by_layer = {}
+    for layer_idx, neuron_idx in probe.h_neurons_:
+        neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
+
+    print(
+        f"  Zeroing {probe.n_neurons_} neurons across {len(neurons_by_layer)} layers...",
+        end="",
+        flush=True,
+    )
+    for layer_idx, neurons in sorted(neurons_by_layer.items()):
+        down_proj = get_mlp_down_proj(model, layer_idx)
+        indices = torch.tensor(neurons, dtype=torch.long)
+        down_proj.weight.data[:, indices] = 0
+    print(" done")
+
+    alpha = args.alpha
+    if alpha != 0:
+        print(
+            f"  Note: full zeroing only. alpha={alpha} scaling not yet supported for edit; using alpha=0"
+        )
+
+    output_dir = args.output or f"{Path(args.model).stem}_dehallucinated"
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"\n  Saved → {output_dir}")
+    print(sep + "\n")
+
+
 def _add_common_model_args(p):
     """Add --device, --dtype, and --trust-remote-code to a subparser."""
     p.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda (default: auto)")
@@ -1274,6 +1325,25 @@ def main() -> None:
         help="Path to save comparison results (default: print to stdout)",
     )
 
+    # ── hprobes edit ───────────────────────────────────────────────────────────
+    edit_p = subparsers.add_parser(
+        "edit", help="Permanently zero H-Neuron weights to dehallucinate a model"
+    )
+    edit_p.add_argument("--probe", required=True, help="Base path of saved probe")
+    edit_p.add_argument("--model", required=True, help="HuggingFace model ID to load and modify")
+    edit_p.add_argument(
+        "--alpha",
+        type=float,
+        default=0.0,
+        help="Scale factor (0=suppress, 1=baseline, 2=amplify). Only alpha=0 is supported for edit.",
+    )
+    edit_p.add_argument(
+        "--output",
+        default=None,
+        help="Output directory for dehallucinated model (default: auto-named)",
+    )
+    _add_common_model_args(edit_p)
+
     args = parser.parse_args()
     if args.command == "run":
         cmd_run(args)
@@ -1283,6 +1353,8 @@ def main() -> None:
         cmd_transfer(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "edit":
+        cmd_edit(args)
 
 
 if __name__ == "__main__":
