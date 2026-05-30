@@ -400,7 +400,9 @@ class HProbes:
         if self.check_l2 and self.n_neurons_ > 0:
             self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
         if self.stability and self.n_neurons_ > 0:
-            self._stability_results_ = _run_stability_check(X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed)
+            self._stability_results_ = _run_stability_check(
+                X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
+            )
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -638,7 +640,9 @@ class HProbes:
         if self.check_l2 and self.n_neurons_ > 0:
             self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
         if self.stability and self.n_neurons_ > 0:
-            self._stability_results_ = _run_stability_check(X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed)
+            self._stability_results_ = _run_stability_check(
+                X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
+            )
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
