@@ -631,6 +631,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             top_k=args.top_k,
             check_l2=getattr(args, "check_l2", False),
+            stability=getattr(args, "stability", False),
         )
         probe.fit_from_responses(
             samples,
@@ -1106,6 +1107,12 @@ def _add_common_probe_args(p):
         action="store_true",
         dest="check_l2",
         help="Run L2 regression alongside L1 to check for collinearity among H-Neurons",
+    )
+    p.add_argument(
+        "--stability",
+        action="store_true",
+        dest="stability",
+        help="Bootstrap L1 across random seeds to test H-Neuron selection stability",
     )
 
 

@@ -90,6 +90,62 @@ def _run_l2_check(
     }
 
 
+def _run_stability_check(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    l1_C: float,
+    n_runs: int = 5,
+    base_seed: int = 42,
+) -> Dict[str, Any]:
+    """Bootstrap stability: refit L1 on bootstrapped versions of X_train, compare neurons.
+
+    Returns dict with neuron consistency, Jaccard similarities, and per-run counts.
+    """
+    n_samples = X_train.shape[0]
+    neuron_sets = []
+
+    for i in range(n_runs):
+        clf = LogisticRegression(
+            penalty="l1",
+            solver="liblinear",
+            C=l1_C,
+            max_iter=1000,
+            random_state=base_seed + i + 1,
+        )
+        idx = np.random.RandomState(base_seed + i).choice(n_samples, size=n_samples, replace=True)
+        Xb, yb = X_train[idx], y_train[idx]
+        clf.fit(Xb, yb)
+        selected = set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
+        neuron_sets.append(selected)
+
+    n_neurons_per_run = [len(s) for s in neuron_sets]
+
+    intersection_all = neuron_sets[0]
+    for s in neuron_sets[1:]:
+        intersection_all = intersection_all & s
+
+    jaccards = []
+    for i in range(len(neuron_sets)):
+        for j in range(i + 1, len(neuron_sets)):
+            a, b = neuron_sets[i], neuron_sets[j]
+            union = len(a | b)
+            jaccards.append(len(a & b) / union if union > 0 else 0.0)
+
+    return {
+        "n_runs": n_runs,
+        "neurons_per_run": n_neurons_per_run,
+        "neurons_consistent_all_runs": len(intersection_all),
+        "jaccard_min": float(np.min(jaccards)) if jaccards else 0.0,
+        "jaccard_max": float(np.max(jaccards)) if jaccards else 0.0,
+        "jaccard_mean": float(np.mean(jaccards)) if jaccards else 0.0,
+        "interpretation": (
+            "H-Neurons consistent across bootstrap runs — robust selection"
+            if len(intersection_all) >= n_neurons_per_run[0] * 0.5
+            else "H-Neurons unstable across bootstrap runs — possible sensitivity to data composition"
+        ),
+    }
+
+
 class HProbes:
     """Discover and causally validate hallucination-associated FFN neurons in a transformer LLM.
 
@@ -142,11 +198,13 @@ class HProbes:
         n_consistency: int = 1,
         top_k: int = 5000,
         check_l2: bool = False,
+        stability: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.l1_C = l1_C
         self.check_l2 = check_l2
+        self.stability = stability
         self.top_k = top_k
         self.batch_size = batch_size
         self.layer_stride = layer_stride
@@ -164,6 +222,7 @@ class HProbes:
         self.threshold_: float = 0.5
         self.is_fitted_: bool = False
         self._l2_results_: Optional[Dict] = None
+        self._stability_results_: Optional[Dict] = None
 
         # Internal state
         self._layers: List[int] = []
@@ -340,6 +399,8 @@ class HProbes:
 
         if self.check_l2 and self.n_neurons_ > 0:
             self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
+        if self.stability and self.n_neurons_ > 0:
+            self._stability_results_ = _run_stability_check(X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed)
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -576,6 +637,8 @@ class HProbes:
 
         if self.check_l2 and self.n_neurons_ > 0:
             self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
+        if self.stability and self.n_neurons_ > 0:
+            self._stability_results_ = _run_stability_check(X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed)
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -833,6 +896,8 @@ class HProbes:
             out["causal_validation"] = {str(k): v for k, v in self.cv_results_.items()}
         if self._l2_results_ is not None:
             out["l2_check"] = self._l2_results_
+        if self._stability_results_ is not None:
+            out["stability"] = self._stability_results_
 
         out["config"] = {
             "h_neurons": self.h_neurons_,
