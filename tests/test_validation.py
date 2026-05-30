@@ -1,7 +1,6 @@
 """Tests for L2, stability, and correlation validation functions."""
 
 import numpy as np
-import pytest
 from hprobes.probe import _run_l2_check, _run_stability_check, _run_correlation_check
 
 
@@ -93,7 +92,6 @@ class TestCorrelationCheck:
         rng = np.random.RandomState(42)
         X = rng.randn(100, 5)
         X[:, 1] = X[:, 0] * 0.99  # near-identical copy
-        y = (X[:, 0] > 0).astype(int)
 
         # Check correlation from feature 0's perspective
         # feature 0 should have high max |r| because column 1 is a copy
@@ -114,7 +112,6 @@ class TestCorrelationCheck:
         rng = np.random.RandomState(42)
         X = rng.randn(100, 5)
         X[:, 1] = X[:, 0] * 0.99
-        y = (X[:, 0] > 0).astype(int)
         result = _run_correlation_check(np.array([0]), X)
         assert (
             "correlated clusters" in result["interpretation"].lower()
