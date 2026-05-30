@@ -863,6 +863,14 @@ class HProbes:
             tensors["col_mean"] = torch.tensor(self._col_mean)
         if self._col_std is not None:
             tensors["col_std"] = torch.tensor(self._col_std)
+        if self._X_train_cache is not None:
+            tensors["X_train"] = torch.tensor(self._X_train_cache)
+        if self._y_train_cache is not None:
+            tensors["y_train"] = torch.tensor(self._y_train_cache)
+        if self._X_val is not None and len(self._X_val) > 0:
+            tensors["X_val"] = torch.tensor(self._X_val)
+        if self._y_val is not None and len(self._y_val) > 0:
+            tensors["y_val"] = torch.tensor(self._y_val)
 
         sf_path = p.with_suffix(".safetensors")
         save_file(tensors, sf_path)
@@ -935,6 +943,10 @@ class HProbes:
         probe._top_k_idx = tensors["top_k_idx"].numpy() if "top_k_idx" in tensors else None
         probe._col_mean = tensors["col_mean"].numpy() if "col_mean" in tensors else None
         probe._col_std = tensors["col_std"].numpy() if "col_std" in tensors else None
+        probe._X_train_cache = tensors["X_train"].numpy() if "X_train" in tensors else None
+        probe._y_train_cache = tensors["y_train"].numpy() if "y_train" in tensors else None
+        probe._X_val = tensors["X_val"].numpy() if "X_val" in tensors else np.array([])
+        probe._y_val = tensors["y_val"].numpy() if "y_val" in tensors else np.array([])
 
         probe.h_neurons_ = [(layer, neuron) for layer, neuron in config["h_neurons"]]
         probe._layers = config["layers"]
