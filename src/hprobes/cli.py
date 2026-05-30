@@ -632,6 +632,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             top_k=args.top_k,
             check_l2=getattr(args, "check_l2", False),
             stability=getattr(args, "stability", False),
+            correlation=getattr(args, "correlation", False),
         )
         probe.fit_from_responses(
             samples,
@@ -1113,6 +1114,12 @@ def _add_common_probe_args(p):
         action="store_true",
         dest="stability",
         help="Bootstrap L1 across random seeds to test H-Neuron selection stability",
+    )
+    p.add_argument(
+        "--correlation",
+        action="store_true",
+        dest="correlation",
+        help="Compute max feature-feature correlation for each H-Neuron",
     )
 
 

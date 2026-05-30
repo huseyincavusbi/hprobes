@@ -146,6 +146,60 @@ def _run_stability_check(
     }
 
 
+def _run_correlation_check(
+    l1_selected_idxs: np.ndarray,
+    X_train: np.ndarray,
+) -> Dict[str, Any]:
+    """Correlation analysis: for each H-Neuron, compute max |r| with all other features.
+
+    High correlation means the neuron is one of many encoding the same pattern
+    (collinearity). Low correlation means it carries unique signal.
+    """
+    n_features = X_train.shape[1]
+    max_corrs = []
+    high_corrs = 0
+
+    for idx in l1_selected_idxs:
+        hn_acts = X_train[:, int(idx)]
+        hn_std = float(np.std(hn_acts))
+        if hn_std < 1e-8:
+            max_corrs.append(0.0)
+            continue
+
+        hn_centered = hn_acts - hn_acts.mean()
+        hn_norm = float(np.sqrt(np.dot(hn_centered, hn_centered)))
+
+        best = 0.0
+        for j in range(n_features):
+            if j == idx:
+                continue
+            col = X_train[:, j]
+            col_std = float(np.std(col))
+            if col_std < 1e-8:
+                continue
+            col_centered = col - col.mean()
+            col_norm = float(np.sqrt(np.dot(col_centered, col_centered)))
+            r = float(np.dot(hn_centered, col_centered) / (hn_norm * col_norm + 1e-10))
+            r_abs = abs(r)
+            if r_abs > best:
+                best = r_abs
+
+        max_corrs.append(round(best, 4))
+        if best > 0.7:
+            high_corrs += 1
+
+    return {
+        "max_correlations": max_corrs,
+        "n_neurons": len(l1_selected_idxs),
+        "n_high_correlation": high_corrs,
+        "interpretation": (
+            "All H-Neurons have low max correlation — genuinely unique features"
+            if high_corrs == 0
+            else f"{high_corrs}/{len(l1_selected_idxs)} H-Neurons have high max correlation — from correlated clusters"
+        ),
+    }
+
+
 class HProbes:
     """Discover and causally validate hallucination-associated FFN neurons in a transformer LLM.
 
@@ -199,12 +253,14 @@ class HProbes:
         top_k: int = 5000,
         check_l2: bool = False,
         stability: bool = False,
+        correlation: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.l1_C = l1_C
         self.check_l2 = check_l2
         self.stability = stability
+        self.correlation = correlation
         self.top_k = top_k
         self.batch_size = batch_size
         self.layer_stride = layer_stride
@@ -223,6 +279,7 @@ class HProbes:
         self.is_fitted_: bool = False
         self._l2_results_: Optional[Dict] = None
         self._stability_results_: Optional[Dict] = None
+        self._correlation_results_: Optional[Dict] = None
 
         # Internal state
         self._layers: List[int] = []
@@ -403,6 +460,8 @@ class HProbes:
             self._stability_results_ = _run_stability_check(
                 X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
             )
+        if self.correlation and self.n_neurons_ > 0:
+            self._correlation_results_ = _run_correlation_check(selected, X_train)
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -643,6 +702,8 @@ class HProbes:
             self._stability_results_ = _run_stability_check(
                 X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
             )
+        if self.correlation and self.n_neurons_ > 0:
+            self._correlation_results_ = _run_correlation_check(selected, X_train)
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -902,6 +963,8 @@ class HProbes:
             out["l2_check"] = self._l2_results_
         if self._stability_results_ is not None:
             out["stability"] = self._stability_results_
+        if self._correlation_results_ is not None:
+            out["correlation"] = self._correlation_results_
 
         out["config"] = {
             "h_neurons": self.h_neurons_,
