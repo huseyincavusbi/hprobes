@@ -48,8 +48,8 @@ def _run_l2_check(
     Returns dict with L2 overlap, weight concentration, AUROC.
     """
     clf_l2 = LogisticRegression(
-        penalty="l2",
         solver="liblinear",
+        l1_ratio=0,
         C=l1_C,
         max_iter=1000,
         random_state=seed,
@@ -106,8 +106,8 @@ def _run_stability_check(
 
     for i in range(n_runs):
         clf = LogisticRegression(
-            penalty="l1",
             solver="liblinear",
+            l1_ratio=1,
             C=l1_C,
             max_iter=1000,
             random_state=base_seed + i + 1,
@@ -1062,7 +1062,6 @@ class HProbes:
             l1_ratio=1,
             C=config["l1_C"],
             max_iter=1000,
-            penalty="l1",
         )
 
         if "clf_coef" in tensors:
@@ -1377,7 +1376,7 @@ class HProbes:
             )
             clf_rand = LogisticRegression(
                 solver="liblinear",
-                penalty="l1",
+                l1_ratio=1,
                 C=self.l1_C,
                 max_iter=1000,
                 random_state=self.seed,
