@@ -511,6 +511,111 @@ def _filter_consistent(
     return balanced
 
 
+def _neurons_by_layer(neurons: List[Tuple[int, int]]) -> dict:
+    """Group (layer, neuron) pairs by layer for hook registration."""
+    grouped: dict = {}
+    for layer_idx, neuron_idx in neurons:
+        grouped.setdefault(layer_idx, []).append(neuron_idx)
+    return grouped
+
+
+def _causal_validation_run(
+    model,
+    tokenizer,
+    neurons: List[Tuple[int, int]],
+    all_layers: List[int],
+    val_subset: List[Dict],
+    open_answer: str,
+    answer_key: str,
+    max_new_tokens: int,
+    alphas: List[float],
+) -> Dict[float, float]:
+    """Run causal validation for a set of neurons and return {alpha: correctness_rate}."""
+    import torch
+    from hprobes.cett import get_mlp_down_proj
+
+    rates: Dict[float, float] = {}
+    val_n = len(val_subset)
+
+    for alpha in alphas:
+        handles = []
+        neurons_by_layer = _neurons_by_layer(neurons)
+
+        for layer_idx in all_layers:
+            if layer_idx not in neurons_by_layer:
+                continue
+            indices = torch.tensor(
+                neurons_by_layer[layer_idx], dtype=torch.long, device=model.device
+            )
+            down_proj = get_mlp_down_proj(model, layer_idx)
+
+            def make_hook(idx, a):
+                def hook(_module, _input):
+                    z = _input[0].clone()
+                    z[..., idx.to(z.device)] *= a
+                    return (z,) + _input[1:]
+
+                return hook
+
+            handles.append(down_proj.register_forward_pre_hook(make_hook(indices, alpha)))
+
+        correct = 0
+        max_tk = max_new_tokens or 40
+        for s in val_subset:
+            prompt = _build_prompt(s, "options", "open")
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_tk,
+                    do_sample=True,
+                    temperature=1.0,
+                    top_p=0.9,
+                    top_k=50,
+                    num_return_sequences=1,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            resp = tokenizer.decode(
+                outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+            ).strip()
+
+            gt = s.get(open_answer)
+            if gt is None:
+                gt = s.get(answer_key)
+            if gt is None:
+                raw_text = s.get("text", "")
+                if raw_text:
+                    gt = {"text": raw_text}
+            if isinstance(gt, dict) and "text" in gt:
+                gt = _parse_bioasq_answer(gt["text"]) or gt.get("value", "")
+
+            if _judge_open_ended(resp, gt):
+                correct += 1
+
+        for h in handles:
+            h.remove()
+
+        rate = correct / val_n if val_n > 0 else 0.0
+        rates[alpha] = rate
+
+    return rates
+
+
+def _pick_random_neurons(
+    h_neurons: List[Tuple[int, int]], layers: List[int], intermediate_dim: int, rng
+) -> List[Tuple[int, int]]:
+    """Pick random neurons from the same layers and same count as H-Neurons."""
+    neurons_by_layer = _neurons_by_layer(h_neurons)
+    random_neurons = []
+    for layer_idx, layer_neurons in neurons_by_layer.items():
+        if layer_idx in layers:
+            candidates = set(range(intermediate_dim)) - set(layer_neurons)
+            if len(candidates) >= len(layer_neurons):
+                picks = rng.sample(sorted(candidates), len(layer_neurons))
+                random_neurons.extend((layer_idx, int(p)) for p in picks)
+    return random_neurons
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     from hprobes import HProbes, __version__
 
@@ -655,77 +760,24 @@ def cmd_run(args: argparse.Namespace) -> None:
         if not probe.h_neurons_:
             print("\n  Causal validation: no H-Neurons found")
         else:
-            import torch
-
-            print("\n  Causal validation (α → correctness rate):")
             val_n = min(100, len(samples))
             val_subset = samples[:val_n]
             alphas = [0.0, 1.0, 2.0]
 
-            from hprobes.cett import get_mlp_down_proj
-
+            print("\n  Causal validation (α → correctness rate):")
+            h_rates = _causal_validation_run(
+                model,
+                tokenizer,
+                probe.h_neurons_,
+                probe._layers,
+                val_subset,
+                open_answer,
+                answer_key,
+                args.max_new_tokens_consistency,
+                alphas,
+            )
             for alpha in alphas:
-                neurons_by_layer: dict = {}
-                for layer_idx, neuron_idx in probe.h_neurons_:
-                    neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
-
-                handles = []
-                for layer_idx in probe._layers:
-                    if layer_idx not in neurons_by_layer:
-                        continue
-                    indices = torch.tensor(
-                        neurons_by_layer[layer_idx], dtype=torch.long, device=model.device
-                    )
-                    down_proj = get_mlp_down_proj(model, layer_idx)
-
-                    def make_hook(idx, a):
-                        def hook(module, input):
-                            z = input[0].clone()
-                            z[..., idx.to(z.device)] *= a
-                            return (z,) + input[1:]
-
-                        return hook
-
-                    handles.append(down_proj.register_forward_pre_hook(make_hook(indices, alpha)))
-
-                correct = 0
-                max_tk = args.max_new_tokens_consistency or 40
-                for s in val_subset:
-                    prompt = _build_prompt(s, "options", "open")
-                    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=max_tk,
-                            do_sample=True,
-                            temperature=1.0,
-                            top_p=0.9,
-                            top_k=50,
-                            num_return_sequences=1,
-                            pad_token_id=tokenizer.eos_token_id,
-                        )
-                    resp = tokenizer.decode(
-                        outputs[0][inputs["input_ids"].shape[1] :],
-                        skip_special_tokens=True,
-                    ).strip()
-
-                    gt = s.get(open_answer)
-                    if gt is None:
-                        gt = s.get(answer_key)
-                    if gt is None:
-                        raw_text = s.get("text", "")
-                        if raw_text:
-                            gt = {"text": raw_text}
-                    if isinstance(gt, dict) and "text" in gt:
-                        gt = _parse_bioasq_answer(gt["text"]) or gt.get("value", "")
-
-                    if _judge_open_ended(resp, gt):
-                        correct += 1
-
-                for h in handles:
-                    h.remove()
-
-                rate = correct / val_n if val_n > 0 else 0.0
+                rate = h_rates[alpha]
                 tag = (
                     "  ← baseline"
                     if alpha == 1.0
@@ -734,6 +786,29 @@ def cmd_run(args: argparse.Namespace) -> None:
                     else "  ← amplification"
                 )
                 print(f"    α={alpha:.1f} → {rate:.3f}{tag}")
+
+            if getattr(args, "random_baseline", False):
+                import random as _random
+
+                rng = _random.Random(args.seed + 1)
+                random_neurons = _pick_random_neurons(
+                    probe.h_neurons_, probe._layers, probe._intermediate_dim, rng
+                )
+                print(f"\n  Random baseline ({len(random_neurons)} random neurons):")
+                r_rates = _causal_validation_run(
+                    model,
+                    tokenizer,
+                    random_neurons,
+                    probe._layers,
+                    val_subset,
+                    open_answer,
+                    answer_key,
+                    args.max_new_tokens_consistency,
+                    alphas,
+                )
+                for alpha in alphas:
+                    rate = r_rates[alpha]
+                    print(f"    α={alpha:.1f} → {rate:.3f}")
 
     saved = probe.save(out_path)
     print(f"\n  Saved → {saved}  +  {Path(out_path).with_suffix('.pkl').name}")
@@ -1120,6 +1195,12 @@ def _add_common_probe_args(p):
         action="store_true",
         dest="correlation",
         help="Compute max feature-feature correlation for each H-Neuron",
+    )
+    p.add_argument(
+        "--random-baseline",
+        action="store_true",
+        dest="random_baseline",
+        help="Run causal validation on random neurons as a control baseline",
     )
 
 

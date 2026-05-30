@@ -117,3 +117,47 @@ class TestCorrelationCheck:
             "correlated clusters" in result["interpretation"].lower()
             or result["n_high_correlation"] > 0
         )
+
+
+class TestRandomBaseline:
+    def test_neurons_by_layer(self):
+        from hprobes.cli import _neurons_by_layer
+
+        neurons = [(0, 5), (0, 7), (2, 3)]
+        grouped = _neurons_by_layer(neurons)
+        assert grouped == {0: [5, 7], 2: [3]}
+
+    def test_neurons_by_layer_empty(self):
+        from hprobes.cli import _neurons_by_layer
+
+        assert _neurons_by_layer([]) == {}
+
+    def test_pick_random_neurons_same_layers(self):
+        from hprobes.cli import _pick_random_neurons
+
+        h_neurons = [(0, 5), (0, 7), (2, 3)]
+        layers = [0, 1, 2]
+        rng = __import__("random").Random(42)
+        picked = _pick_random_neurons(h_neurons, layers, 1000, rng)
+        # Same count
+        assert len(picked) == len(h_neurons)
+        # Layer 0 should get 2 random neurons, layer 2 gets 1
+        layer0_count = sum(1 for layer, _ in picked if layer == 0)
+        layer2_count = sum(1 for layer, _ in picked if layer == 2)
+        assert layer0_count == 2
+        assert layer2_count == 1
+        # No overlap with H-Neurons
+        h_set = set(h_neurons)
+        for n in picked:
+            assert n not in h_set
+
+    def test_pick_random_neurons_not_enough_candidates(self):
+        from hprobes.cli import _pick_random_neurons
+
+        # Layer 0 has 1 neuron, we ask for 2 → insufficient candidates
+        h_neurons = [(0, 0), (0, 1)]
+        layers = [0]
+        rng = __import__("random").Random(42)
+        picked = _pick_random_neurons(h_neurons, layers, 2, rng)
+        # Only 2 total neurons in dim=2, both are H-Neurons → 0 candidates → 0 picked
+        assert len(picked) == 0
