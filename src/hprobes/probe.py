@@ -29,6 +29,67 @@ _NOT_FITTED_MSG = "Call fit() before using this method."
 _MCQ_LETTERS = list("ABCDEFGHIJ")
 
 
+def _run_l2_check(
+    l1_selected_idxs: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    l1_C: float,
+    seed: int,
+) -> Dict[str, Any]:
+    """L2 collinearity check: compare L1-selected features against L2 weight ranking.
+
+    Parameters
+    ----------
+    l1_selected_idxs : indices of L1-selected neurons within the top-k feature space
+    X_train, y_train : training data
+    l1_C : C value used in L1 (reused for fair comparison)
+    seed : random seed
+
+    Returns dict with L2 overlap, weight concentration, AUROC.
+    """
+    clf_l2 = LogisticRegression(
+        penalty="l2",
+        solver="liblinear",
+        C=l1_C,
+        max_iter=1000,
+        random_state=seed,
+    )
+    clf_l2.fit(X_train, y_train)
+
+    coef_l2 = np.abs(clf_l2.coef_[0])
+    top_l2 = np.argsort(coef_l2)[::-1]
+
+    n_l1 = len(l1_selected_idxs)
+    l1_set = set(int(i) for i in l1_selected_idxs)
+    l2_top_n = set(int(i) for i in top_l2[:n_l1])
+
+    overlap = l1_set & l2_top_n
+
+    total_weight = float(coef_l2.sum())
+    top_n_weight = float(coef_l2[top_l2[:n_l1]].sum())
+    weight_concentration = top_n_weight / total_weight if total_weight > 0 else 0.0
+
+    try:
+        probs_l2 = clf_l2.predict_proba(X_train)
+        l2_auroc = float(roc_auc_score(y_train, probs_l2[:, 1]) if probs_l2.shape[1] > 1 else 0.5)
+    except Exception:
+        l2_auroc = 0.5
+
+    return {
+        "n_l1_neurons": n_l1,
+        "l2_overlap_count": len(overlap),
+        "l2_overlap_ratio": len(overlap) / n_l1 if n_l1 > 0 else 0.0,
+        "l2_weight_concentration": weight_concentration,
+        "l2_auroc": l2_auroc,
+        "l2_top_indices": top_l2[:n_l1].tolist(),
+        "interpretation": (
+            "L1 neurons dominate L2 ranking — genuinely sparse signal"
+            if len(overlap) >= n_l1 * 0.6
+            else "L1 neurons not dominant in L2 — possible collinearity with other features"
+        ),
+    }
+
+
 class HProbes:
     """Discover and causally validate hallucination-associated FFN neurons in a transformer LLM.
 
@@ -80,10 +141,12 @@ class HProbes:
         batch_size: int = 1,
         n_consistency: int = 1,
         top_k: int = 5000,
+        check_l2: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.l1_C = l1_C
+        self.check_l2 = check_l2
         self.top_k = top_k
         self.batch_size = batch_size
         self.layer_stride = layer_stride
@@ -100,6 +163,7 @@ class HProbes:
         self.accuracy_: float = 0.0
         self.threshold_: float = 0.5
         self.is_fitted_: bool = False
+        self._l2_results_: Optional[Dict] = None
 
         # Internal state
         self._layers: List[int] = []
@@ -273,6 +337,9 @@ class HProbes:
             self.layer_distribution_[li] = self.layer_distribution_.get(li, 0) + 1
 
         self.is_fitted_ = True
+
+        if self.check_l2 and self.n_neurons_ > 0:
+            self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -506,6 +573,9 @@ class HProbes:
         for li, _ in self.h_neurons_:
             self.layer_distribution_[li] = self.layer_distribution_.get(li, 0) + 1
         self.is_fitted_ = True
+
+        if self.check_l2 and self.n_neurons_ > 0:
+            self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
 
         print(f"[hprobes] H-Neurons: {self.n_neurons_}  |  Ratio: {self.neuron_ratio_:.3f}‰")
         if self.layer_distribution_:
@@ -761,6 +831,8 @@ class HProbes:
             out["score"] = self.score_results_
         if self.cv_results_ is not None:
             out["causal_validation"] = {str(k): v for k, v in self.cv_results_.items()}
+        if self._l2_results_ is not None:
+            out["l2_check"] = self._l2_results_
 
         out["config"] = {
             "h_neurons": self.h_neurons_,

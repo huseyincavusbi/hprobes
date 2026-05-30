@@ -630,6 +630,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
             top_k=args.top_k,
+            check_l2=getattr(args, "check_l2", False),
         )
         probe.fit_from_responses(
             samples,
@@ -1099,6 +1100,12 @@ def _add_common_probe_args(p):
         default=None,
         dest="gen_batch_size",
         help="Batch size for consistency generation (default: same as --batch-size). Use 4-8 on GPU.",
+    )
+    p.add_argument(
+        "--l2",
+        action="store_true",
+        dest="check_l2",
+        help="Run L2 regression alongside L1 to check for collinearity among H-Neurons",
     )
 
 
