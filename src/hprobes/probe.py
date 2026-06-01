@@ -100,23 +100,28 @@ def _run_stability_check(
     """Bootstrap stability: refit L1 on bootstrapped versions of X_train, compare neurons.
 
     Returns dict with neuron consistency, Jaccard similarities, and per-run counts.
+    Runs bootstrap fits in parallel via joblib.
     """
-    n_samples = X_train.shape[0]
-    neuron_sets = []
+    from joblib import Parallel, delayed
 
-    for i in range(n_runs):
+    n_samples = X_train.shape[0]
+
+    def _fit_one(seed_offset: int) -> set:
         clf = LogisticRegression(
             solver="liblinear",
             l1_ratio=1,
             C=l1_C,
             max_iter=1000,
-            random_state=base_seed + i + 1,
+            random_state=base_seed + seed_offset + 1,
         )
-        idx = np.random.RandomState(base_seed + i).choice(n_samples, size=n_samples, replace=True)
+        idx = np.random.RandomState(base_seed + seed_offset).choice(
+            n_samples, size=n_samples, replace=True
+        )
         Xb, yb = X_train[idx], y_train[idx]
         clf.fit(Xb, yb)
-        selected = set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
-        neuron_sets.append(selected)
+        return set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
+
+    neuron_sets = Parallel(n_jobs=-1, verbose=0)(delayed(_fit_one)(i) for i in range(n_runs))
 
     n_neurons_per_run = [len(s) for s in neuron_sets]
 
