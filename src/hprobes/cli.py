@@ -768,6 +768,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         if not probe.h_neurons_:
             print("\n  Causal validation: no H-Neurons found")
+            probe.cv_results_ = None
         else:
             val_n = min(100, len(samples))
             val_subset = samples[:val_n]
@@ -796,6 +797,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 )
                 print(f"    α={alpha:.1f} → {rate:.3f}{tag}")
 
+            causal_info = {"h_neurons": {str(k): v for k, v in h_rates.items()}}
+
             if getattr(args, "random_baseline", False):
                 import random as _random
 
@@ -818,6 +821,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 for alpha in alphas:
                     rate = r_rates[alpha]
                     print(f"    α={alpha:.1f} → {rate:.3f}")
+
+                causal_info["random_baseline"] = {str(k): v for k, v in r_rates.items()}
+
+            probe.cv_results_ = causal_info
 
     saved = probe.save(out_path)
     print(f"\n  Saved → {saved}  +  {Path(out_path).with_suffix('.pkl').name}")
