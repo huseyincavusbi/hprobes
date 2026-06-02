@@ -530,12 +530,34 @@ def _causal_validation_run(
     max_new_tokens: int,
     alphas: List[float],
 ) -> Dict[float, float]:
-    """Run causal validation for a set of neurons and return {alpha: correctness_rate}."""
+    """Run causal validation for a set of neurons and return {alpha: correctness_rate}.
+
+    Batches all samples per alpha to eliminate per-sample generate() overhead.
+    """
     import torch
     from hprobes.cett import get_mlp_down_proj
 
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+
+    # Build prompts once
+    prompts = [_build_prompt(s, "options", "open") for s in val_subset]
+    ground_truths = []
+    for s in val_subset:
+        gt = s.get(open_answer)
+        if gt is None:
+            gt = s.get(answer_key)
+        if gt is None:
+            raw_text = s.get("text", "")
+            if raw_text:
+                gt = {"text": raw_text}
+        if isinstance(gt, dict) and "text" in gt:
+            gt = _parse_bioasq_answer(gt["text"]) or gt.get("value", "")
+        ground_truths.append(gt)
+
     rates: Dict[float, float] = {}
-    val_n = len(val_subset)
+    max_tk = max_new_tokens or 40
 
     for alpha in alphas:
         handles = []
@@ -559,44 +581,31 @@ def _causal_validation_run(
 
             handles.append(down_proj.register_forward_pre_hook(make_hook(indices, alpha)))
 
+        # Batch generate all samples for this alpha
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+        input_len = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tk,
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.9,
+                top_k=50,
+                num_return_sequences=1,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
         correct = 0
-        max_tk = max_new_tokens or 40
-        for s in val_subset:
-            prompt = _build_prompt(s, "options", "open")
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_tk,
-                    do_sample=True,
-                    temperature=1.0,
-                    top_p=0.9,
-                    top_k=50,
-                    num_return_sequences=1,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            resp = tokenizer.decode(
-                outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
-            ).strip()
-
-            gt = s.get(open_answer)
-            if gt is None:
-                gt = s.get(answer_key)
-            if gt is None:
-                raw_text = s.get("text", "")
-                if raw_text:
-                    gt = {"text": raw_text}
-            if isinstance(gt, dict) and "text" in gt:
-                gt = _parse_bioasq_answer(gt["text"]) or gt.get("value", "")
-
+        for i, gt in enumerate(ground_truths):
+            resp = tokenizer.decode(outputs[i][input_len:], skip_special_tokens=True).strip()
             if _judge_open_ended(resp, gt):
                 correct += 1
 
         for h in handles:
             h.remove()
 
-        rate = correct / val_n if val_n > 0 else 0.0
-        rates[alpha] = rate
+        rates[alpha] = correct / len(val_subset)
 
     return rates
 
