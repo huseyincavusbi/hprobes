@@ -799,48 +799,79 @@ def cmd_run(args: argparse.Namespace) -> None:
             print("\n  Causal validation: no H-Neurons found")
             probe.cv_results_ = None
         else:
-            val_n = min(100, len(samples))
-            val_subset = samples[:val_n]
-            alphas = [0.0, 1.0, 2.0]
+            import random as _random
 
-            print("\n  Causal validation (α → correctness rate):")
-            h_rates, h_per_sample = _causal_validation_run(
-                model,
-                tokenizer,
-                probe.h_neurons_,
-                probe._layers,
-                val_subset,
-                open_answer,
-                answer_key,
-                args.max_new_tokens_consistency,
-                alphas,
-            )
+            val_n = min(args.causal_samples, len(samples))
+            val_rng = _random.Random(args.seed + 42)
+            val_subset = val_rng.sample(samples, val_n)
+            alphas = [0.0, 1.0, 2.0]
+            n_seeds = args.causal_seeds
+
+            if n_seeds == 1:
+                print(f"\n  Causal validation (α → correctness rate, n={val_n}):")
+            else:
+                print(f"\n  Causal validation (α → correctness rate, n={val_n}, {n_seeds} seeds):")
+
+            # Collect per-seed rates
+            all_h_rates = {a: [] for a in alphas}
+            all_per_sample = {a: [] for a in alphas}
+
+            for s in range(n_seeds):
+                h_rates, h_per_sample = _causal_validation_run(
+                    model,
+                    tokenizer,
+                    probe.h_neurons_,
+                    probe._layers,
+                    val_subset,
+                    open_answer,
+                    answer_key,
+                    args.max_new_tokens_consistency,
+                    alphas,
+                )
+                for a in alphas:
+                    all_h_rates[a].append(h_rates[a])
+                    all_per_sample[a].append(h_per_sample[a])
+
+            # Report mean +/- SE
+            import math
+
+            causal_info = {"h_neurons": {}, "n_samples": val_n, "n_seeds": n_seeds}
             for alpha in alphas:
-                rate = h_rates[alpha]
+                rates = all_h_rates[alpha]
+                mean_rate = sum(rates) / len(rates)
+                se = (
+                    math.sqrt(sum((r - mean_rate) ** 2 for r in rates) / len(rates))
+                    / math.sqrt(len(rates))
+                    if len(rates) > 1
+                    else 0.0
+                )
                 tag = (
                     "  ← baseline"
                     if alpha == 1.0
-                    else "  ← suppression"
-                    if alpha < 1.0
-                    else "  ← amplification"
+                    else ("  ← suppression" if alpha < 1.0 else "  ← amplification")
                 )
-                print(f"    α={alpha:.1f} → {rate:.3f}{tag}")
+                if n_seeds == 1:
+                    print(f"    α={alpha:.1f} → {mean_rate:.3f}{tag}")
+                else:
+                    print(f"    α={alpha:.1f} → {mean_rate:.3f} ± {se:.3f}{tag}")
+                causal_info["h_neurons"][str(alpha)] = {
+                    "mean": mean_rate,
+                    "se": se,
+                    "rates": rates,
+                }
 
-            causal_info = {"h_neurons": {str(k): v for k, v in h_rates.items()}}
-
-            # McNemar test: α=0 (suppress) vs α=1 (baseline)
-            if 0.0 in h_per_sample and 1.0 in h_per_sample:
-                mcn = _mcnemar(h_per_sample[0.0], h_per_sample[1.0])
-                causal_info["mcnemar_suppress_vs_baseline"] = mcn
-                sig = "significant" if mcn["p_value"] < 0.05 else "not significant"
-                print(
-                    f"\n  McNemar test (α=0 vs α=1): "
-                    f"b={mcn['b']}, c={mcn['c']}, p={mcn['p_value']:.4f} ({sig})"
-                )
+            # Pooled McNemar: concatenate per-sample masks across seeds
+            pooled_0 = [v for s in all_per_sample[0.0] for v in s]
+            pooled_1 = [v for s in all_per_sample[1.0] for v in s]
+            mcn = _mcnemar(pooled_0, pooled_1)
+            causal_info["mcnemar_suppress_vs_baseline"] = mcn
+            sig = "significant" if mcn["p_value"] < 0.05 else "not significant"
+            print(
+                f"\n  McNemar test (α=0 vs α=1): "
+                f"b={mcn['b']}, c={mcn['c']}, p={mcn['p_value']:.4f} ({sig})"
+            )
 
             if getattr(args, "random_baseline", False):
-                import random as _random
-
                 rng = _random.Random(args.seed + 1)
                 random_neurons = _pick_random_neurons(
                     probe.h_neurons_, probe._layers, probe._intermediate_dim, rng
@@ -858,9 +889,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     alphas,
                 )
                 for alpha in alphas:
-                    rate = r_rates[alpha]
-                    print(f"    α={alpha:.1f} → {rate:.3f}")
-
+                    print(f"    α={alpha:.1f} → {r_rates[alpha]:.3f}")
                 causal_info["random_baseline"] = {str(k): v for k, v in r_rates.items()}
 
             probe.cv_results_ = causal_info
@@ -1256,6 +1285,20 @@ def _add_common_probe_args(p):
         action="store_true",
         dest="random_baseline",
         help="Run causal validation on random neurons as a control baseline",
+    )
+    p.add_argument(
+        "--causal-samples",
+        type=int,
+        default=100,
+        dest="causal_samples",
+        help="Number of samples for causal validation (default: 100)",
+    )
+    p.add_argument(
+        "--causal-seeds",
+        type=int,
+        default=1,
+        dest="causal_seeds",
+        help="Number of random seeds for causal validation, reporting mean +/- SE (default: 1)",
     )
 
 
