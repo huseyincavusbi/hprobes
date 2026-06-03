@@ -161,3 +161,36 @@ class TestRandomBaseline:
         picked = _pick_random_neurons(h_neurons, layers, 2, rng)
         # Only 2 total neurons in dim=2, both are H-Neurons → 0 candidates → 0 picked
         assert len(picked) == 0
+
+
+class TestClusterSelection:
+    def test_independent_features(self):
+        from hprobes.probe import _select_cluster_representatives
+
+        rng = np.random.RandomState(42)
+        X = rng.randn(100, 5)
+        reps, info = _select_cluster_representatives(X)
+        assert info["n_clusters"] == 5
+        assert len(reps) == 5
+        assert info["method"] == "cluster"
+
+    def test_correlated_features(self):
+        from hprobes.probe import _select_cluster_representatives
+
+        rng = np.random.RandomState(42)
+        X = rng.randn(100, 6)
+        X[:, 1] = X[:, 0] * 0.9
+        X[:, 2] = X[:, 0] * 0.8
+        X[:, 4] = X[:, 5] * 0.85
+        reps, info = _select_cluster_representatives(X)
+        # Should reduce from 6 to fewer clusters
+        assert info["n_clusters"] < 6
+        assert "cluster_sizes" in info
+
+    def test_single_feature(self):
+        from hprobes.probe import _select_cluster_representatives
+
+        X = np.random.randn(50, 1)
+        reps, info = _select_cluster_representatives(X)
+        assert info["n_clusters"] == 1
+        assert len(reps) == 1

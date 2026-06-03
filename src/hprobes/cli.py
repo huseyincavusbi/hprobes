@@ -776,6 +776,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             check_l2=getattr(args, "check_l2", False),
             stability=getattr(args, "stability", False),
             correlation=getattr(args, "correlation", False),
+            cluster=getattr(args, "cluster", False),
         )
         probe.fit_from_responses(
             samples,
@@ -1279,6 +1280,12 @@ def _add_common_probe_args(p):
         action="store_true",
         dest="correlation",
         help="Compute max feature-feature correlation for each H-Neuron",
+    )
+    p.add_argument(
+        "--cluster",
+        action="store_true",
+        dest="cluster",
+        help="Use hierarchical clustering to select one representative per correlated group before L1",
     )
     p.add_argument(
         "--random-baseline",

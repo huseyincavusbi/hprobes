@@ -205,6 +205,65 @@ def _run_correlation_check(
     }
 
 
+def _select_cluster_representatives(
+    X_train: np.ndarray,
+    correlation_threshold: float = 0.3,
+    max_features_for_corr: int = 2000,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Hierarchical clustering on correlations, pick one rep per cluster.
+
+    Returns (representative_indices, cluster_info) where indices are positions
+    within the top-k feature space.
+    """
+    n_features = X_train.shape[1]
+    if n_features <= 1:
+        return np.arange(n_features), {
+            "n_clusters": n_features,
+            "cluster_sizes": [1] * n_features,
+            "method": "cluster",
+        }
+
+    from scipy.cluster.hierarchy import fcluster, linkage
+
+    if n_features > max_features_for_corr:
+        step = n_features // max_features_for_corr
+        idx_sampled = np.arange(0, n_features, step)[:max_features_for_corr]
+        X_sub = X_train[:, idx_sampled]
+    else:
+        X_sub = X_train
+        idx_sampled = np.arange(n_features)
+
+    corr = np.abs(np.corrcoef(X_sub.T))
+    np.fill_diagonal(corr, 0)
+    dist = 1 - corr
+    np.fill_diagonal(dist, 0)
+
+    Z = linkage(dist[np.triu_indices_from(dist, k=1)], method="average")
+    clusters = fcluster(Z, t=1 - correlation_threshold, criterion="distance")
+
+    n_clusters = max(clusters)
+    reps = np.zeros(n_clusters, dtype=int)
+    for c in range(1, n_clusters + 1):
+        members = idx_sampled[clusters == c]
+        if len(members) == 1:
+            reps[c - 1] = members[0]
+        else:
+            variances = X_train[:, members].var(axis=0)
+            reps[c - 1] = members[np.argmax(variances)]
+
+    reps.sort()
+    cluster_sizes = [int(np.sum(clusters == c)) for c in range(1, n_clusters + 1)]
+
+    info = {
+        "n_features_raw": n_features,
+        "n_clusters": n_clusters,
+        "cluster_sizes": cluster_sizes,
+        "correlation_threshold": correlation_threshold,
+        "method": "cluster",
+    }
+    return reps, info
+
+
 class HProbes:
     """Discover and causally validate hallucination-associated FFN neurons in a transformer LLM.
 
@@ -259,6 +318,7 @@ class HProbes:
         check_l2: bool = False,
         stability: bool = False,
         correlation: bool = False,
+        cluster: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -266,6 +326,7 @@ class HProbes:
         self.check_l2 = check_l2
         self.stability = stability
         self.correlation = correlation
+        self.cluster = cluster
         self.top_k = top_k
         self.batch_size = batch_size
         self.layer_stride = layer_stride
@@ -285,6 +346,7 @@ class HProbes:
         self._l2_results_: Optional[Dict] = None
         self._stability_results_: Optional[Dict] = None
         self._correlation_results_: Optional[Dict] = None
+        self._cluster_info_: Optional[Dict] = None
 
         # Internal state
         self._layers: List[int] = []
@@ -421,7 +483,17 @@ class HProbes:
         self._val_prompts = [valid_prompts[i] for i in val_s]
         self._val_gt = [valid_gt[i] for i in val_s]
 
-        # --- Phase 2: L1 probe ---
+        # --- Phase 2: Cluster-based feature selection (optional) ---
+        if self.cluster:
+            cluster_reps, self._cluster_info_ = _select_cluster_representatives(X_train)
+            X_train = X_train[:, cluster_reps]
+            X_val = X_val[:, cluster_reps]
+            # Update top_k_idx to point to cluster representatives within original indexing
+            self._top_k_cluster_reps = self._top_k_idx[cluster_reps]
+            self._top_k_idx_original = self._top_k_idx.copy()
+            self._top_k_idx = self._top_k_cluster_reps
+
+        # --- Phase 3: L1 probe ---
         self._clf = LogisticRegression(
             solver="liblinear",
             l1_ratio=1,
@@ -664,6 +736,15 @@ class HProbes:
         # Evaluation protocol: answer-token rows only (strip non-answer controls)
         ans_count = len(cett_ans)
         self._val_is_answer = np.array([idx < ans_count for idx in val_rows])
+
+        # --- Cluster-based feature selection (optional) ---
+        if self.cluster:
+            cluster_reps, self._cluster_info_ = _select_cluster_representatives(X_train)
+            X_train = X_train[:, cluster_reps]
+            X_val = X_val[:, cluster_reps]
+            self._top_k_cluster_reps = self._top_k_idx[cluster_reps]
+            self._top_k_idx_original = self._top_k_idx.copy()
+            self._top_k_idx = self._top_k_cluster_reps
 
         self._clf = LogisticRegression(
             solver="liblinear",
@@ -970,6 +1051,8 @@ class HProbes:
             out["stability"] = self._stability_results_
         if self._correlation_results_ is not None:
             out["correlation"] = self._correlation_results_
+        if self._cluster_info_ is not None:
+            out["cluster"] = self._cluster_info_
 
         out["config"] = {
             "h_neurons": self.h_neurons_,
