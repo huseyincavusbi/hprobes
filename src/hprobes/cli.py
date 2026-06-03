@@ -557,6 +557,7 @@ def _causal_validation_run(
         ground_truths.append(gt)
 
     rates: Dict[float, float] = {}
+    per_sample: Dict[float, List[bool]] = {}
     max_tk = max_new_tokens or 40
 
     for alpha in alphas:
@@ -597,17 +598,45 @@ def _causal_validation_run(
             )
 
         correct = 0
+        correct_mask = []
         for i, gt in enumerate(ground_truths):
             resp = tokenizer.decode(outputs[i][input_len:], skip_special_tokens=True).strip()
-            if _judge_open_ended(resp, gt):
+            is_correct = _judge_open_ended(resp, gt)
+            correct_mask.append(is_correct)
+            if is_correct:
                 correct += 1
 
         for h in handles:
             h.remove()
 
         rates[alpha] = correct / len(val_subset)
+        per_sample[alpha] = correct_mask
 
-    return rates
+    return rates, per_sample
+
+
+def _mcnemar(correct_a: List[bool], correct_b: List[bool]) -> Dict[str, float]:
+    """McNemar's test for paired binary data: are correctness rates significantly different?"""
+    b = sum(1 for i in range(len(correct_a)) if correct_a[i] and not correct_b[i])
+    c = sum(1 for i in range(len(correct_a)) if not correct_a[i] and correct_b[i])
+    n_discordant = b + c
+    if n_discordant == 0:
+        return {"statistic": 0.0, "p_value": 1.0, "b": b, "c": c, "n_discordant": 0}
+    from math import comb
+
+    p_exact = 0.0
+    for k in range(min(b, c) + 1):
+        p_exact += comb(n_discordant, k) * (0.5**n_discordant)
+    p_exact *= 2
+    if p_exact > 1.0:
+        p_exact = 1.0
+    return {
+        "statistic": (b - c) ** 2 / n_discordant if n_discordant > 0 else 0.0,
+        "p_value": round(p_exact, 6),
+        "b": b,
+        "c": c,
+        "n_discordant": n_discordant,
+    }
 
 
 def _pick_random_neurons(
@@ -775,7 +804,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             alphas = [0.0, 1.0, 2.0]
 
             print("\n  Causal validation (α → correctness rate):")
-            h_rates = _causal_validation_run(
+            h_rates, h_per_sample = _causal_validation_run(
                 model,
                 tokenizer,
                 probe.h_neurons_,
@@ -799,6 +828,16 @@ def cmd_run(args: argparse.Namespace) -> None:
 
             causal_info = {"h_neurons": {str(k): v for k, v in h_rates.items()}}
 
+            # McNemar test: α=0 (suppress) vs α=1 (baseline)
+            if 0.0 in h_per_sample and 1.0 in h_per_sample:
+                mcn = _mcnemar(h_per_sample[0.0], h_per_sample[1.0])
+                causal_info["mcnemar_suppress_vs_baseline"] = mcn
+                sig = "significant" if mcn["p_value"] < 0.05 else "not significant"
+                print(
+                    f"\n  McNemar test (α=0 vs α=1): "
+                    f"b={mcn['b']}, c={mcn['c']}, p={mcn['p_value']:.4f} ({sig})"
+                )
+
             if getattr(args, "random_baseline", False):
                 import random as _random
 
@@ -807,7 +846,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     probe.h_neurons_, probe._layers, probe._intermediate_dim, rng
                 )
                 print(f"\n  Random baseline ({len(random_neurons)} random neurons):")
-                r_rates = _causal_validation_run(
+                r_rates, _r_per_sample = _causal_validation_run(
                     model,
                     tokenizer,
                     random_neurons,
