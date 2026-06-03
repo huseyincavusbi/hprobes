@@ -800,11 +800,11 @@ def cmd_run(args: argparse.Namespace) -> None:
             print("\n  Causal validation: no H-Neurons found")
             probe.cv_results_ = None
         else:
+            import math
             import random as _random
+            import torch
 
             val_n = min(args.causal_samples, len(samples))
-            val_rng = _random.Random(args.seed + 42)
-            val_subset = val_rng.sample(samples, val_n)
             alphas = [0.0, 1.0, 2.0]
             n_seeds = args.causal_seeds
 
@@ -818,6 +818,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             all_per_sample = {a: [] for a in alphas}
 
             for s in range(n_seeds):
+                subset_rng = _random.Random(args.seed + 42 + s)
+                val_subset = subset_rng.sample(samples, val_n)
+                torch.manual_seed(args.seed + 1000 + s)
                 h_rates, h_per_sample = _causal_validation_run(
                     model,
                     tokenizer,
@@ -834,8 +837,6 @@ def cmd_run(args: argparse.Namespace) -> None:
                     all_per_sample[a].append(h_per_sample[a])
 
             # Report mean +/- SE
-            import math
-
             causal_info = {"h_neurons": {}, "n_samples": val_n, "n_seeds": n_seeds}
             for alpha in alphas:
                 rates = all_h_rates[alpha]
