@@ -121,7 +121,8 @@ def _run_stability_check(
         clf.fit(Xb, yb)
         return set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
 
-    neuron_sets = Parallel(n_jobs=-1, verbose=0)(delayed(_fit_one)(i) for i in range(n_runs))
+    n_jobs = 1 if X_train.shape[1] * X_train.shape[0] * 8 > 2 * 1024**3 else -1
+    neuron_sets = Parallel(n_jobs=n_jobs, verbose=0)(delayed(_fit_one)(i) for i in range(n_runs))
 
     n_neurons_per_run = [len(s) for s in neuron_sets]
 
