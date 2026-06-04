@@ -1076,7 +1076,19 @@ class HProbes:
             "clf_classes": self._clf.classes_.tolist() if hasattr(self._clf, "classes_") else [],
         }
 
-        json_path.write_text(json.dumps(out, indent=2))
+        class _NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, np.bool_):
+                    return bool(obj)
+                return super().default(obj)
+
+        json_path.write_text(json.dumps(out, indent=2, cls=_NumpyEncoder))
 
         # Save classifier state for transfer experiments
         tensors = {}
