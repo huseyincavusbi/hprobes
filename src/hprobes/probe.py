@@ -488,7 +488,10 @@ class HProbes:
             cluster_reps, self._cluster_info_ = _select_cluster_representatives(X_train)
             X_train = X_train[:, cluster_reps]
             X_val = X_val[:, cluster_reps]
-            # Update top_k_idx to point to cluster representatives within original indexing
+            self._X_train_cache = X_train
+            self._y_train_cache = y_train
+            self._X_val = X_val
+            self._y_val = y_val
             self._top_k_cluster_reps = self._top_k_idx[cluster_reps]
             self._top_k_idx_original = self._top_k_idx.copy()
             self._top_k_idx = self._top_k_cluster_reps
@@ -742,6 +745,10 @@ class HProbes:
             cluster_reps, self._cluster_info_ = _select_cluster_representatives(X_train)
             X_train = X_train[:, cluster_reps]
             X_val = X_val[:, cluster_reps]
+            self._X_val = X_val
+            self._y_val = y_val
+            self._X_train_cache = X_train
+            self._y_train_cache = y_train
             self._top_k_cluster_reps = self._top_k_idx[cluster_reps]
             self._top_k_idx_original = self._top_k_idx.copy()
             self._top_k_idx = self._top_k_cluster_reps
