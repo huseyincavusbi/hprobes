@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hprobes"
-version = "0.7.2"
+version = "0.8.0"
 description = "Hallucination neuron discovery and causal validation for transformer LLMs"
 readme = "README.md"
 requires-python = ">=3.10"
