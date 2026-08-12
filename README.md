@@ -82,6 +82,7 @@ This research is conducted in collaboration with the
 ## Contributors
 
 - **Huseyin Cavus** — Core Contributor
-- **Dr. Pavithra Rajendran** — Machine Learning Lead, GOSH DRIVE
+- **Pavithra Rajendran, PhD** — Machine Learning Lead, GOSH DRIVE
 - **Sebin Sabu** — Senior AI Scientist, GOSH DRIVE
 - **Jaskaran Singh Kawatra** — ML Engineer, GOSH DRIVE
+- **Josh Spear, PhD** — Postdoctoral Researcher, GOSH DRIVE
