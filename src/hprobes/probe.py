@@ -21,8 +21,10 @@ from .cett import (
     forward_cett_at_token_batch,
     forward_cett_batch,
     forward_cett_dual_span,
+    forward_cett_dual_span_batch,
     precompute_col_norms,
     scale_h_neurons,
+    scale_h_neurons_batch,
 )
 
 _NOT_FITTED_MSG = "Call fit() before using this method."
@@ -609,6 +611,28 @@ class HProbes:
         valid_prompts, valid_gt = [], []
         per_sample, skipped = [], 0
 
+        def _record_features(full_text, is_correct, vec_ans, vec_other):
+            valid_prompts.append(full_text)
+            valid_gt.append("correct" if is_correct else "incorrect")
+            per_sample.append({"is_correct": is_correct})
+
+            ans = np.nan_to_num(vec_ans.numpy().astype(np.float32))
+            cett_ans.append(ans)
+            labels_ans.append(0 if is_correct else 1)  # 1 = hallucinatory
+            self._welford_update(ans)
+
+            oth = np.nan_to_num(vec_other.numpy().astype(np.float32))
+            cett_other.append(oth)
+            labels_other.append(0)  # always negative (non-answer tokens)
+            self._welford_update(oth)
+
+        device = next(self.model.parameters()).device
+        if self.batch_size > 1:
+            orig_padding_side = self.tokenizer.padding_side
+            self.tokenizer.padding_side = "right"
+
+        pending = []  # (full_text, (span_start, span_end), is_correct)
+
         for sample in tqdm(samples, desc="CETT extraction (responses)"):
             raw_label = sample.get(label_key)
             if raw_label is None:
@@ -666,37 +690,81 @@ class HProbes:
                 skipped += 1
                 continue
 
-            try:
-                vec_ans, vec_other = forward_cett_dual_span(
-                    self.model,
-                    tokens,
-                    span_start,
-                    span_end,
-                    self._layers,
-                    self._col_norms,
-                    aggregation,
-                )
-            except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
-                logging.warning(f"Error: {e}")
-                skipped += 1
-                continue
+            pending.append((full_text, (span_start, span_end), is_correct))
 
-            valid_prompts.append(full_text)
-            valid_gt.append("correct" if is_correct else "incorrect")
-            per_sample.append({"is_correct": is_correct})
+            if self.batch_size > 1 and len(pending) >= self.batch_size:
+                batch = pending
+                pending = []
+                prompts = [b[0] for b in batch]
+                enc = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_tokens,
+                ).to(device)
+                spans = [b[1] for b in batch]
+                try:
+                    vec_ans_m, vec_oth_m = forward_cett_dual_span_batch(
+                        self.model, enc, spans, self._layers, self._col_norms, aggregation
+                    )
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                    logging.warning(f"Error: {e}")
+                    skipped += len(batch)
+                    continue
+                for i, (full_text, _span, is_correct) in enumerate(batch):
+                    _record_features(full_text, is_correct, vec_ans_m[i], vec_oth_m[i])
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            ans = np.nan_to_num(vec_ans.numpy().astype(np.float32))
-            cett_ans.append(ans)
-            labels_ans.append(0 if is_correct else 1)  # 1 = hallucinatory
-            self._welford_update(ans)
+        # Flush the final partial batch (batch_size > 1) or each single sample
+        # (batch_size == 1, preserving the original per-sample forward path).
+        if self.batch_size > 1:
+            if pending:
+                prompts = [b[0] for b in pending]
+                enc = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_tokens,
+                ).to(device)
+                spans = [b[1] for b in pending]
+                try:
+                    vec_ans_m, vec_oth_m = forward_cett_dual_span_batch(
+                        self.model, enc, spans, self._layers, self._col_norms, aggregation
+                    )
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                    logging.warning(f"Error: {e}")
+                    skipped += len(pending)
+                else:
+                    for i, (full_text, _span, is_correct) in enumerate(pending):
+                        _record_features(full_text, is_correct, vec_ans_m[i], vec_oth_m[i])
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        else:
+            for full_text, span, is_correct in pending:
+                span_start, span_end = span
+                try:
+                    vec_ans, vec_other = forward_cett_dual_span(
+                        self.model,
+                        self._tokenize(full_text),
+                        span_start,
+                        span_end,
+                        self._layers,
+                        self._col_norms,
+                        aggregation,
+                    )
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                    logging.warning(f"Error: {e}")
+                    skipped += 1
+                    continue
+                _record_features(full_text, is_correct, vec_ans, vec_other)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            oth = np.nan_to_num(vec_other.numpy().astype(np.float32))
-            cett_other.append(oth)
-            labels_other.append(0)  # always negative (non-answer tokens)
-            self._welford_update(oth)
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if self.batch_size > 1:
+            self.tokenizer.padding_side = orig_padding_side
 
         if skipped:
             print(f"[hprobes] Skipped: {skipped}")
@@ -918,24 +986,57 @@ class HProbes:
         alphas = alphas or [0.0, 0.5, 1.0, 1.5, 2.0]
         results = {}
 
+        device = next(self.model.parameters()).device
+        if self.batch_size > 1 and self._val_prompts:
+            orig_padding_side = self.tokenizer.padding_side
+            self.tokenizer.padding_side = "right"
+
         for alpha in alphas:
             correct, total = 0, 0
-            for prompt, gt in zip(self._val_prompts, self._val_gt):
-                tokens = self._tokenize(prompt)
-                try:
-                    logits = scale_h_neurons(
-                        self.model, tokens, self.h_neurons_, alpha, self._layers
-                    )
-                    pred = self._predict_letter(logits)
-                    correct += int(pred == gt)
-                    total += 1
-                except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
-                    logging.warning(f"Error: {e}")
-                    continue
+            if self.batch_size > 1 and self._val_prompts:
+                for start in range(0, len(self._val_prompts), self.batch_size):
+                    chunk_prompts = self._val_prompts[start : start + self.batch_size]
+                    chunk_gt = self._val_gt[start : start + self.batch_size]
+                    enc = self.tokenizer(
+                        chunk_prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_tokens,
+                    ).to(device)
+                    try:
+                        logits_matrix = scale_h_neurons_batch(
+                            self.model, enc, self.h_neurons_, alpha, self._layers
+                        )
+                    except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                        logging.warning(f"Error: {e}")
+                        continue
+                    for i, gt in enumerate(chunk_gt):
+                        pred = self._predict_letter(logits_matrix[i])
+                        correct += int(pred == gt)
+                        total += 1
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+            else:
+                for prompt, gt in zip(self._val_prompts, self._val_gt):
+                    tokens = self._tokenize(prompt)
+                    try:
+                        logits = scale_h_neurons(
+                            self.model, tokens, self.h_neurons_, alpha, self._layers
+                        )
+                        pred = self._predict_letter(logits)
+                        correct += int(pred == gt)
+                        total += 1
+                    except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                        logging.warning(f"Error: {e}")
+                        continue
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             results[alpha] = correct / total if total > 0 else 0.0
+
+        if self.batch_size > 1 and self._val_prompts:
+            self.tokenizer.padding_side = orig_padding_side
 
         self.cv_results_ = results
         return results
@@ -1377,16 +1478,8 @@ class HProbes:
         X, y = [], []
         skipped = 0
 
-        for sample in tqdm(samples, desc="CETT extraction (transfer)"):
-            raw_label = sample.get(label_key)
-            if raw_label is None:
-                skipped += 1
-                continue
-            is_correct = str(raw_label).lower() in ("true", "1", "t")
-
-            question = sample.get(question_key, "")
-            response = sample.get(response_key, "")
-
+        def _make_span(sample, question, response):
+            """Build (full_text, (span_start, span_end)) for a sample, or None."""
             if (
                 hasattr(self.tokenizer, "apply_chat_template")
                 and self.tokenizer.chat_template is not None
@@ -1417,27 +1510,110 @@ class HProbes:
                 span_start, span_end = 0, seq_len
             else:
                 span_end = seq_len
+            return full_text, (span_start, span_end)
 
-            try:
-                vec_ans, _vec_other = forward_cett_dual_span(
-                    self.model,
-                    tokens,
-                    span_start,
-                    span_end,
-                    self._layers,
-                    self._col_norms,
-                    aggregation,
-                )
-            except (ValueError, KeyError, RuntimeError, IndexError, TypeError):
+        device = next(self.model.parameters()).device
+        if self.batch_size > 1:
+            orig_padding_side = self.tokenizer.padding_side
+            self.tokenizer.padding_side = "right"
+
+        pending = []  # (sample, is_correct, full_text, span)
+
+        for sample in tqdm(samples, desc="CETT extraction (transfer)"):
+            raw_label = sample.get(label_key)
+            if raw_label is None:
                 skipped += 1
                 continue
+            is_correct = str(raw_label).lower() in ("true", "1", "t")
 
-            ans = np.nan_to_num(vec_ans.numpy().astype(np.float32))
-            X.append(ans)
-            y.append(0 if is_correct else 1)
+            question = sample.get(question_key, "")
+            response = sample.get(response_key, "")
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            made = _make_span(sample, question, response)
+            if made is None:
+                skipped += 1
+                continue
+            full_text, span = made
+
+            pending.append((sample, is_correct, full_text, span))
+
+            if self.batch_size > 1 and len(pending) >= self.batch_size:
+                batch = pending
+                pending = []
+                prompts = [b[2] for b in batch]
+                enc = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_tokens,
+                ).to(device)
+                spans = [b[3] for b in batch]
+                try:
+                    vec_ans_m, _vec_oth_m = forward_cett_dual_span_batch(
+                        self.model, enc, spans, self._layers, self._col_norms, aggregation
+                    )
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError):
+                    skipped += len(batch)
+                    continue
+                for i, (_sample, is_correct, _ft, _span) in enumerate(batch):
+                    ans = np.nan_to_num(vec_ans_m[i].numpy().astype(np.float32))
+                    X.append(ans)
+                    y.append(0 if is_correct else 1)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Final partial batch (batch_size > 1) or the batch_size==1 single-forward path
+        if self.batch_size > 1:
+            if pending:
+                prompts = [b[2] for b in pending]
+                enc = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_tokens,
+                ).to(device)
+                spans = [b[3] for b in pending]
+                try:
+                    vec_ans_m, _vec_oth_m = forward_cett_dual_span_batch(
+                        self.model, enc, spans, self._layers, self._col_norms, aggregation
+                    )
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError):
+                    skipped += len(pending)
+                else:
+                    for i, (_sample, is_correct, _ft, _span) in enumerate(pending):
+                        ans = np.nan_to_num(vec_ans_m[i].numpy().astype(np.float32))
+                        X.append(ans)
+                        y.append(0 if is_correct else 1)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        else:
+            for _sample, is_correct, full_text, span in pending:
+                span_start, span_end = span
+                try:
+                    vec_ans, _vec_other = forward_cett_dual_span(
+                        self.model,
+                        self._tokenize(full_text),
+                        span_start,
+                        span_end,
+                        self._layers,
+                        self._col_norms,
+                        aggregation,
+                    )
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError):
+                    skipped += 1
+                    continue
+
+                ans = np.nan_to_num(vec_ans.numpy().astype(np.float32))
+                X.append(ans)
+                y.append(0 if is_correct else 1)
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        if self.batch_size > 1:
+            self.tokenizer.padding_side = orig_padding_side
 
         if skipped:
             print(f"[hprobes] Skipped transfer samples: {skipped}")
@@ -1814,7 +1990,7 @@ class HProbes:
         letters = list(self._letter_ids.keys())
         token_ids = torch.tensor(list(self._letter_ids.values()))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             out = self.model(**tokens)
 
         logits = out.logits[0, -1, :].float().cpu()
