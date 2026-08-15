@@ -1351,6 +1351,56 @@ class HProbes:
             }
 
         X, y = [], []
+        skipped = 0
+
+        device = next(self.model.parameters()).device
+        if self.batch_size > 1:
+            orig_padding_side = self.tokenizer.padding_side
+            self.tokenizer.padding_side = "right"
+
+        batch_buf: list = []  # list of (prompt, gt)
+
+        def _flush(buf):
+            nonlocal skipped
+            if not buf:
+                return
+            prompts = [b[0] for b in buf]
+            enc = self.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_tokens,
+            ).to(device)
+            if "attention_mask" in enc:
+                last_positions = (enc["attention_mask"].sum(dim=1) - 1).tolist()
+            else:
+                last_positions = [enc["input_ids"].shape[1] - 1] * len(buf)
+            try:
+                cett_matrix, logits_matrix = forward_cett_batch(
+                    self.model,
+                    enc,
+                    self._layers,
+                    self._col_norms,
+                    [int(p) for p in last_positions],
+                )
+            except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                logging.warning(f"Error: {e}")
+                skipped += len(buf)
+                return
+            for i, (prompt, gt) in enumerate(buf):
+                try:
+                    cett_vec = cett_matrix[i].numpy()
+                    pred = self._predict_letter(logits_matrix[i])
+                    label = 1 if pred != gt else 0
+                    X.append(cett_vec)
+                    y.append(label)
+                except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                    logging.warning(f"Error: {e}")
+                    skipped += 1
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         for sample in tqdm(samples, desc="CETT extraction (transfer)"):
             gt = self._parse_ground_truth(sample, answer_key)
             if gt is None:
@@ -1358,16 +1408,22 @@ class HProbes:
             prompt = self._build_prompt(
                 sample, question_key, options_key, prompt_fn, self._answer_cue
             )
-            tokens = self._tokenize(prompt)
-            try:
-                cett_vec, logits = forward_cett(self.model, tokens, self._layers, self._col_norms)
-                pred = self._predict_letter(logits)
-                label = 1 if pred != gt else 0
-                X.append(cett_vec.numpy())
-                y.append(label)
-            except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
-                logging.warning(f"Error: {e}")
-                continue
+            batch_buf.append((prompt, gt))
+            if self.batch_size > 1 and len(batch_buf) >= self.batch_size:
+                _flush(batch_buf)
+                batch_buf = []
+            if self.batch_size <= 1 and len(batch_buf) >= 1:
+                _flush(batch_buf)
+                batch_buf = []
+
+        if batch_buf:
+            _flush(batch_buf)
+
+        if self.batch_size > 1:
+            self.tokenizer.padding_side = orig_padding_side
+
+        if skipped:
+            print(f"[hprobes] Skipped transfer samples: {skipped}")
 
         if not X:
             return {
