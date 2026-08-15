@@ -100,11 +100,13 @@ class TestLayer1Tensor:
             handles.append(
                 dp.register_forward_hook(
                     (
-                        lambda idx: lambda mod, inp, out: (
-                            zs.__setitem__(idx, inp[0][0, -1].detach().float()),
-                            hs.__setitem__(idx, out[0, -1].detach().float()),
-                            out,
-                        )[2]
+                        lambda idx: (
+                            lambda mod, inp, out: (
+                                zs.__setitem__(idx, inp[0][0, -1].detach().float()),
+                                hs.__setitem__(idx, out[0, -1].detach().float()),
+                                out,
+                            )[2]
+                        )
                     )(li)
                 )
             )
