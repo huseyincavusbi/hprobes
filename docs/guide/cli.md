@@ -37,6 +37,7 @@ hprobes run \
 | `--output` | auto-named | Base path for output files (`.json` + `.pkl`) |
 | `--device` | `auto` | Device: `auto`, `cpu`, `mps`, `cuda` |
 | `--dtype` | `auto` | Precision: `auto`, `float16`, `bfloat16`, `float32` |
+| `--attn-implementation` | `auto` | Attention implementation: `auto`, `eager`, `sdpa`, `flash_attention_2` |
 | `--l1-c` | `0.5` | Inverse L1 regularisation strength (Python API default is `0.01`) |
 | `--seed` | `42` | Random seed |
 | `--layer-stride` | `1` | Sample every Nth layer |
@@ -44,6 +45,14 @@ hprobes run \
 | `--max-tokens` | `1024` | Max input tokens before truncation |
 | `--alphas` | `0.0,0.5,1.0,1.5,2.0` | Comma-separated alpha values for causal validation |
 | `--batch-size` | `1` | Batch size for CETT extraction |
+
+> **Numerical-equivalence warning (research integrity).** `eager` attention is the
+> reference used for published results. `sdpa` and `flash_attention_2` are faster
+> but only *approximately* numerically equal to eager — they can shift activations
+> and flip borderline predictions. They must **not** be used to produce or
+> reproduce published paper numbers unless you run and record an equivalence
+> check (see `tests/test_attn_equivalence.py`). The default `auto` keeps the
+> model's native path unchanged.
 
 ### Output
 

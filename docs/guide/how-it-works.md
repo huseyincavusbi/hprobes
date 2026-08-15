@@ -93,3 +93,15 @@ threshold = argmax(J)
 ```
 
 This is stored as `probe.threshold_` and persisted through `save()`/`load()`. The threshold is used in production when you need a binary hallucination/not-hallucination decision rather than a continuous score.
+
+## Performance Optimizations and Numerical Equivalence
+
+hprobes batches the deterministic CETT extraction loops (`fit_from_responses`, `score_on_responses`, `causal_validate`) when `batch_size > 1`, and uses `torch.inference_mode()` (numerically identical to `no_grad`, just faster). The batched paths are verified equivalent to the single-sample paths by `tests/test_equivalence.py` and `tests/test_attn_equivalence.py`.
+
+### Attention implementations are approximately-equal, not bit-identical
+
+`eager` attention is the reference used for published results. `sdpa` and `flash_attention_2` (opt-in via `--attn-implementation`) are faster but only approximately numerically equal — fused kernels reorder floating-point accumulation. On MPS we measured eager-vs-sdpa logits differing by up to ~0.5 (argmax stable on test samples); activations at `down_proj` shift by ~1e-2–1e-1 relative. This can flip borderline predictions. **Do not use sdpa/flash to produce or reproduce published paper numbers unless you run and record an equivalence check** (the harness in `tests/test_attn_equivalence.py`).
+
+### Why the hooked probing paths do not use `torch.compile`
+
+CETT extraction and α-scaling read/modify activations through forward hooks that write to Python dicts. `torch.compile` with `fullgraph=True` is incompatible with this pattern: the hook logic gets baked into the compiled graph at trace time and never executes during the forward pass, so no activations are captured (see pytorch/pytorch#173452, open as of 2026). The `fullgraph=False` workaround loses ~30–50% of the CUDA-graph speedup. Consequently the probing paths intentionally stay eager. `torch.compile` is only safe for hook-free, fixed-shape forward passes (e.g. plain generation).

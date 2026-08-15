@@ -195,12 +195,15 @@ def _load_model(args):
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=dtype_map[args.dtype],
-        device_map=args.device,
-        trust_remote_code=args.trust_remote_code,
-    )
+    load_kwargs = {
+        "dtype": dtype_map[args.dtype],
+        "device_map": args.device,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    attn = getattr(args, "attn_implementation", "auto")
+    if attn not in ("auto", None):
+        load_kwargs["attn_implementation"] = attn
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model.eval()
     return tokenizer, model
 
@@ -1192,13 +1195,24 @@ def cmd_edit(args: argparse.Namespace) -> None:
 
 
 def _add_common_model_args(p):
-    """Add --device, --dtype, and --trust-remote-code to a subparser."""
+    """Add --device, --dtype, --attn-implementation, and --trust-remote-code."""
     p.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda (default: auto)")
     p.add_argument(
         "--dtype",
         choices=["auto", "float16", "bfloat16", "float32"],
         default="auto",
         help="Model dtype (default: auto)",
+    )
+    p.add_argument(
+        "--attn-implementation",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        default="auto",
+        help="Attention implementation (default: auto — model/transformers default). "
+        "eager is the reference used for published results. sdpa/flash_attention_2 "
+        "are faster but numerically approximately-equal, NOT bit-identical: they can "
+        "shift activations and flip borderline predictions, so they must not be used "
+        "to produce or reproduce published paper numbers without a documented "
+        "equivalence check (see tests/test_attn_equivalence.py).",
     )
     p.add_argument(
         "--trust-remote-code",

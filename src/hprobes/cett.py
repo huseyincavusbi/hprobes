@@ -218,7 +218,7 @@ def forward_cett(
         handles.append(down_proj.register_forward_hook(make_hook(layer_idx)))
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             out = model(**tokens)
     finally:
         for h in handles:
@@ -279,7 +279,7 @@ def forward_cett_at_token(
         handles.append(down_proj.register_forward_hook(make_hook(layer_idx)))
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             model(**extended)
     finally:
         for h in handles:
@@ -322,7 +322,7 @@ def forward_cett_span(
         handles.append(down_proj.register_forward_hook(make_hook(layer_idx)))
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             model(**tokens)
     finally:
         for h in handles:
@@ -382,7 +382,7 @@ def forward_cett_dual_span(
         handles.append(down_proj.register_forward_hook(make_hook(layer_idx)))
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             model(**tokens)
     finally:
         for h in handles:
@@ -422,6 +422,131 @@ def forward_cett_dual_span(
     return torch.cat(cett_answer_parts, dim=0), torch.cat(cett_other_parts, dim=0)
 
 
+def forward_cett_dual_span_batch(
+    model: torch.nn.Module,
+    batch_tokens: Dict[str, torch.Tensor],
+    answer_spans: List[Tuple[int, int]],
+    layers: List[int],
+    col_norms: Dict[int, torch.Tensor],
+    aggregation: str = "mean",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched dual-span forward pass → CETT for answer and non-answer spans.
+
+    Batched version of :func:`forward_cett_dual_span`. Pads all samples in the
+    batch, runs ONE forward pass, and aggregates per-token CETT over each
+    sample's answer span and non-answer span. Padded positions are excluded
+    from both aggregations (they are not part of the sequence, so single-mode
+    equivalence requires them to be masked out here).
+
+    Parameters
+    ----------
+    model : causal LM
+    batch_tokens : tokenizer output for a batch (input_ids, attention_mask padded)
+    answer_spans : list of (start, end) exclusive token spans per sample
+    layers : list of layer indices to hook
+    col_norms : precomputed column norms from precompute_col_norms()
+    aggregation : "mean" | "max"
+
+    Returns
+    -------
+    cett_answer : (B, n_layers * intermediate_dim,) float32 CPU
+    cett_other  : (B, n_layers * intermediate_dim,) float32 CPU
+    """
+    batch_size = batch_tokens["input_ids"].shape[0]
+    seq_len = batch_tokens["input_ids"].shape[1]
+    device = batch_tokens["input_ids"].device
+
+    if len(answer_spans) != batch_size:
+        raise ValueError(f"answer_spans length {len(answer_spans)} != batch_size {batch_size}")
+
+    # Per-sample answer mask over the padded sequence
+    answer_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+    for i, (start, end) in enumerate(answer_spans):
+        answer_mask[i, start:end] = True
+
+    # Non-answer mask: every real (non-padded) token outside the answer span
+    if "attention_mask" in batch_tokens:
+        real_mask = batch_tokens["attention_mask"].to(torch.bool)
+    else:
+        real_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+    other_mask = real_mask & ~answer_mask
+
+    z_cache: Dict[int, torch.Tensor] = {}
+    h_cache: Dict[int, torch.Tensor] = {}
+    handles = []
+
+    for layer_idx in layers:
+        down_proj = get_mlp_down_proj(model, layer_idx)
+
+        def make_hook(idx: int):
+            def hook(module, input, output):
+                z_cache[idx] = input[0]
+                h_cache[idx] = output
+                return output
+
+            return hook
+
+        handles.append(down_proj.register_forward_hook(make_hook(layer_idx)))
+
+    if "attention_mask" in batch_tokens:
+        position_ids = (batch_tokens["attention_mask"].cumsum(dim=-1) - 1).clamp(min=0)
+    else:
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    try:
+        with torch.inference_mode():
+            model(**batch_tokens, position_ids=position_ids)
+    finally:
+        for h in handles:
+            h.remove()
+
+    cett_answer_parts = []
+    cett_other_parts = []
+
+    for layer_idx in layers:
+        z = z_cache[layer_idx].float()
+        h = h_cache[layer_idx].float()
+        col_norm = col_norms[layer_idx].to(device)
+
+        h_norm = torch.norm(h, dim=-1, keepdim=True) + 1e-8
+        cett_per_token = (torch.abs(z) * col_norm.unsqueeze(0).unsqueeze(0)) / h_norm
+
+        if aggregation == "max":
+            inf = torch.finfo(cett_per_token.dtype).min
+            ans_agg = torch.where(
+                answer_mask.unsqueeze(-1),
+                cett_per_token,
+                torch.full_like(cett_per_token, inf),
+            ).amax(dim=1)
+            oth_agg = torch.where(
+                other_mask.unsqueeze(-1),
+                cett_per_token,
+                torch.full_like(cett_per_token, inf),
+            ).amax(dim=1)
+            # Samples with an empty non-answer span → zero vector
+            oth_agg = torch.where(
+                other_mask.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
+            )
+        else:
+            ans_agg = (cett_per_token * answer_mask.unsqueeze(-1)).sum(dim=1) / answer_mask.sum(
+                dim=1, keepdim=True
+            ).clamp(min=1)
+            oth_agg = (cett_per_token * other_mask.unsqueeze(-1)).sum(dim=1) / other_mask.sum(
+                dim=1, keepdim=True
+            ).clamp(min=1)
+            oth_agg = torch.where(
+                other_mask.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
+            )
+
+        cett_answer_parts.append(ans_agg.cpu())
+        cett_other_parts.append(oth_agg.cpu())
+
+    cett_answer_matrix = torch.cat(cett_answer_parts, dim=1)
+    cett_other_matrix = torch.cat(cett_other_parts, dim=1)
+
+    return cett_answer_matrix, cett_other_matrix
+
+
 def forward_cett_batch(
     model: torch.nn.Module,
     batch_tokens: Dict[str, torch.Tensor],
@@ -459,7 +584,7 @@ def forward_cett_batch(
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             out = model(**batch_tokens, position_ids=position_ids)
     finally:
         for h in handles:
@@ -523,7 +648,7 @@ def forward_cett_at_token_batch(
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             model(**extended, position_ids=position_ids)
     finally:
         for h in handles:
@@ -538,6 +663,58 @@ def forward_cett_at_token_batch(
     cett_matrix = cett.permute(1, 0, 2).reshape(batch_size, -1).cpu()
 
     return cett_matrix
+
+
+def scale_h_neurons_batch(
+    model: torch.nn.Module,
+    batch_tokens: Dict[str, torch.Tensor],
+    h_neurons: List[Tuple[int, int]],
+    alpha: float,
+    layers: List[int],
+) -> torch.Tensor:
+    """Batched version of :func:`scale_h_neurons`.
+
+    Runs ONE forward pass over a padded batch, scaling the same H-Neuron set
+    by alpha, and returns the logits at each sample's last real token.
+
+    Returns
+    -------
+    logits_matrix : (B, vocab_size,) float32 CPU
+    """
+    batch_size = batch_tokens["input_ids"].shape[0]
+    device = batch_tokens["input_ids"].device
+
+    neurons_by_layer: Dict[int, List[int]] = {}
+    for layer_idx, neuron_idx in h_neurons:
+        neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
+
+    handles = []
+    for layer_idx in layers:
+        if layer_idx not in neurons_by_layer:
+            continue
+        indices = torch.tensor(neurons_by_layer[layer_idx], dtype=torch.long)
+        down_proj = get_mlp_down_proj(model, layer_idx)
+
+        def make_pre_hook(idx: torch.Tensor, a: float):
+            def pre_hook(module, input):
+                z = input[0].clone()
+                z[..., idx.to(z.device)] *= a
+                return (z,) + input[1:]
+
+            return pre_hook
+
+        handles.append(down_proj.register_forward_pre_hook(make_pre_hook(indices, alpha)))
+
+    try:
+        with torch.inference_mode():
+            out = model(**batch_tokens)
+    finally:
+        for h in handles:
+            h.remove()
+
+    last_positions = batch_tokens["attention_mask"].sum(dim=1) - 1
+    logits = out.logits[torch.arange(batch_size, device=device), last_positions]
+    return logits.detach().float().cpu()
 
 
 def scale_h_neurons(
@@ -570,7 +747,7 @@ def scale_h_neurons(
         handles.append(down_proj.register_forward_pre_hook(make_pre_hook(indices, alpha)))
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             out = model(**tokens)
     finally:
         for h in handles:
