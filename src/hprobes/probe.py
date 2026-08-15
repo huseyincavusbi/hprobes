@@ -367,6 +367,9 @@ class HProbes:
         self._val_prompts: List[str] = []
         self._val_gt: List[str] = []
         self._X_val: Optional[np.ndarray] = None
+
+        if self.batch_size > 1:
+            self._ensure_pad_token()
         self._y_val: Optional[np.ndarray] = None
         self._val_is_answer: Optional[np.ndarray] = None
         self._X_train_cache: Optional[np.ndarray] = None
@@ -2000,6 +2003,19 @@ class HProbes:
         indices = torch.multinomial(probs, num_samples=n, replacement=True).tolist()
         preds = [letters[i] for i in indices]
         return preds[0] if len(set(preds)) == 1 else None
+
+    def _ensure_pad_token(self):
+        """Ensure the tokenizer has a pad token so batched padding works.
+
+        Falls back to the EOS token when the tokenizer defines none. Modifies
+        the tokenizer in place; safe to call repeatedly.
+        """
+        if self.tokenizer.pad_token_id is not None:
+            return
+        if self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            return
+        self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     def _tokenize(self, prompt: str) -> Dict[str, torch.Tensor]:
         device = next(self.model.parameters()).device
