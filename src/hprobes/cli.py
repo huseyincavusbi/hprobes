@@ -1208,7 +1208,11 @@ def _add_common_model_args(p):
         choices=["auto", "eager", "sdpa", "flash_attention_2"],
         default="auto",
         help="Attention implementation (default: auto — model/transformers default). "
-        "sdpa/flash_attention_2 are faster but numerically approximately-equal to eager.",
+        "eager is the reference used for published results. sdpa/flash_attention_2 "
+        "are faster but numerically approximately-equal, NOT bit-identical: they can "
+        "shift activations and flip borderline predictions, so they must not be used "
+        "to produce or reproduce published paper numbers without a documented "
+        "equivalence check (see tests/test_attn_equivalence.py).",
     )
     p.add_argument(
         "--trust-remote-code",
