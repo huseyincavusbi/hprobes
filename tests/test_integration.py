@@ -79,6 +79,43 @@ def test_full_pipeline_with_gpt2(gpt2_setup):
             os.remove(tmp_path)
 
 
+def test_fit_from_responses_batched_equals_single(gpt2_setup):
+    """
+    Real-model equivalence: fit_from_responses with batch_size>1 must produce
+    the same feature statistics as the single-sample path, on real GPT-2.
+    """
+    import numpy as np
+
+    model, tokenizer = gpt2_setup
+
+    samples = []
+    for i in range(12):
+        q = f"What is the answer to question {i}?"
+        r = f"The answer is number {i}."
+        resp_ids = tokenizer(r, add_special_tokens=False)["input_ids"][:3]
+        ans_toks = [tokenizer.decode([tid]) for tid in resp_ids]
+        samples.append(
+            {
+                "question": q,
+                "response": r,
+                "answer_tokens": ans_toks,
+                "judge": i % 2 == 0,
+            }
+        )
+
+    p1 = HProbes(model, tokenizer, l1_C=1.0, layer_stride=2, batch_size=1)
+    p1.fit_from_responses(samples)
+
+    p2 = HProbes(model, tokenizer, l1_C=1.0, layer_stride=2, batch_size=4)
+    p2.fit_from_responses(samples)
+
+    assert p1.accuracy_ == p2.accuracy_
+    assert p1._welford_n == p2._welford_n
+    # Feature statistics must match within float32 tolerance
+    assert np.allclose(p1._welford_mean, p2._welford_mean, atol=1e-4, rtol=1e-3)
+    assert np.allclose(p1._welford_M2, p2._welford_M2, atol=1e-4, rtol=1e-3)
+
+
 def test_cli_run_command(gpt2_setup):
     """
     Verifies the 'hprobes run' CLI command works end-to-end.
