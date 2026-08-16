@@ -523,7 +523,10 @@ def forward_cett_dual_span_batch(
                 cett_per_token,
                 torch.full_like(cett_per_token, inf),
             ).amax(dim=1)
-            # Samples with an empty non-answer span → zero vector
+            # Samples with an empty answer/non-answer span → zero vector
+            ans_agg = torch.where(
+                answer_mask.any(dim=1, keepdim=True), ans_agg, torch.zeros_like(ans_agg)
+            )
             oth_agg = torch.where(
                 other_mask.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
             )
