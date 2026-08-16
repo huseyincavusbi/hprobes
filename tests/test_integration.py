@@ -116,6 +116,54 @@ def test_fit_from_responses_batched_equals_single(gpt2_setup):
     assert np.allclose(p1._welford_M2, p2._welford_M2, atol=1e-4, rtol=1e-3)
 
 
+def test_pad_token_resizes_embeddings(gpt2_setup):
+    """_ensure_pad_token must resize embeddings when adding a brand-new token."""
+    model, tokenizer = gpt2_setup
+    tokenizer.pad_token_id = None
+    tokenizer.eos_token_id = None
+    before = model.get_input_embeddings().num_embeddings
+    probe = HProbes(model, tokenizer, l1_C=10, layer_stride=2, batch_size=2)
+    assert probe.tokenizer.pad_token_id is not None, "pad token must be added"
+    after = model.get_input_embeddings().num_embeddings
+    assert after == len(tokenizer), "embeddings must be resized to the new vocab size"
+    assert after > before, "new [PAD] token requires a new embedding row"
+
+
+def test_score_on_batched_equals_single(gpt2_setup):
+    """
+    Real-model equivalence: score_on must produce identical results whether the
+    samples are processed with batch_size=1 or batch_size=4.
+    """
+
+    model, tokenizer = gpt2_setup
+
+    samples = []
+    for i in range(12):
+        q = f"What is the answer to question {i}?"
+        r = f"The answer is number {i}."
+        resp_ids = tokenizer(r, add_special_tokens=False)["input_ids"][:3]
+        ans_toks = [tokenizer.decode([tid]) for tid in resp_ids]
+        samples.append(
+            {
+                "question": q,
+                "response": r,
+                "answer_tokens": ans_toks,
+                "judge": i % 2 == 0,
+            }
+        )
+
+    p1 = HProbes(model, tokenizer, l1_C=1.0, layer_stride=2, batch_size=1)
+    p1.fit_from_responses(samples)
+
+    p2 = HProbes(model, tokenizer, l1_C=1.0, layer_stride=2, batch_size=4)
+    p2.fit_from_responses(samples)
+
+    r1 = p1.score_on(samples)
+    r2 = p2.score_on(samples)
+    assert r1["auroc"] == pytest.approx(r2["auroc"], abs=1e-6)
+    assert r1["balanced_accuracy"] == pytest.approx(r2["balanced_accuracy"], abs=1e-6)
+
+
 def test_cli_run_command(gpt2_setup):
     """
     Verifies the 'hprobes run' CLI command works end-to-end.

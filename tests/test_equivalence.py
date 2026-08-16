@@ -104,6 +104,17 @@ class TestDualSpanBatchEquivalence:
         )
         torch.testing.assert_close(batch_oth[0], single_oth, atol=1e-5, rtol=1e-4)
 
+    def test_max_aggregation_empty_answer_zeroed(self):
+        """Empty answer span + aggregation='max' → zeros, never finfo.min sentinel."""
+        toks = [_tok("ABCDE"), _tok("ABCDEFG")]
+        spans = [(3, 3), (0, 0)]  # both answer spans empty
+        batch = _pad(toks)
+        ans, _ = forward_cett_dual_span_batch(
+            self.model, batch, spans, self.layers, self.norms, aggregation="max"
+        )
+        assert torch.all(ans == 0), "empty answer spans must zero out, not propagate finfo.min"
+        assert not torch.isinf(ans).any()
+
 
 class TestScaleNeuronsBatchEquivalence:
     def setup_method(self):
