@@ -2072,6 +2072,7 @@ class HProbes:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             return
         self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        self.model.resize_token_embeddings(len(self.tokenizer))
 
     def _tokenize(self, prompt: str) -> Dict[str, torch.Tensor]:
         device = next(self.model.parameters()).device
