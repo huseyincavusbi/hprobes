@@ -575,6 +575,19 @@ class TestMemoryGuard:
         assert _estimate_peak_fit_bytes(200, 1000, 1) == 2 * base
         assert _estimate_peak_fit_bytes(100, 1000, 2) == 2 * base
 
+    def test_estimate_increases_with_fits(self):
+        from hprobes.probe import _estimate_peak_fit_bytes
+
+        assert _estimate_peak_fit_bytes(100, 1000, 5) > _estimate_peak_fit_bytes(100, 1000, 1)
+
+    def test_stability_raises_estimate(self, monkeypatch):
+        from hprobes import probe
+
+        monkeypatch.setattr(probe, "_available_ram_bytes", lambda: 10**18)  # never warn
+        assert probe._warn_if_memory_heavy(
+            1000, 1000, stability=True
+        ) > probe._warn_if_memory_heavy(1000, 1000, stability=False)
+
     def test_warns_when_peak_exceeds_available(self, monkeypatch):
         from hprobes import probe
 

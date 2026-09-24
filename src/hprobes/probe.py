@@ -41,6 +41,9 @@ def _available_ram_bytes() -> Optional[int]:
         return None
 
 
+_STABILITY_N_RUNS = 5  # matches _run_stability_check's default (bootstrap fits)
+
+
 def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
     """Rough peak bytes for the probe fit.
 
@@ -63,10 +66,13 @@ def _warn_if_memory_heavy(
     """Warn (or raise, if ``strict``) when the probe fit is likely to exceed available RAM.
 
     With ``top_k=0`` (all features) plus the stability bootstrap, the fit allocates
-    several float64 copies of the feature matrix and can OOM small kernels. Returns the
+    several float64 copies of the feature matrix, and the stability check's ``n_runs``
+    bootstrap fits can run concurrently — so it can OOM small kernels. Returns the
     estimated peak bytes (useful for tests).
     """
-    n_fits = 1 + int(bool(stability)) + int(bool(check_l2)) + int(bool(correlation))
+    n_fits = (
+        1 + (_STABILITY_N_RUNS if stability else 0) + int(bool(check_l2)) + int(bool(correlation))
+    )
     peak = _estimate_peak_fit_bytes(n_rows, n_features, n_fits)
     avail = _available_ram_bytes()
     if avail is not None and peak > 0.8 * avail:
