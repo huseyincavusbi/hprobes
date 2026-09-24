@@ -565,3 +565,39 @@ class TestLabelFn:
         assert probe.is_fitted_
         # Should still find neurons, but they encode correctness instead of hallucination
         assert probe.n_neurons_ >= 0
+
+
+class TestMemoryGuard:
+    def test_estimate_scales_with_rows_and_fits(self):
+        from hprobes.probe import _estimate_peak_fit_bytes
+
+        base = _estimate_peak_fit_bytes(100, 1000, 1)
+        assert _estimate_peak_fit_bytes(200, 1000, 1) == 2 * base
+        assert _estimate_peak_fit_bytes(100, 1000, 2) == 2 * base
+
+    def test_warns_when_peak_exceeds_available(self, monkeypatch):
+        from hprobes import probe
+
+        monkeypatch.setattr(probe, "_available_ram_bytes", lambda: 1_000_000)  # 1 MB
+        with pytest.warns(UserWarning):
+            probe._warn_if_memory_heavy(1000, 348160, stability=True)
+
+    def test_no_warn_when_ram_is_plentiful(self, monkeypatch):
+        import warnings as _w
+
+        from hprobes import probe
+
+        monkeypatch.setattr(probe, "_available_ram_bytes", lambda: 10**15)
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            probe._warn_if_memory_heavy(1000, 348160, stability=True)
+
+    def test_strict_raises(self, monkeypatch):
+        from hprobes import probe
+
+        monkeypatch.setattr(probe, "_available_ram_bytes", lambda: 1_000_000)
+        with pytest.raises(MemoryError):
+            probe._warn_if_memory_heavy(1000, 348160, stability=True, strict=True)
+
+    def test_default_top_k_is_all_features(self):
+        assert HProbes(MODEL, TOK).top_k == 0

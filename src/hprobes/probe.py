@@ -2,6 +2,8 @@
 
 import logging
 import json
+import os
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -29,6 +31,55 @@ from .cett import (
 
 _NOT_FITTED_MSG = "Call fit() before using this method."
 _MCQ_LETTERS = list("ABCDEFGHIJ")
+
+
+def _available_ram_bytes() -> Optional[int]:
+    """Best-effort available RAM in bytes, without extra dependencies."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
+    """Rough peak bytes for the probe fit.
+
+    ``X`` is float32, but scikit-learn's liblinear solver upcasts it to float64, so a
+    single fit needs ~12 bytes per cell; multiply by the number of fits (main + the
+    stability bootstrap + l2/correlation checks).
+    """
+    return n_rows * n_features * (4 + 8) * max(1, n_fits)
+
+
+def _warn_if_memory_heavy(
+    n_rows: int,
+    n_features: int,
+    *,
+    stability: bool = False,
+    check_l2: bool = False,
+    correlation: bool = False,
+    strict: bool = False,
+) -> int:
+    """Warn (or raise, if ``strict``) when the probe fit is likely to exceed available RAM.
+
+    With ``top_k=0`` (all features) plus the stability bootstrap, the fit allocates
+    several float64 copies of the feature matrix and can OOM small kernels. Returns the
+    estimated peak bytes (useful for tests).
+    """
+    n_fits = 1 + int(bool(stability)) + int(bool(check_l2)) + int(bool(correlation))
+    peak = _estimate_peak_fit_bytes(n_rows, n_features, n_fits)
+    avail = _available_ram_bytes()
+    if avail is not None and peak > 0.8 * avail:
+        msg = (
+            f"Probe fit may exceed available RAM: estimated peak ~{peak / 1e9:.1f} GB vs "
+            f"~{avail / 1e9:.1f} GB available ({n_rows} rows x {n_features:,} features, "
+            f"{n_fits} fits). Mitigations: reduce samples, set top_k>0, or disable "
+            "stability/check_l2."
+        )
+        if strict:
+            raise MemoryError(msg)
+        warnings.warn(msg, stacklevel=2)
+    return peak
 
 
 def _run_l2_check(
@@ -322,6 +373,7 @@ class HProbes:
         stability: bool = False,
         correlation: bool = False,
         cluster: bool = False,
+        strict_memory: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -330,6 +382,7 @@ class HProbes:
         self.stability = stability
         self.correlation = correlation
         self.cluster = cluster
+        self.strict_memory = strict_memory
         self.top_k = top_k
         self.batch_size = batch_size
         self.layer_stride = layer_stride
@@ -503,6 +556,14 @@ class HProbes:
             self._top_k_idx = self._top_k_cluster_reps
 
         # --- Phase 3: L1 probe ---
+        _warn_if_memory_heavy(
+            X_train.shape[0],
+            X_train.shape[1],
+            stability=self.stability,
+            check_l2=self.check_l2,
+            correlation=self.correlation,
+            strict=self.strict_memory,
+        )
         self._clf = LogisticRegression(
             solver="liblinear",
             l1_ratio=1,
@@ -825,6 +886,14 @@ class HProbes:
             self._top_k_idx_original = self._top_k_idx.copy()
             self._top_k_idx = self._top_k_cluster_reps
 
+        _warn_if_memory_heavy(
+            X_train.shape[0],
+            X_train.shape[1],
+            stability=self.stability,
+            check_l2=self.check_l2,
+            correlation=self.correlation,
+            strict=self.strict_memory,
+        )
         self._clf = LogisticRegression(
             solver="liblinear",
             l1_ratio=1,
