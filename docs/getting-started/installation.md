@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - PyTorch 2.0+
 - A HuggingFace causal language model
 
