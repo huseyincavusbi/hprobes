@@ -317,7 +317,7 @@ class HProbes:
         max_tokens: int = 1024,
         batch_size: int = 1,
         n_consistency: int = 1,
-        top_k: int = 5000,
+        top_k: int = 0,
         check_l2: bool = False,
         stability: bool = False,
         correlation: bool = False,
