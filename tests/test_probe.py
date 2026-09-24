@@ -568,12 +568,11 @@ class TestLabelFn:
 
 
 class TestMemoryGuard:
-    def test_estimate_scales_with_rows_and_fits(self):
+    def test_estimate_scales_with_rows(self):
         from hprobes.probe import _estimate_peak_fit_bytes
 
         base = _estimate_peak_fit_bytes(100, 1000, 1)
         assert _estimate_peak_fit_bytes(200, 1000, 1) == 2 * base
-        assert _estimate_peak_fit_bytes(100, 1000, 2) == 2 * base
 
     def test_estimate_increases_with_fits(self):
         from hprobes.probe import _estimate_peak_fit_bytes

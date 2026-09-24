@@ -47,11 +47,13 @@ _STABILITY_N_RUNS = 5  # matches _run_stability_check's default (bootstrap fits)
 def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
     """Rough peak bytes for the probe fit.
 
-    ``X`` is float32, but scikit-learn's liblinear solver upcasts it to float64, so a
-    single fit needs ~12 bytes per cell; multiply by the number of fits (main + the
-    stability bootstrap + l2/correlation checks).
+    Includes the float32 feature matrices retained during the fit (``X`` plus the
+    ``X_train``/``X_val`` copies) and the solver's float64 working copies (scikit-learn's
+    liblinear upcasts ``X``), multiplied by the number of fits that can be live at once.
     """
-    return n_rows * n_features * (4 + 8) * max(1, n_fits)
+    retained = n_rows * n_features * 4 * 2  # X + (X_train + X_val)
+    fit_copies = n_rows * n_features * 8 * max(1, n_fits)
+    return retained + fit_copies
 
 
 def _warn_if_memory_heavy(
