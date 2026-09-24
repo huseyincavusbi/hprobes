@@ -939,6 +939,7 @@ def cmd_responses(args: argparse.Namespace) -> None:
         model,
         tokenizer,
         l1_C=args.l1_c,
+        top_k=args.top_k,
         layer_stride=args.layer_stride,
         validation_split=args.validation_split,
         seed=args.seed,
@@ -1260,9 +1261,10 @@ def _add_common_probe_args(p):
     p.add_argument(
         "--top-k",
         type=int,
-        default=5000,
+        default=0,
         dest="top_k",
-        help="Variance pre-selection: keep top-K features (default: 5000). Set to 0 to use all features.",
+        help="Variance pre-selection: keep top-K features (default: 0 = all features, "
+        "matching the published pipeline). A positive value is a speed/memory trade-off.",
     )
     p.add_argument(
         "--batch-size",
