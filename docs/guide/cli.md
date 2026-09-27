@@ -43,8 +43,19 @@ hprobes run \
 | `--layer-stride` | `1` | Sample every Nth layer |
 | `--validation-split` | `0.2` | Fraction held out for validation |
 | `--max-tokens` | `1024` | Max input tokens before truncation |
+| `--top-k` | `0` (all features) | Variance pre-selection: keep top-K features. `0` = all features (published pipeline); `auto` = largest K that safely fits available RAM; a positive int is an explicit cap |
+| `--auto-safety` | `0.6` | RAM safety factor for `--top-k auto` |
 | `--alphas` | `0.0,0.5,1.0,1.5,2.0` | Comma-separated alpha values for causal validation |
 | `--batch-size` | `1` | Batch size for CETT extraction |
+
+> **Auto top-k (`--top-k auto`).** Resolves the largest feature count that safely fits the
+> machine's available RAM at fit time (Linux `/proc/meminfo`, macOS `vm_stat`, `psutil` when
+> installed, `os.sysconf` fallback). The fit peak is linear in `top_k` — `8·n_rows·k·(1+n_fits)`
+> bytes — so it is inverted as
+> `k = (safety·available − cett_bytes − overhead) // (8·n_rows·(1+n_fits))`,
+> capped at all features. If even a minimal `k` cannot fit, the run raises `MemoryError`
+> with the maximum sample count instead of an OOM kill. The resolved value and reasoning
+> are recorded in the results JSON (`top_k`, `top_k_auto`, `top_k_reason`).
 
 > **Numerical-equivalence warning (research integrity).** `eager` attention is the
 > reference used for published results. `sdpa` and `flash_attention_2` are faster
