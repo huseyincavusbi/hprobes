@@ -34,7 +34,44 @@ _MCQ_LETTERS = list("ABCDEFGHIJ")
 
 
 def _available_ram_bytes() -> Optional[int]:
-    """Best-effort available RAM in bytes, without extra dependencies."""
+    """Best-effort available RAM in bytes, without new dependencies.
+
+    Reads platform sources directly where possible:
+    - Linux: ``MemAvailable`` from ``/proc/meminfo`` (accounts for reclaimable cache)
+    - macOS: ``vm_stat`` free + inactive + speculative pages (subprocess; no direct API)
+    - ``psutil`` when installed, then the ``os.sysconf`` free-page count as fallback.
+    """
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except (ImportError, OSError, AttributeError, ValueError):
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    if hasattr(os, "uname") and os.uname().sysname == "Darwin":
+        try:
+            import re
+            import subprocess
+
+            out = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=5, check=False
+            ).stdout
+            match = re.search(r"page size of (\d+) bytes", out)
+            page_size = int(match.group(1)) if match else os.sysconf("SC_PAGE_SIZE")
+            pages = 0
+            for line in out.splitlines():
+                if line.startswith(("Pages free:", "Pages inactive:", "Pages speculative:")):
+                    pages += int(line.split(":")[1].strip().rstrip("."))
+            if pages:
+                return pages * page_size
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            pass
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
     except (ValueError, OSError, AttributeError):
