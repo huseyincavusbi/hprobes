@@ -668,6 +668,26 @@ class TestAutoTopK:
         with pytest.raises(MemoryError, match="top_k cannot help"):
             self._resolve(2e9)
 
+    def test_max_sample_hint_is_plausible(self):
+        """The remediation hint must divide by per-sample CETT bytes (bytes/element x F)."""
+        from hprobes.probe import _DEFAULT_AUTO_OVERHEAD_BYTES, _resolve_auto_top_k
+
+        n_features = 400_000
+        n_valid = 200
+        expected = int((0.6 * 1.1e9 - _DEFAULT_AUTO_OVERHEAD_BYTES) // (4 * n_features))
+        with pytest.raises(MemoryError) as exc:
+            _resolve_auto_top_k(
+                n_valid=n_valid,
+                n_rows=160,
+                n_features=n_features,
+                n_fits=1,
+                cett_bytes=4 * n_valid * n_features,
+                cett_bytes_per_sample=4 * n_features,
+                available_bytes=1.1e9,
+            )
+        assert f"<= {expected:,}" in str(exc.value)
+        assert 0 < expected < 1_000_000  # sanity: a plausible sample count
+
     def test_tiny_safety_suggests_increasing_safety(self):
         with pytest.raises(MemoryError, match="increase --auto-safety"):
             self._resolve(3e9, safety=0.01)

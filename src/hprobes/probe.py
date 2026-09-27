@@ -104,7 +104,7 @@ def _resolve_auto_top_k(
     n_features: int,
     n_fits: int,
     cett_bytes: int,
-    bytes_per_sample: int = 4,
+    cett_bytes_per_sample: int = 4,
     safety: float = _DEFAULT_AUTO_SAFETY,
     overhead_bytes: int = _DEFAULT_AUTO_OVERHEAD_BYTES,
     available_bytes: Optional[int] = None,
@@ -130,7 +130,7 @@ def _resolve_auto_top_k(
     per_feature = 8 * max(1, n_rows) * max(1, n_fits)
     if budget <= 0:
         headroom = safety * avail - overhead_bytes
-        max_samples = int(headroom // max(1, bytes_per_sample)) if headroom > 0 else 0
+        max_samples = int(headroom // max(1, cett_bytes_per_sample)) if headroom > 0 else 0
         if max_samples > 0:
             hint = f"reduce samples to <= {max_samples:,} or run on a larger machine"
         else:
@@ -634,7 +634,7 @@ class HProbes:
                 n_features=self._n_features,
                 n_fits=self._n_fits,
                 cett_bytes=4 * n_valid * self._n_features,
-                bytes_per_sample=4,
+                cett_bytes_per_sample=4 * self._n_features,
                 safety=self.auto_safety,
             )
             print(
@@ -991,7 +991,7 @@ class HProbes:
                 n_features=self._n_features,
                 n_fits=self._n_fits,
                 cett_bytes=8 * n_valid * self._n_features,
-                bytes_per_sample=8,
+                cett_bytes_per_sample=8 * self._n_features,
                 safety=self.auto_safety,
             )
             print(
