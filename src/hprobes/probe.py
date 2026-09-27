@@ -129,12 +129,16 @@ def _resolve_auto_top_k(
     budget = safety * avail - cett_bytes - overhead_bytes
     per_feature = 8 * max(1, n_rows) * max(1, n_fits)
     if budget <= 0:
-        max_samples = int((safety * avail - overhead_bytes) // max(1, bytes_per_sample))
+        headroom = safety * avail - overhead_bytes
+        max_samples = int(headroom // max(1, bytes_per_sample)) if headroom > 0 else 0
+        if max_samples > 0:
+            hint = f"reduce samples to <= {max_samples:,} or run on a larger machine"
+        else:
+            hint = "increase --auto-safety, free RAM, or run on a larger machine"
         raise MemoryError(
             f"insufficient RAM for the probe fit: available {avail / 1e9:.1f} GB, "
             f"CETT features already use {cett_bytes / 1e9:.1f} GB, overhead "
-            f"{overhead_bytes / 1e9:.1f} GB. top_k cannot help — reduce samples to "
-            f"<= {max_samples:,} or run on a larger machine."
+            f"{overhead_bytes / 1e9:.1f} GB. top_k cannot help — {hint}."
         )
     k = int(budget // per_feature)
     capped = k >= n_features
