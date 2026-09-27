@@ -696,6 +696,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
             top_k=args.top_k,
+            auto_safety=args.auto_safety,
         )
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
         probe.model_id = args.model
@@ -776,6 +777,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
             top_k=args.top_k,
+            auto_safety=args.auto_safety,
             check_l2=getattr(args, "check_l2", False),
             stability=getattr(args, "stability", False),
             correlation=getattr(args, "correlation", False),
@@ -940,6 +942,7 @@ def cmd_responses(args: argparse.Namespace) -> None:
         tokenizer,
         l1_C=args.l1_c,
         top_k=args.top_k,
+        auto_safety=args.auto_safety,
         layer_stride=args.layer_stride,
         validation_split=args.validation_split,
         seed=args.seed,
@@ -1222,6 +1225,19 @@ def _add_common_model_args(p):
     )
 
 
+def _parse_top_k(value: str):
+    """Parse --top-k: non-negative int, or 'auto'/'-1' for RAM-based resolution."""
+    if isinstance(value, str) and value.strip().lower() in ("auto", "-1"):
+        return "auto"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid --top-k value: {value!r} (use an int or 'auto')")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"--top-k must be >= 0 or 'auto', got {parsed}")
+    return parsed
+
+
 def _add_common_probe_args(p):
     """Add shared probe hyperparameter args to a subparser."""
     p.add_argument(
@@ -1260,11 +1276,19 @@ def _add_common_probe_args(p):
     )
     p.add_argument(
         "--top-k",
-        type=int,
+        type=_parse_top_k,
         default=0,
         dest="top_k",
-        help="Variance pre-selection: keep top-K features (default: 0 = all features, "
-        "matching the published pipeline). A positive value is a speed/memory trade-off.",
+        help="Variance pre-selection: keep top-K features. 0 = all features (published "
+        "pipeline); 'auto' = largest K that safely fits available RAM; a positive int is "
+        "an explicit cap.",
+    )
+    p.add_argument(
+        "--auto-safety",
+        type=float,
+        default=0.6,
+        dest="auto_safety",
+        help="RAM safety factor for --top-k auto (default: 0.6).",
     )
     p.add_argument(
         "--batch-size",
