@@ -45,6 +45,7 @@ hprobes run \
 | `--max-tokens` | `1024` | Max input tokens before truncation |
 | `--top-k` | `0` (all features) | Variance pre-selection: keep top-K features. `0` = all features (published pipeline); `auto` = largest K that safely fits available RAM; a positive int is an explicit cap |
 | `--auto-safety` | `0.8` | RAM safety factor for `--top-k auto` |
+| `--no-predictions` | off (predictions are written) | Skip the per-sample predictions sidecar |
 | `--alphas` | `0.0,0.5,1.0,1.5,2.0` | Comma-separated alpha values for causal validation |
 | `--batch-size` | `1` | Batch size for CETT extraction |
 
@@ -68,10 +69,22 @@ hprobes run \
 
 ### Output
 
-Produces two files:
+Produces:
 
 - `<output>.json` — Human-readable results (H-Neurons, AUROC, accuracy, causal validation)
 - `<output>.pkl` — Serialized classifier for later loading
+- `<output>.predictions.jsonl` — Per-sample predictions (written by default)
+
+The predictions sidecar has one JSON object per sample. MCQ runs read the answer as a letter
+from the last-prompt logits, so the file records the readout and the underlying letter logits:
+
+```json
+{"index": 0, "prompt": "...exact model input...", "predicted": "B", "ground_truth": "B",
+ "is_correct": true, "letter_logits": {"A": 10.42, "B": 17.88, "C": 9.15, "D": 12.03}}
+```
+
+Open-ended runs record `{"index", "prompt", "is_correct"}` (raw response text is saved
+separately by the response pipeline). Disable with `--no-predictions`.
 
 ## `hprobes responses`
 
