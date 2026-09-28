@@ -1286,9 +1286,9 @@ def _add_common_probe_args(p):
     p.add_argument(
         "--auto-safety",
         type=float,
-        default=0.6,
+        default=0.8,
         dest="auto_safety",
-        help="RAM safety factor for --top-k auto (default: 0.6).",
+        help="RAM safety factor for --top-k auto (default: 0.8).",
     )
     p.add_argument(
         "--batch-size",

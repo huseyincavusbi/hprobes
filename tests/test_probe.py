@@ -697,6 +697,7 @@ class TestAutoTopK:
                 n_fits=1,
                 cett_bytes=4 * n_valid * n_features,
                 cett_bytes_per_sample=4 * n_features,
+                safety=0.6,
                 available_bytes=1.1e9,
             )
         assert f"<= {expected:,}" in str(exc.value)

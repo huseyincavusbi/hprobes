@@ -93,7 +93,7 @@ def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
     return retained + fit_copies
 
 
-_DEFAULT_AUTO_SAFETY = 0.6
+_DEFAULT_AUTO_SAFETY = 0.8
 _DEFAULT_AUTO_OVERHEAD_BYTES = 400 * 1024 * 1024  # interpreter/tokenizer slack
 # Measured correction: the real liblinear peak runs ~2.18x above the analytic model
 # (800 rows x 100k features, macOS; solver internals/temporaries dominate). 2.5 adds margin.

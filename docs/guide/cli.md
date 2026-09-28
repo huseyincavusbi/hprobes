@@ -44,7 +44,7 @@ hprobes run \
 | `--validation-split` | `0.2` | Fraction held out for validation |
 | `--max-tokens` | `1024` | Max input tokens before truncation |
 | `--top-k` | `0` (all features) | Variance pre-selection: keep top-K features. `0` = all features (published pipeline); `auto` = largest K that safely fits available RAM; a positive int is an explicit cap |
-| `--auto-safety` | `0.6` | RAM safety factor for `--top-k auto` |
+| `--auto-safety` | `0.8` | RAM safety factor for `--top-k auto` |
 | `--alphas` | `0.0,0.5,1.0,1.5,2.0` | Comma-separated alpha values for causal validation |
 | `--batch-size` | `1` | Batch size for CETT extraction |
 
