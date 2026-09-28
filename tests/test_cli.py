@@ -232,6 +232,12 @@ class TestCLIArgParsing:
         )
         assert args.max_tokens == 512
 
+    def test_run_parser_accepts_readout(self):
+        args = self._parse(["run", "--model", "m", "--data", "d", "--readout", "logits"])
+        assert args.readout == "logits"
+        args = self._parse(["run", "--model", "m", "--data", "d"])
+        assert args.readout == "both"
+
     def test_run_parser_accepts_no_predictions(self):
         args = self._parse(["run", "--model", "m", "--data", "d", "--no-predictions"])
         assert args.no_predictions is True

@@ -803,3 +803,92 @@ class TestPredictionsSidecar:
             rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
             assert rows
             assert all(set(r) == {"index", "prompt", "is_correct"} for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Readout modes
+# ---------------------------------------------------------------------------
+
+
+class TestLetterExtraction:
+    def test_leading_letter(self):
+        from hprobes.probe import _extract_letter_from_text
+
+        assert _extract_letter_from_text("B", ["A", "B", "C", "D"]) == "B"
+        assert _extract_letter_from_text("B. proteins.", ["A", "B", "C", "D"]) == "B"
+        assert _extract_letter_from_text("(C)", ["A", "B", "C", "D"]) == "C"
+
+    def test_answer_patterns(self):
+        from hprobes.probe import _extract_letter_from_text
+
+        assert _extract_letter_from_text("The answer is D.", ["A", "B", "C", "D"]) == "D"
+        assert _extract_letter_from_text("answer: C", ["A", "B", "C", "D"]) == "C"
+
+    def test_option_text_match(self):
+        from hprobes.probe import _extract_letter_from_text
+
+        texts = {"A": "alpha", "B": "proteins", "C": "gamma", "D": "delta"}
+        assert (
+            _extract_letter_from_text("The answer is proteins.", ["A", "B", "C", "D"], texts) == "B"
+        )
+
+    def test_none_when_no_valid_letter(self):
+        from hprobes.probe import _extract_letter_from_text
+
+        assert _extract_letter_from_text("I don't know", ["A", "B", "C", "D"]) is None
+        assert _extract_letter_from_text("The answer is E", ["A", "B", "C", "D"]) is None
+        assert _extract_letter_from_text("", ["A", "B"]) is None
+        assert _extract_letter_from_text("B", []) is None
+
+    def test_last_standalone_letter_fallback(self):
+        from hprobes.probe import _extract_letter_from_text
+
+        assert (
+            _extract_letter_from_text("I think B is wrong; probably C", ["A", "B", "C", "D"]) == "C"
+        )
+
+
+class TestReadoutModes:
+    def _fit(self, readout):
+        probe = HProbes(MODEL, TOK, l1_C=0.5, readout=readout)
+        probe.fit(SAMPLES, options_key="options", answer_key="answer")
+        return probe
+
+    def test_invalid_readout_raises(self):
+        with pytest.raises(ValueError, match="readout"):
+            HProbes(MODEL, TOK, readout="bogus")
+
+    def test_logits_mode_records_no_generated(self):
+        probe = self._fit("logits")
+        assert probe._predictions_
+        for row in probe._predictions_:
+            assert "generated" not in row
+            assert row["predicted"] == row["logits_letter"]
+            assert row["is_correct"] == (row["predicted"] == row["ground_truth"])
+
+    def test_generate_mode_primary_is_generated(self):
+        probe = self._fit("generate")
+        assert probe._predictions_
+        for row in probe._predictions_:
+            assert row["predicted"] == row["generated_letter"]
+            assert row["generated"] is not None
+            assert "letter_logits" in row
+
+    def test_both_mode_records_both_readouts(self):
+        probe = self._fit("both")
+        assert probe._predictions_
+        for row in probe._predictions_:
+            assert row["predicted"] == row["generated_letter"]
+            assert row["logits_letter"] in "ABCD"
+            assert row["generated_is_correct"] == (row["generated_letter"] == row["ground_truth"])
+            assert row["logits_is_correct"] == (row["logits_letter"] == row["ground_truth"])
+
+    def test_sidecar_includes_generated_in_both(self):
+        probe = self._fit("both")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "probe")
+            probe.save(base)
+            sidecar = Path(base).with_suffix(".predictions.jsonl")
+            rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+            assert rows
+            assert all("generated" in row for row in rows)
