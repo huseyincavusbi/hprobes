@@ -2201,9 +2201,15 @@ class HProbes:
     ) -> Dict[str, float]:
         """Raw letter logits at the readout position, restricted to the sample's options."""
         options = sample.get(options_key, {}) or {}
+        if isinstance(options, list):
+            letters = [_MCQ_LETTERS[i] for i in range(len(options))]
+        elif isinstance(options, dict):
+            letters = list(options.keys())
+        else:
+            letters = []
         return {
             letter: round(float(logits[self._letter_ids[letter]].item()), 4)
-            for letter in options
+            for letter in letters
             if letter in self._letter_ids
         }
 
