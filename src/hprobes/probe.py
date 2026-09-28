@@ -1353,9 +1353,10 @@ class HProbes:
     def save(self, path: str) -> Path:
         """Save probe results and classifier to disk.
 
-        Writes two files:
+        Writes:
         - ``<path>.json`` — human-readable results (neurons, scores, cv)
         - ``<path>.pkl``  — serialized classifier for transfer experiments
+        - ``<path>.predictions.jsonl`` — per-sample predictions (unless ``save_predictions=False``)
 
         Parameters
         ----------
@@ -1432,6 +1433,9 @@ class HProbes:
             "clf_classes": self._clf.classes_.tolist() if hasattr(self._clf, "classes_") else [],
         }
 
+        if self.save_predictions and self._predictions_:
+            out["predictions_file"] = p.with_suffix(".predictions.jsonl").name
+
         class _NumpyEncoder(json.JSONEncoder):
             def default(self, obj):
                 if isinstance(obj, (np.integer,)):
@@ -1445,6 +1449,12 @@ class HProbes:
                 return super().default(obj)
 
         json_path.write_text(json.dumps(out, indent=2, cls=_NumpyEncoder))
+
+        if self.save_predictions and self._predictions_:
+            predictions_path = json_path.with_suffix(".predictions.jsonl")
+            with open(predictions_path, "w") as fh:
+                for record in self._predictions_:
+                    fh.write(json.dumps(record, cls=_NumpyEncoder) + "\n")
 
         # Save classifier state for transfer experiments
         tensors = {}
