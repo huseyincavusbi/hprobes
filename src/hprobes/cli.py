@@ -697,6 +697,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             top_k=args.top_k,
             auto_safety=args.auto_safety,
+            save_predictions=not args.no_predictions,
         )
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
         probe.model_id = args.model
@@ -778,6 +779,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             top_k=args.top_k,
             auto_safety=args.auto_safety,
+            save_predictions=not args.no_predictions,
             check_l2=getattr(args, "check_l2", False),
             stability=getattr(args, "stability", False),
             correlation=getattr(args, "correlation", False),
@@ -943,6 +945,7 @@ def cmd_responses(args: argparse.Namespace) -> None:
         l1_C=args.l1_c,
         top_k=args.top_k,
         auto_safety=args.auto_safety,
+        save_predictions=not args.no_predictions,
         layer_stride=args.layer_stride,
         validation_split=args.validation_split,
         seed=args.seed,
@@ -1289,6 +1292,12 @@ def _add_common_probe_args(p):
         default=0.8,
         dest="auto_safety",
         help="RAM safety factor for --top-k auto (default: 0.8).",
+    )
+    p.add_argument(
+        "--no-predictions",
+        action="store_true",
+        dest="no_predictions",
+        help="Do not write the per-sample predictions sidecar (<run>.predictions.jsonl).",
     )
     p.add_argument(
         "--batch-size",

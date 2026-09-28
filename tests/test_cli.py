@@ -232,6 +232,12 @@ class TestCLIArgParsing:
         )
         assert args.max_tokens == 512
 
+    def test_run_parser_accepts_no_predictions(self):
+        args = self._parse(["run", "--model", "m", "--data", "d", "--no-predictions"])
+        assert args.no_predictions is True
+        args = self._parse(["run", "--model", "m", "--data", "d"])
+        assert args.no_predictions is False
+
     def test_run_parser_accepts_auto_top_k_and_safety(self):
         args = self._parse(
             [

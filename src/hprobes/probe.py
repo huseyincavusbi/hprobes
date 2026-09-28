@@ -485,6 +485,7 @@ class HProbes:
         n_consistency: int = 1,
         top_k: Union[int, str] = 0,
         auto_safety: float = _DEFAULT_AUTO_SAFETY,
+        save_predictions: bool = True,
         check_l2: bool = False,
         stability: bool = False,
         correlation: bool = False,
@@ -502,7 +503,9 @@ class HProbes:
         self._top_k_auto = isinstance(top_k, str) and top_k.strip().lower() in ("auto", "-1")
         self.top_k = 0 if self._top_k_auto else int(top_k)
         self.auto_safety = auto_safety
+        self.save_predictions = save_predictions
         self._top_k_reason: Optional[Dict[str, Any]] = None
+        self._predictions_: List[Dict[str, Any]] = []
         self._n_fits = (
             1
             + (_STABILITY_N_RUNS if stability else 0)
@@ -627,6 +630,9 @@ class HProbes:
 
         n_valid = len(valid_prompts)
         self.accuracy_ = sum(p["is_correct"] for p in per_sample) / n_valid if n_valid > 0 else 0.0
+        self._predictions_ = [
+            {"index": i, "prompt": valid_prompts[i], **per_sample[i]} for i in range(n_valid)
+        ]
 
         print(f"[hprobes] Valid: {n_valid}  |  Accuracy: {self.accuracy_:.3f}")
         if n_valid < 20:
@@ -987,6 +993,10 @@ class HProbes:
 
         n_valid = len(valid_prompts)
         self.accuracy_ = sum(p["is_correct"] for p in per_sample) / n_valid if n_valid > 0 else 0.0
+        self._predictions_ = [
+            {"index": i, "prompt": valid_prompts[i], "is_correct": per_sample[i]["is_correct"]}
+            for i in range(n_valid)
+        ]
         print(f"[hprobes] Valid: {n_valid}  |  Accuracy: {self.accuracy_:.3f}")
 
         if self._top_k_auto:
@@ -1343,9 +1353,10 @@ class HProbes:
     def save(self, path: str) -> Path:
         """Save probe results and classifier to disk.
 
-        Writes two files:
+        Writes:
         - ``<path>.json`` — human-readable results (neurons, scores, cv)
         - ``<path>.pkl``  — serialized classifier for transfer experiments
+        - ``<path>.predictions.jsonl`` — per-sample predictions (unless ``save_predictions=False``)
 
         Parameters
         ----------
@@ -1422,6 +1433,9 @@ class HProbes:
             "clf_classes": self._clf.classes_.tolist() if hasattr(self._clf, "classes_") else [],
         }
 
+        if self.save_predictions and self._predictions_:
+            out["predictions_file"] = p.with_suffix(".predictions.jsonl").name
+
         class _NumpyEncoder(json.JSONEncoder):
             def default(self, obj):
                 if isinstance(obj, (np.integer,)):
@@ -1435,6 +1449,12 @@ class HProbes:
                 return super().default(obj)
 
         json_path.write_text(json.dumps(out, indent=2, cls=_NumpyEncoder))
+
+        if self.save_predictions and self._predictions_:
+            predictions_path = json_path.with_suffix(".predictions.jsonl")
+            with open(predictions_path, "w") as fh:
+                for record in self._predictions_:
+                    fh.write(json.dumps(record, cls=_NumpyEncoder) + "\n")
 
         # Save classifier state for transfer experiments
         tensors = {}
@@ -2176,6 +2196,23 @@ class HProbes:
     # Prompt building
     # ------------------------------------------------------------------
 
+    def _letter_logits_for(
+        self, logits: torch.Tensor, sample: Dict, options_key: str
+    ) -> Dict[str, float]:
+        """Raw letter logits at the readout position, restricted to the sample's options."""
+        options = sample.get(options_key, {}) or {}
+        if isinstance(options, list):
+            letters = [_MCQ_LETTERS[i] for i in range(len(options))]
+        elif isinstance(options, dict):
+            letters = list(options.keys())
+        else:
+            letters = []
+        return {
+            letter: round(float(logits[self._letter_ids[letter]].item()), 4)
+            for letter in letters
+            if letter in self._letter_ids
+        }
+
     def _build_prompt(
         self,
         sample: Dict,
@@ -2413,7 +2450,16 @@ class HProbes:
                 sample_pos = len(valid_prompts)
                 valid_prompts.append(prompt)
                 valid_gt.append(gt)
-                per_sample.append({"predicted": pred, "ground_truth": gt, "is_correct": is_correct})
+                per_sample.append(
+                    {
+                        "predicted": pred,
+                        "ground_truth": gt,
+                        "is_correct": is_correct,
+                        "letter_logits": self._letter_logits_for(
+                            logits_matrix[i], sample, options_key
+                        ),
+                    }
+                )
 
                 # Decision feature: last prompt token CETT (the model's pre-decision state)
                 try:
@@ -2445,6 +2491,7 @@ class HProbes:
 
             # --- single-sample path ---
             tokens = self._tokenize(prompt)
+            letter_logits = None
 
             if self.n_consistency > 1:
                 pred = self._consistency_predict(tokens, self.n_consistency)
@@ -2467,6 +2514,7 @@ class HProbes:
                     skipped += 1
                     continue
                 pred = self._predict_letter(logits)
+                letter_logits = self._letter_logits_for(logits, sample, options_key)
             is_correct = pred == gt
 
             sample_pos = len(valid_prompts)
@@ -2477,6 +2525,7 @@ class HProbes:
                     "predicted": pred,
                     "ground_truth": gt,
                     "is_correct": is_correct,
+                    "letter_logits": letter_logits,
                 }
             )
 

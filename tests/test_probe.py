@@ -729,3 +729,72 @@ class TestAutoTopK:
         probe = HProbes(MODEL, TOK, top_k=5000)
         assert probe._top_k_auto is False
         assert probe.top_k == 5000
+
+
+# ---------------------------------------------------------------------------
+# Predictions sidecar
+# ---------------------------------------------------------------------------
+
+
+class TestPredictionsSidecar:
+    def test_sidecar_written_with_expected_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "probe")
+            _PROBE.save(base)
+            sidecar = Path(base).with_suffix(".predictions.jsonl")
+            assert sidecar.exists()
+            rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+            assert len(rows) == len(_PROBE._predictions_)
+            for row in rows[:5]:
+                assert {
+                    "index",
+                    "prompt",
+                    "predicted",
+                    "ground_truth",
+                    "is_correct",
+                    "letter_logits",
+                } <= set(row)
+                assert row["predicted"] in "ABCD"
+                assert set(row["letter_logits"]) <= set("ABCD")
+            doc = json.loads(Path(base).with_suffix(".json").read_text())
+            assert doc["predictions_file"] == sidecar.name
+
+    def test_list_options_get_letter_logits(self):
+        samples = [
+            {"question": f"Q{i}?", "choices": ["a", "b", "c", "d"], "answer": i % 2}
+            for i in range(20)
+        ]
+        probe = HProbes(MODEL, TOK, l1_C=0.5)
+        probe.fit(samples, options_key="choices", answer_key="answer")
+        assert probe._predictions_
+        assert all(set(r["letter_logits"]) == set("ABCD") for r in probe._predictions_)
+
+    def test_opt_out_writes_no_sidecar(self):
+        probe = HProbes(MODEL, TOK, l1_C=0.5, save_predictions=False)
+        probe.fit(SAMPLES, options_key="options", answer_key="answer")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "probe")
+            probe.save(base)
+            assert not Path(base).with_suffix(".predictions.jsonl").exists()
+            doc = json.loads(Path(base).with_suffix(".json").read_text())
+            assert "predictions_file" not in doc
+
+    def test_open_ended_sidecar_format(self):
+        samples = [
+            {
+                "question": f"Describe {i}.",
+                "response": f"The answer is X{i}.",
+                "answer_tokens": ["X"],
+                "judge": i % 2 == 0,
+            }
+            for i in range(20)
+        ]
+        probe = HProbes(MODEL, TOK, l1_C=0.5)
+        probe.fit_from_responses(samples)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "probe")
+            probe.save(base)
+            sidecar = Path(base).with_suffix(".predictions.jsonl")
+            rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+            assert rows
+            assert all(set(r) == {"index", "prompt", "is_correct"} for r in rows)
