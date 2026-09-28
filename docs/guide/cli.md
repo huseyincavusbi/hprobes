@@ -51,8 +51,9 @@ hprobes run \
 > **Auto top-k (`--top-k auto`).** Resolves the largest feature count that safely fits the
 > machine's available RAM at fit time (Linux `/proc/meminfo`, macOS `vm_stat`, `psutil` when
 > installed, `os.sysconf` fallback). The fit peak is linear in `top_k` — `8·n_rows·k·(1+n_fits)`
-> bytes — so it is inverted as
-> `k = (safety·available − cett_bytes − overhead) // (8·n_rows·(1+n_fits))`,
+> bytes per the analytic model, corrected by a measured calibration factor for the solver's real
+> internals — so it is inverted as
+> `k = (safety·available − cett_bytes − overhead) // (calibration · 8·n_rows·(1+n_fits))`,
 > capped at all features. If even a minimal `k` cannot fit, the run raises `MemoryError`
 > with the maximum sample count instead of an OOM kill. The resolved value and reasoning
 > are recorded in the results JSON (`top_k`, `top_k_auto`, `top_k_reason`).
