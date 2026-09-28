@@ -46,7 +46,7 @@ hprobes run \
 | `--top-k` | `0` (all features) | Variance pre-selection: keep top-K features. `0` = all features (published pipeline); `auto` = largest K that safely fits available RAM; a positive int is an explicit cap |
 | `--auto-safety` | `0.8` | RAM safety factor for `--top-k auto` |
 | `--no-predictions` | off (predictions are written) | Skip the per-sample predictions sidecar |
-| `--readout` | `both` | MCQ answer readout: `logits` (top letter token; legacy), `generate` (greedy generation + parse), `both` (default; generation is the primary label, both recorded) |
+| `--readout` | `both` | MCQ answer readout: `logits` (top letter token; legacy), `generate` (greedy generation + parse), `both` (default; generation is the primary label, both recorded). Causal validation uses the same readout |
 | `--alphas` | `0.0,0.5,1.0,1.5,2.0` | Comma-separated alpha values for causal validation |
 | `--batch-size` | `1` | Batch size for CETT extraction |
 
@@ -91,6 +91,10 @@ primary label while recording both readouts:
 
 Open-ended runs record `{"index", "prompt", "is_correct"}` (raw response text is saved
 separately by the response pipeline). Disable with `--no-predictions`.
+
+Causal validation follows the same readout: with `generate`/`both`, each alpha's accuracy is
+measured on generated answers, and unparseable generations count as **incorrect** so the
+denominator stays fixed across alphas.
 
 ## `hprobes responses`
 
