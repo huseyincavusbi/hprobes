@@ -3,6 +3,7 @@
 import logging
 import json
 import os
+import re
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from .cett import (
     forward_cett_batch,
     forward_cett_dual_span,
     forward_cett_dual_span_batch,
+    scaled_h_neurons,
     precompute_col_norms,
     scale_h_neurons,
     scale_h_neurons_batch,
@@ -31,6 +33,49 @@ from .cett import (
 
 _NOT_FITTED_MSG = "Call fit() before using this method."
 _MCQ_LETTERS = list("ABCDEFGHIJ")
+
+
+def _normalize_text(text: str) -> str:
+    """Lowercase and strip punctuation/whitespace for option-text matching."""
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", str(text).lower())
+    return " ".join(cleaned.split())
+
+
+def _extract_letter_from_text(
+    text: str,
+    valid_letters: List[str],
+    option_texts: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Parse an answer letter from generated text.
+
+    Order: leading letter -> explicit answer patterns -> option-text match
+    (longest first) -> last standalone valid letter.
+    """
+    if not text or not valid_letters:
+        return None
+    clean = str(text).strip()
+    upper = clean.upper()
+
+    match = re.match(r"^\s*\**\(?([A-J])(?=$|[\).,:;\-\s])", upper)
+    if match and match.group(1) in valid_letters:
+        return match.group(1)
+
+    for pattern in (r"\bANSWER\s*(?:IS|:)\s*\**\(?([A-J])\b", r"\bOPTION\s+([A-J])\b"):
+        match = re.search(pattern, upper)
+        if match and match.group(1) in valid_letters:
+            return match.group(1)
+
+    if option_texts:
+        norm = _normalize_text(clean)
+        for letter, option_text in sorted(option_texts.items(), key=lambda kv: -len(str(kv[1]))):
+            norm_opt = _normalize_text(option_text)
+            if len(norm_opt) >= 3 and norm_opt in norm:
+                return letter
+
+    for letter in reversed(re.findall(r"\b([A-J])\b", upper)):
+        if letter in valid_letters:
+            return letter
+    return None
 
 
 def _available_ram_bytes() -> Optional[int]:
@@ -486,6 +531,8 @@ class HProbes:
         top_k: Union[int, str] = 0,
         auto_safety: float = _DEFAULT_AUTO_SAFETY,
         save_predictions: bool = True,
+        readout: str = "both",
+        readout_max_new_tokens: int = 16,
         check_l2: bool = False,
         stability: bool = False,
         correlation: bool = False,
@@ -504,8 +551,14 @@ class HProbes:
         self.top_k = 0 if self._top_k_auto else int(top_k)
         self.auto_safety = auto_safety
         self.save_predictions = save_predictions
+        if readout not in ("logits", "generate", "both"):
+            raise ValueError(f"readout must be 'logits', 'generate' or 'both', got {readout!r}")
+        self.readout = readout
+        self.readout_max_new_tokens = readout_max_new_tokens
         self._top_k_reason: Optional[Dict[str, Any]] = None
         self._predictions_: List[Dict[str, Any]] = []
+        self._val_samples: List[Dict] = []
+        self._options_key: str = "options"
         self._n_fits = (
             1
             + (_STABILITY_N_RUNS if stability else 0)
@@ -615,17 +668,23 @@ class HProbes:
         print(f"[hprobes] Layers: {len(self._layers)}  |  Features: {self._n_features:,}")
 
         # --- Phase 1: extract CETT features ---
-        cett_raw, train_labels, row_to_sample, valid_prompts, valid_gt, per_sample = (
-            self._extract_features(
-                samples,
-                question_key,
-                options_key,
-                answer_key,
-                prompt_fn,
-                answer_cue,
-                top_k,
-                label_fn,
-            )
+        (
+            cett_raw,
+            train_labels,
+            row_to_sample,
+            valid_prompts,
+            valid_gt,
+            per_sample,
+            valid_samples,
+        ) = self._extract_features(
+            samples,
+            question_key,
+            options_key,
+            answer_key,
+            prompt_fn,
+            answer_cue,
+            top_k,
+            label_fn,
         )
 
         n_valid = len(valid_prompts)
@@ -694,6 +753,8 @@ class HProbes:
         # Store val prompts + ground truth for causal_validate()
         self._val_prompts = [valid_prompts[i] for i in val_s]
         self._val_gt = [valid_gt[i] for i in val_s]
+        self._val_samples = [valid_samples[i] for i in val_s]
+        self._options_key = options_key
 
         # --- Phase 2: Cluster-based feature selection (optional) ---
         if self.cluster:
@@ -1220,6 +1281,10 @@ class HProbes:
     ) -> Dict[float, float]:
         """Scale H-Neuron activations by each alpha and measure accuracy on val split.
 
+        Uses the same readout as the fit labels: ``logits`` (top letter token) or, for
+        ``generate``/``both``, greedy generation with the letter parsed from the text
+        (unparseable generations count as incorrect so the denominator stays fixed).
+
         Labeling convention (Incorrect=1):
             suppression (alpha<1) should INCREASE accuracy,
             amplification (alpha>1) should DECREASE accuracy.
@@ -1242,9 +1307,32 @@ class HProbes:
             orig_padding_side = self.tokenizer.padding_side
             self.tokenizer.padding_side = "right"
 
+        use_generation = self.readout in ("generate", "both") and bool(self._val_samples)
         for alpha in alphas:
             correct, total = 0, 0
-            if self.batch_size > 1 and self._val_prompts:
+            if use_generation:
+                self._ensure_pad_token()
+                for sample, prompt, gt in zip(self._val_samples, self._val_prompts, self._val_gt):
+                    tokens = self._tokenize(prompt)
+                    input_len = tokens["input_ids"].shape[1]
+                    try:
+                        with scaled_h_neurons(self.model, self.h_neurons_, alpha, self._layers):
+                            with torch.inference_mode():
+                                out = self.model.generate(
+                                    **tokens,
+                                    max_new_tokens=self.readout_max_new_tokens,
+                                    do_sample=False,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                )
+                    except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                        logging.warning(f"Error: {e}")
+                        continue
+                    text = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
+                    pred = self._extract_generated_letter(text, sample, self._options_key)
+                    # Unparseable generation counts as incorrect: fixed denominator across alphas.
+                    correct += int(pred == gt)
+                    total += 1
+            elif self.batch_size > 1 and self._val_prompts:
                 for start in range(0, len(self._val_prompts), self.batch_size):
                     chunk_prompts = self._val_prompts[start : start + self.batch_size]
                     chunk_gt = self._val_gt[start : start + self.batch_size]
@@ -1430,6 +1518,7 @@ class HProbes:
             "answer_cue": self._answer_cue,
             "threshold": self.threshold_,
             "n_consistency": self.n_consistency,
+            "readout": self.readout,
             "clf_classes": self._clf.classes_.tolist() if hasattr(self._clf, "classes_") else [],
         }
 
@@ -2213,6 +2302,36 @@ class HProbes:
             if letter in self._letter_ids
         }
 
+    def _extract_generated_letter(self, text: str, sample: Dict, options_key: str) -> Optional[str]:
+        """Parse the answer letter from generated text for a sample."""
+        options = sample.get(options_key, {}) or {}
+        if isinstance(options, list):
+            letters = [_MCQ_LETTERS[i] for i in range(len(options)) if i < len(_MCQ_LETTERS)]
+            texts = {letter: str(t) for letter, t in zip(letters, options)}
+        elif isinstance(options, dict):
+            letters = [letter for letter in options if letter in self._letter_ids]
+            texts = {letter: str(options[letter]) for letter in letters}
+        else:
+            return None
+        return _extract_letter_from_text(text, letters, texts)
+
+    def _generate_letter(
+        self, prompt: str, sample: Dict, options_key: str
+    ) -> Tuple[Optional[str], str]:
+        """Greedy generation for the MCQ readout. Returns ``(letter, generated_text)``."""
+        self._ensure_pad_token()
+        tokens = self._tokenize(prompt)
+        input_len = tokens["input_ids"].shape[1]
+        with torch.inference_mode():
+            out = self.model.generate(
+                **tokens,
+                max_new_tokens=self.readout_max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        text = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
+        return self._extract_generated_letter(text, sample, options_key), text
+
     def _build_prompt(
         self,
         sample: Dict,
@@ -2400,6 +2519,7 @@ class HProbes:
 
         cett_raw, train_labels, row_to_sample = [], [], []
         valid_prompts, valid_gt = [], []
+        valid_samples: List[Dict] = []
         per_sample = []
         skipped = 0
 
@@ -2445,21 +2565,33 @@ class HProbes:
                 return
 
             for i, (sample, gt, prompt) in enumerate(buf):
-                pred = self._predict_letter(logits_matrix[i])
+                logits_letter = self._predict_letter(logits_matrix[i])
+                generated, generated_letter = None, None
+                if self.readout in ("generate", "both"):
+                    generated_letter, generated = self._generate_letter(prompt, sample, options_key)
+                    if generated_letter is None:
+                        skipped += 1
+                        continue
+                    pred = generated_letter
+                else:
+                    pred = logits_letter
                 is_correct = pred == gt
                 sample_pos = len(valid_prompts)
                 valid_prompts.append(prompt)
                 valid_gt.append(gt)
-                per_sample.append(
-                    {
-                        "predicted": pred,
-                        "ground_truth": gt,
-                        "is_correct": is_correct,
-                        "letter_logits": self._letter_logits_for(
-                            logits_matrix[i], sample, options_key
-                        ),
-                    }
-                )
+                record = {
+                    "predicted": pred,
+                    "ground_truth": gt,
+                    "is_correct": is_correct,
+                    "letter_logits": self._letter_logits_for(logits_matrix[i], sample, options_key),
+                    "logits_letter": logits_letter,
+                    "logits_is_correct": logits_letter == gt,
+                }
+                if generated is not None:
+                    record["generated"] = generated
+                    record["generated_letter"] = generated_letter
+                    record["generated_is_correct"] = generated_letter == gt
+                per_sample.append(record)
 
                 # Decision feature: last prompt token CETT (the model's pre-decision state)
                 try:
@@ -2492,12 +2624,15 @@ class HProbes:
             # --- single-sample path ---
             tokens = self._tokenize(prompt)
             letter_logits = None
+            logits_letter = None
+            generated, generated_letter = None, None
 
             if self.n_consistency > 1:
                 pred = self._consistency_predict(tokens, self.n_consistency)
                 if pred is None:
                     skipped += 1
                     continue
+                logits_letter = pred
                 try:
                     cett_vec, _ = forward_cett(self.model, tokens, self._layers, self._col_norms)
                 except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
@@ -2513,21 +2648,35 @@ class HProbes:
                     logging.warning(f"Error: {e}")
                     skipped += 1
                     continue
-                pred = self._predict_letter(logits)
+                logits_letter = self._predict_letter(logits)
                 letter_logits = self._letter_logits_for(logits, sample, options_key)
+                pred = logits_letter
+
+            if self.readout in ("generate", "both") and self.n_consistency <= 1:
+                generated_letter, generated = self._generate_letter(prompt, sample, options_key)
+                if generated_letter is None:
+                    skipped += 1
+                    continue
+                pred = generated_letter
             is_correct = pred == gt
 
             sample_pos = len(valid_prompts)
             valid_prompts.append(prompt)
             valid_gt.append(gt)
-            per_sample.append(
-                {
-                    "predicted": pred,
-                    "ground_truth": gt,
-                    "is_correct": is_correct,
-                    "letter_logits": letter_logits,
-                }
-            )
+            valid_samples.append(sample)
+            record = {
+                "predicted": pred,
+                "ground_truth": gt,
+                "is_correct": is_correct,
+                "letter_logits": letter_logits,
+                "logits_letter": logits_letter,
+                "logits_is_correct": logits_letter == gt,
+            }
+            if generated is not None:
+                record["generated"] = generated
+                record["generated_letter"] = generated_letter
+                record["generated_is_correct"] = generated_letter == gt
+            per_sample.append(record)
 
             # Decision feature: last prompt token CETT (the model's pre-decision state)
             try:
@@ -2552,7 +2701,15 @@ class HProbes:
         if skipped:
             print(f"[hprobes] Skipped: {skipped}")
 
-        return cett_raw, train_labels, row_to_sample, valid_prompts, valid_gt, per_sample
+        return (
+            cett_raw,
+            train_labels,
+            row_to_sample,
+            valid_prompts,
+            valid_gt,
+            per_sample,
+            valid_samples,
+        )
 
     def _find_answer_span(
         self, input_ids: torch.Tensor, answer_tokens: List[str]
