@@ -698,6 +698,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             top_k=args.top_k,
             auto_safety=args.auto_safety,
             save_predictions=not args.no_predictions,
+            readout=args.readout,
+            readout_max_new_tokens=args.max_new_tokens_consistency or 16,
         )
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
         probe.model_id = args.model
@@ -780,6 +782,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             top_k=args.top_k,
             auto_safety=args.auto_safety,
             save_predictions=not args.no_predictions,
+            readout=args.readout,
+            readout_max_new_tokens=args.max_new_tokens_consistency or 16,
             check_l2=getattr(args, "check_l2", False),
             stability=getattr(args, "stability", False),
             correlation=getattr(args, "correlation", False),
@@ -946,6 +950,8 @@ def cmd_responses(args: argparse.Namespace) -> None:
         top_k=args.top_k,
         auto_safety=args.auto_safety,
         save_predictions=not args.no_predictions,
+        readout=args.readout,
+        readout_max_new_tokens=args.max_new_tokens_consistency or 16,
         layer_stride=args.layer_stride,
         validation_split=args.validation_split,
         seed=args.seed,
@@ -1298,6 +1304,14 @@ def _add_common_probe_args(p):
         action="store_true",
         dest="no_predictions",
         help="Do not write the per-sample predictions sidecar (<run>.predictions.jsonl).",
+    )
+    p.add_argument(
+        "--readout",
+        choices=["logits", "generate", "both"],
+        default="both",
+        dest="readout",
+        help="MCQ answer readout: 'logits' (top letter token; legacy), 'generate' (greedy "
+        "generation + parse), 'both' (default; generation is the primary label, both recorded).",
     )
     p.add_argument(
         "--batch-size",
