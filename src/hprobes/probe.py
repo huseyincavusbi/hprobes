@@ -95,6 +95,9 @@ def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
 
 _DEFAULT_AUTO_SAFETY = 0.6
 _DEFAULT_AUTO_OVERHEAD_BYTES = 400 * 1024 * 1024  # interpreter/tokenizer slack
+# Measured correction: the real liblinear peak runs ~2.18x above the analytic model
+# (800 rows x 100k features, macOS; solver internals/temporaries dominate). 2.5 adds margin.
+_FIT_PEAK_CALIBRATION = 2.5
 
 
 def _resolve_auto_top_k(
@@ -111,10 +114,12 @@ def _resolve_auto_top_k(
 ) -> Tuple[int, Dict[str, Any]]:
     """Largest ``top_k`` whose estimated fit peak fits safely in available RAM.
 
-    The fit peak is linear in ``top_k`` — ``8·n_rows·k·(1+n_fits)`` bytes — so it
-    can be inverted:
+    The fit peak is linear in ``top_k`` — ``8·n_rows·k·(1+n_fits)`` bytes per the
+    analytic model, calibrated by ``_FIT_PEAK_CALIBRATION`` for the solver's real
+    internals — so it can be inverted:
 
-        k = (safety·available − cett − overhead) / (8·n_rows·(1+n_fits))
+        k = (safety·available − cett − overhead)
+            / (calibration · 8·n_rows·(1+n_fits))
 
     Returns ``(top_k, reason)`` where ``top_k=0`` means "all features" (the budget
     covers every feature). Raises ``MemoryError`` when even a minimal ``top_k``
@@ -127,7 +132,7 @@ def _resolve_auto_top_k(
             "cannot measure available RAM; pass an explicit numeric --top-k instead of 'auto'"
         )
     budget = safety * avail - cett_bytes - overhead_bytes
-    per_feature = 8 * max(1, n_rows) * max(1, n_fits)
+    per_feature = _FIT_PEAK_CALIBRATION * 8 * max(1, n_rows) * (1 + max(0, n_fits))
     if budget <= 0:
         headroom = safety * avail - overhead_bytes
         max_samples = int(headroom // max(1, cett_bytes_per_sample)) if headroom > 0 else 0

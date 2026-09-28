@@ -646,12 +646,16 @@ class TestAutoTopK:
         assert reason["top_k_resolved"] == 0
 
     def test_mid_ram_resolves_partial(self):
-        from hprobes.probe import _DEFAULT_AUTO_OVERHEAD_BYTES, _DEFAULT_AUTO_SAFETY
+        from hprobes.probe import (
+            _DEFAULT_AUTO_OVERHEAD_BYTES,
+            _DEFAULT_AUTO_SAFETY,
+            _FIT_PEAK_CALIBRATION,
+        )
 
         k, reason = self._resolve(4.22e9)
         expected = int(
             (_DEFAULT_AUTO_SAFETY * 4.22e9 - self._CETT - _DEFAULT_AUTO_OVERHEAD_BYTES)
-            // (8 * self._NR)
+            // (_FIT_PEAK_CALIBRATION * 8 * self._NR * 2)
         )
         assert k == expected
         assert 0 < k < self._F
@@ -662,7 +666,17 @@ class TestAutoTopK:
         k1, _ = self._resolve(4.22e9, n_fits=1)
         k6, _ = self._resolve(4.22e9, n_fits=6)
         assert k6 < k1
-        assert abs(k1 / k6 - 6) < 0.01
+        # per-feature cost scales as (1 + n_fits): 2 -> 7
+        assert abs(k1 / k6 - 7 / 2) < 0.01
+
+    def test_calibration_factor_reduces_k(self):
+        """The measured liblinear correction must make k more conservative."""
+        from hprobes.probe import _FIT_PEAK_CALIBRATION
+
+        k, _ = self._resolve(4.22e9)
+        uncorrected = int(k * _FIT_PEAK_CALIBRATION)
+        assert _FIT_PEAK_CALIBRATION > 1.5  # documented as ~2.18x measured
+        assert k < uncorrected / 1.5
 
     def test_insufficient_ram_raises_with_hint(self):
         with pytest.raises(MemoryError, match="top_k cannot help"):
