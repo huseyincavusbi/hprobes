@@ -46,6 +46,7 @@ hprobes run \
 | `--top-k` | `0` (all features) | Variance pre-selection: keep top-K features. `0` = all features (published pipeline); `auto` = largest K that safely fits available RAM; a positive int is an explicit cap |
 | `--auto-safety` | `0.8` | RAM safety factor for `--top-k auto` |
 | `--no-predictions` | off (predictions are written) | Skip the per-sample predictions sidecar |
+| `--readout` | `both` | MCQ answer readout: `logits` (top letter token; legacy), `generate` (greedy generation + parse), `both` (default; generation is the primary label, both recorded) |
 | `--alphas` | `0.0,0.5,1.0,1.5,2.0` | Comma-separated alpha values for causal validation |
 | `--batch-size` | `1` | Batch size for CETT extraction |
 
@@ -75,12 +76,17 @@ Produces:
 - `<output>.pkl` — Serialized classifier for later loading
 - `<output>.predictions.jsonl` — Per-sample predictions (written by default)
 
-The predictions sidecar has one JSON object per sample. MCQ runs read the answer as a letter
-from the last-prompt logits, so the file records the readout and the underlying letter logits:
+The predictions sidecar has one JSON object per sample. For MCQ, `--readout` controls the
+primary label (`predicted` / `is_correct`): `logits` uses the top letter token (legacy),
+`generate` parses the greedy generation, and `both` (default) makes the **generation** the
+primary label while recording both readouts:
 
 ```json
-{"index": 0, "prompt": "...exact model input...", "predicted": "B", "ground_truth": "B",
- "is_correct": true, "letter_logits": {"A": 10.42, "B": 17.88, "C": 9.15, "D": 12.03}}
+{"index": 0, "prompt": "...exact model input...", "ground_truth": "B",
+ "predicted": "B", "is_correct": true,
+ "letter_logits": {"A": 10.42, "B": 17.88, "C": 9.15, "D": 12.03},
+ "logits_letter": "B", "logits_is_correct": true,
+ "generated": "B. proteins.", "generated_letter": "B", "generated_is_correct": true}
 ```
 
 Open-ended runs record `{"index", "prompt", "is_correct"}` (raw response text is saved
