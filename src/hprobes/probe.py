@@ -2475,6 +2475,7 @@ class HProbes:
 
             # --- single-sample path ---
             tokens = self._tokenize(prompt)
+            letter_logits = None
 
             if self.n_consistency > 1:
                 pred = self._consistency_predict(tokens, self.n_consistency)
@@ -2497,6 +2498,7 @@ class HProbes:
                     skipped += 1
                     continue
                 pred = self._predict_letter(logits)
+                letter_logits = self._letter_logits_for(logits, sample, options_key)
             is_correct = pred == gt
 
             sample_pos = len(valid_prompts)
@@ -2507,7 +2509,7 @@ class HProbes:
                     "predicted": pred,
                     "ground_truth": gt,
                     "is_correct": is_correct,
-                    "letter_logits": self._letter_logits_for(logits, sample, options_key),
+                    "letter_logits": letter_logits,
                 }
             )
 
