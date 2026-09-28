@@ -65,6 +65,11 @@ class _Model(nn.Module):
         out.logits = self.lm_head(x)
         return out
 
+    def generate(self, input_ids=None, attention_mask=None, max_new_tokens=1, **kw):
+        """Deterministic stub: append the letter 'B' (chr 66) once per row."""
+        extra = torch.full((input_ids.shape[0], 1), ord("B"), dtype=torch.long)
+        return torch.cat([input_ids, extra], dim=1)
+
 
 class _TokenizerOutput(dict):
     """Dict subclass with .to() so detect_batch() can call tokenizer(...).to(device)."""
@@ -84,7 +89,7 @@ class _Tokenizer:
     def encode(self, text, add_special_tokens=False):
         return [ord(c) for c in text]
 
-    def decode(self, ids):
+    def decode(self, ids, skip_special_tokens=False):
         return "".join(chr(i) for i in ids)
 
     def __call__(self, text, return_tensors=None, truncation=False, max_length=None, padding=False):
