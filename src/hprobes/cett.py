@@ -15,6 +15,7 @@ where:
 from typing import Dict, List, Tuple
 
 import torch
+from contextlib import contextmanager
 
 
 def _get_transformer_layers(model: torch.nn.Module):
@@ -757,3 +758,37 @@ def scale_h_neurons(
             h.remove()
 
     return out.logits[0, -1, :].detach().float().cpu()
+
+
+@contextmanager
+def scaled_h_neurons(model: torch.nn.Module, h_neurons, alpha: float, layers):
+    """Context manager scaling H-Neuron activations by alpha on every forward pass.
+
+    Same intervention as ``scale_h_neurons`` but stays active for the whole block
+    (e.g. across all steps of ``model.generate``).
+    """
+    neurons_by_layer = {}
+    for layer_idx, neuron_idx in h_neurons:
+        neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
+
+    handles = []
+    for layer_idx in layers:
+        if layer_idx not in neurons_by_layer:
+            continue
+        indices = torch.tensor(neurons_by_layer[layer_idx], dtype=torch.long)
+        down_proj = get_mlp_down_proj(model, layer_idx)
+
+        def make_pre_hook(idx, a):
+            def pre_hook(module, input):
+                z = input[0].clone()
+                z[..., idx.to(z.device)] *= a
+                return (z,) + input[1:]
+
+            return pre_hook
+
+        handles.append(down_proj.register_forward_pre_hook(make_pre_hook(indices, alpha)))
+    try:
+        yield
+    finally:
+        for h in handles:
+            h.remove()

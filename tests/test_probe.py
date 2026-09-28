@@ -883,6 +883,22 @@ class TestReadoutModes:
             assert row["generated_is_correct"] == (row["generated_letter"] == row["ground_truth"])
             assert row["logits_is_correct"] == (row["logits_letter"] == row["ground_truth"])
 
+    def test_causal_validation_uses_generation_in_both(self):
+        probe = self._fit("both")
+        probe.h_neurons_ = [(0, 0)]
+        probe.n_neurons_ = 1
+        cv = probe.causal_validate(alphas=[0.0, 1.0])
+        assert set(cv) == {0.0, 1.0}
+        assert all(0.0 <= v <= 1.0 for v in cv.values())
+
+    def test_causal_unparseable_generation_counts_incorrect(self):
+        probe = self._fit("both")
+        probe.h_neurons_ = [(0, 0)]
+        probe.n_neurons_ = 1
+        probe._extract_generated_letter = lambda text, sample, options_key: None
+        cv = probe.causal_validate(alphas=[0.0, 1.0])
+        assert all(v == 0.0 for v in cv.values())
+
     def test_sidecar_includes_generated_in_both(self):
         probe = self._fit("both")
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,6 +25,7 @@ from .cett import (
     forward_cett_batch,
     forward_cett_dual_span,
     forward_cett_dual_span_batch,
+    scaled_h_neurons,
     precompute_col_norms,
     scale_h_neurons,
     scale_h_neurons_batch,
@@ -556,6 +557,8 @@ class HProbes:
         self.readout_max_new_tokens = readout_max_new_tokens
         self._top_k_reason: Optional[Dict[str, Any]] = None
         self._predictions_: List[Dict[str, Any]] = []
+        self._val_samples: List[Dict] = []
+        self._options_key: str = "options"
         self._n_fits = (
             1
             + (_STABILITY_N_RUNS if stability else 0)
@@ -665,17 +668,23 @@ class HProbes:
         print(f"[hprobes] Layers: {len(self._layers)}  |  Features: {self._n_features:,}")
 
         # --- Phase 1: extract CETT features ---
-        cett_raw, train_labels, row_to_sample, valid_prompts, valid_gt, per_sample = (
-            self._extract_features(
-                samples,
-                question_key,
-                options_key,
-                answer_key,
-                prompt_fn,
-                answer_cue,
-                top_k,
-                label_fn,
-            )
+        (
+            cett_raw,
+            train_labels,
+            row_to_sample,
+            valid_prompts,
+            valid_gt,
+            per_sample,
+            valid_samples,
+        ) = self._extract_features(
+            samples,
+            question_key,
+            options_key,
+            answer_key,
+            prompt_fn,
+            answer_cue,
+            top_k,
+            label_fn,
         )
 
         n_valid = len(valid_prompts)
@@ -744,6 +753,8 @@ class HProbes:
         # Store val prompts + ground truth for causal_validate()
         self._val_prompts = [valid_prompts[i] for i in val_s]
         self._val_gt = [valid_gt[i] for i in val_s]
+        self._val_samples = [valid_samples[i] for i in val_s]
+        self._options_key = options_key
 
         # --- Phase 2: Cluster-based feature selection (optional) ---
         if self.cluster:
@@ -1270,6 +1281,10 @@ class HProbes:
     ) -> Dict[float, float]:
         """Scale H-Neuron activations by each alpha and measure accuracy on val split.
 
+        Uses the same readout as the fit labels: ``logits`` (top letter token) or, for
+        ``generate``/``both``, greedy generation with the letter parsed from the text
+        (unparseable generations count as incorrect so the denominator stays fixed).
+
         Labeling convention (Incorrect=1):
             suppression (alpha<1) should INCREASE accuracy,
             amplification (alpha>1) should DECREASE accuracy.
@@ -1292,9 +1307,32 @@ class HProbes:
             orig_padding_side = self.tokenizer.padding_side
             self.tokenizer.padding_side = "right"
 
+        use_generation = self.readout in ("generate", "both") and bool(self._val_samples)
         for alpha in alphas:
             correct, total = 0, 0
-            if self.batch_size > 1 and self._val_prompts:
+            if use_generation:
+                self._ensure_pad_token()
+                for sample, prompt, gt in zip(self._val_samples, self._val_prompts, self._val_gt):
+                    tokens = self._tokenize(prompt)
+                    input_len = tokens["input_ids"].shape[1]
+                    try:
+                        with scaled_h_neurons(self.model, self.h_neurons_, alpha, self._layers):
+                            with torch.inference_mode():
+                                out = self.model.generate(
+                                    **tokens,
+                                    max_new_tokens=self.readout_max_new_tokens,
+                                    do_sample=False,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                )
+                    except (ValueError, KeyError, RuntimeError, IndexError, TypeError) as e:
+                        logging.warning(f"Error: {e}")
+                        continue
+                    text = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
+                    pred = self._extract_generated_letter(text, sample, self._options_key)
+                    # Unparseable generation counts as incorrect: fixed denominator across alphas.
+                    correct += int(pred == gt)
+                    total += 1
+            elif self.batch_size > 1 and self._val_prompts:
                 for start in range(0, len(self._val_prompts), self.batch_size):
                     chunk_prompts = self._val_prompts[start : start + self.batch_size]
                     chunk_gt = self._val_gt[start : start + self.batch_size]
@@ -2481,6 +2519,7 @@ class HProbes:
 
         cett_raw, train_labels, row_to_sample = [], [], []
         valid_prompts, valid_gt = [], []
+        valid_samples: List[Dict] = []
         per_sample = []
         skipped = 0
 
@@ -2624,6 +2663,7 @@ class HProbes:
             sample_pos = len(valid_prompts)
             valid_prompts.append(prompt)
             valid_gt.append(gt)
+            valid_samples.append(sample)
             record = {
                 "predicted": pred,
                 "ground_truth": gt,
@@ -2661,7 +2701,15 @@ class HProbes:
         if skipped:
             print(f"[hprobes] Skipped: {skipped}")
 
-        return cett_raw, train_labels, row_to_sample, valid_prompts, valid_gt, per_sample
+        return (
+            cett_raw,
+            train_labels,
+            row_to_sample,
+            valid_prompts,
+            valid_gt,
+            per_sample,
+            valid_samples,
+        )
 
     def _find_answer_span(
         self, input_ids: torch.Tensor, answer_tokens: List[str]
