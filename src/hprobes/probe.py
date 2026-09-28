@@ -6,7 +6,7 @@ import os
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -34,7 +34,44 @@ _MCQ_LETTERS = list("ABCDEFGHIJ")
 
 
 def _available_ram_bytes() -> Optional[int]:
-    """Best-effort available RAM in bytes, without extra dependencies."""
+    """Best-effort available RAM in bytes, without new dependencies.
+
+    Reads platform sources directly where possible:
+    - Linux: ``MemAvailable`` from ``/proc/meminfo`` (accounts for reclaimable cache)
+    - macOS: ``vm_stat`` free + inactive + speculative pages (subprocess; no direct API)
+    - ``psutil`` when installed, then the ``os.sysconf`` free-page count as fallback.
+    """
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except (ImportError, OSError, AttributeError, ValueError):
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    if hasattr(os, "uname") and os.uname().sysname == "Darwin":
+        try:
+            import re
+            import subprocess
+
+            out = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=5, check=False
+            ).stdout
+            match = re.search(r"page size of (\d+) bytes", out)
+            page_size = int(match.group(1)) if match else os.sysconf("SC_PAGE_SIZE")
+            pages = 0
+            for line in out.splitlines():
+                if line.startswith(("Pages free:", "Pages inactive:", "Pages speculative:")):
+                    pages += int(line.split(":")[1].strip().rstrip("."))
+            if pages:
+                return pages * page_size
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            pass
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
     except (ValueError, OSError, AttributeError):
@@ -54,6 +91,76 @@ def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
     retained = n_rows * n_features * 4 * 2  # X + (X_train + X_val)
     fit_copies = n_rows * n_features * 8 * max(1, n_fits)
     return retained + fit_copies
+
+
+_DEFAULT_AUTO_SAFETY = 0.8
+_DEFAULT_AUTO_OVERHEAD_BYTES = 400 * 1024 * 1024  # interpreter/tokenizer slack
+# Measured correction: the real liblinear peak runs ~2.18x above the analytic model
+# (800 rows x 100k features, macOS; solver internals/temporaries dominate). 2.5 adds margin.
+_FIT_PEAK_CALIBRATION = 2.5
+
+
+def _resolve_auto_top_k(
+    *,
+    n_valid: int,
+    n_rows: int,
+    n_features: int,
+    n_fits: int,
+    cett_bytes: int,
+    cett_bytes_per_sample: int = 4,
+    safety: float = _DEFAULT_AUTO_SAFETY,
+    overhead_bytes: int = _DEFAULT_AUTO_OVERHEAD_BYTES,
+    available_bytes: Optional[int] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """Largest ``top_k`` whose estimated fit peak fits safely in available RAM.
+
+    The fit peak is linear in ``top_k`` — ``8·n_rows·k·(1+n_fits)`` bytes per the
+    analytic model, calibrated by ``_FIT_PEAK_CALIBRATION`` for the solver's real
+    internals — so it can be inverted:
+
+        k = (safety·available − cett − overhead)
+            / (calibration · 8·n_rows·(1+n_fits))
+
+    Returns ``(top_k, reason)`` where ``top_k=0`` means "all features" (the budget
+    covers every feature). Raises ``MemoryError`` when even a minimal ``top_k``
+    cannot fit: the CETT vectors are already allocated and dominate, so only fewer
+    samples (or a larger machine) can help.
+    """
+    avail = available_bytes if available_bytes is not None else _available_ram_bytes()
+    if avail is None:
+        raise MemoryError(
+            "cannot measure available RAM; pass an explicit numeric --top-k instead of 'auto'"
+        )
+    budget = safety * avail - cett_bytes - overhead_bytes
+    per_feature = _FIT_PEAK_CALIBRATION * 8 * max(1, n_rows) * (1 + max(0, n_fits))
+    if budget <= 0:
+        headroom = safety * avail - overhead_bytes
+        max_samples = int(headroom // max(1, cett_bytes_per_sample)) if headroom > 0 else 0
+        if max_samples > 0:
+            hint = f"reduce samples to <= {max_samples:,} or run on a larger machine"
+        else:
+            hint = "increase --auto-safety, free RAM, or run on a larger machine"
+        raise MemoryError(
+            f"insufficient RAM for the probe fit: available {avail / 1e9:.1f} GB, "
+            f"CETT features already use {cett_bytes / 1e9:.1f} GB, overhead "
+            f"{overhead_bytes / 1e9:.1f} GB. top_k cannot help — {hint}."
+        )
+    k = int(budget // per_feature)
+    capped = k >= n_features
+    reason = {
+        "top_k_auto": True,
+        "top_k_resolved": 0 if capped else k,
+        "available_bytes": int(avail),
+        "budget_bytes": int(budget),
+        "cett_bytes": int(cett_bytes),
+        "overhead_bytes": int(overhead_bytes),
+        "safety": float(safety),
+        "n_fits": int(n_fits),
+        "n_rows": int(n_rows),
+        "n_valid": int(n_valid),
+        "capped_all_features": bool(capped),
+    }
+    return (0 if capped else k), reason
 
 
 def _warn_if_memory_heavy(
@@ -376,7 +483,8 @@ class HProbes:
         max_tokens: int = 1024,
         batch_size: int = 1,
         n_consistency: int = 1,
-        top_k: int = 0,
+        top_k: Union[int, str] = 0,
+        auto_safety: float = _DEFAULT_AUTO_SAFETY,
         check_l2: bool = False,
         stability: bool = False,
         correlation: bool = False,
@@ -391,7 +499,16 @@ class HProbes:
         self.correlation = correlation
         self.cluster = cluster
         self.strict_memory = strict_memory
-        self.top_k = top_k
+        self._top_k_auto = isinstance(top_k, str) and top_k.strip().lower() in ("auto", "-1")
+        self.top_k = 0 if self._top_k_auto else int(top_k)
+        self.auto_safety = auto_safety
+        self._top_k_reason: Optional[Dict[str, Any]] = None
+        self._n_fits = (
+            1
+            + (_STABILITY_N_RUNS if stability else 0)
+            + int(bool(check_l2))
+            + int(bool(correlation))
+        )
         self.batch_size = batch_size
         self.layer_stride = layer_stride
         self.validation_split = validation_split
@@ -514,6 +631,28 @@ class HProbes:
         print(f"[hprobes] Valid: {n_valid}  |  Accuracy: {self.accuracy_:.3f}")
         if n_valid < 20:
             print(f"  WARNING: only {n_valid} valid samples — probe may be unreliable.")
+
+        if self._top_k_auto:
+            resolved, self._top_k_reason = _resolve_auto_top_k(
+                n_valid=n_valid,
+                n_rows=max(1, int(n_valid * (1 - self.validation_split))),
+                n_features=self._n_features,
+                n_fits=self._n_fits,
+                cett_bytes=4 * n_valid * self._n_features,
+                cett_bytes_per_sample=4 * self._n_features,
+                safety=self.auto_safety,
+            )
+            print(
+                f"[hprobes] auto top_k: {resolved or self._n_features:,}/{self._n_features:,} "
+                f"(avail {self._top_k_reason['available_bytes'] / 1e9:.1f} GB, "
+                f"CETT {self._top_k_reason['cett_bytes'] / 1e9:.1f} GB, "
+                f"safety {self.auto_safety})"
+            )
+            if 0 < resolved < 1000:
+                print(
+                    f"  WARNING: resolved top_k={resolved} is aggressive — fewer samples raise it."
+                )
+            top_k = min(resolved, self._n_features) if resolved > 0 else self._n_features
 
         # --- Variance pre-selection ---
         feature_var = self._welford_M2 / max(self._welford_n - 1, 1)
@@ -849,6 +988,28 @@ class HProbes:
         n_valid = len(valid_prompts)
         self.accuracy_ = sum(p["is_correct"] for p in per_sample) / n_valid if n_valid > 0 else 0.0
         print(f"[hprobes] Valid: {n_valid}  |  Accuracy: {self.accuracy_:.3f}")
+
+        if self._top_k_auto:
+            resolved, self._top_k_reason = _resolve_auto_top_k(
+                n_valid=n_valid,
+                n_rows=max(1, 2 * int(n_valid * (1 - self.validation_split))),
+                n_features=self._n_features,
+                n_fits=self._n_fits,
+                cett_bytes=8 * n_valid * self._n_features,
+                cett_bytes_per_sample=8 * self._n_features,
+                safety=self.auto_safety,
+            )
+            print(
+                f"[hprobes] auto top_k: {resolved or self._n_features:,}/{self._n_features:,} "
+                f"(avail {self._top_k_reason['available_bytes'] / 1e9:.1f} GB, "
+                f"CETT {self._top_k_reason['cett_bytes'] / 1e9:.1f} GB, "
+                f"safety {self.auto_safety})"
+            )
+            if 0 < resolved < 1000:
+                print(
+                    f"  WARNING: resolved top_k={resolved} is aggressive — fewer samples raise it."
+                )
+            top_k = min(resolved, self._n_features) if resolved > 0 else self._n_features
 
         # Variance pre-selection
         feature_var = self._welford_M2 / max(self._welford_n - 1, 1)
@@ -1249,6 +1410,9 @@ class HProbes:
             "intermediate_dim": self._intermediate_dim,
             "n_features": self._n_features,
             "l1_C": self.l1_C,
+            "top_k": self._top_k_reason["top_k_resolved"] if self._top_k_reason else self.top_k,
+            "top_k_auto": self._top_k_auto,
+            "top_k_reason": self._top_k_reason,
             "layer_stride": self.layer_stride,
             "seed": self.seed,
             "max_tokens": self.max_tokens,

@@ -613,3 +613,119 @@ class TestMemoryGuard:
 
     def test_default_top_k_is_all_features(self):
         assert HProbes(MODEL, TOK).top_k == 0
+
+
+# ---------------------------------------------------------------------------
+# Auto top-k resolution
+# ---------------------------------------------------------------------------
+
+
+class TestAutoTopK:
+    _F = 348_160
+    _NV = 978
+    _NR = int(0.8 * 978)
+    _CETT = 4 * 978 * 348_160
+
+    def _resolve(self, avail, n_fits=1, **kw):
+        from hprobes.probe import _resolve_auto_top_k
+
+        return _resolve_auto_top_k(
+            n_valid=self._NV,
+            n_rows=self._NR,
+            n_features=self._F,
+            n_fits=n_fits,
+            cett_bytes=self._CETT,
+            available_bytes=avail,
+            **kw,
+        )
+
+    def test_high_ram_resolves_to_all_features(self):
+        k, reason = self._resolve(40e9)
+        assert k == 0  # 0 == all features
+        assert reason["capped_all_features"] is True
+        assert reason["top_k_resolved"] == 0
+
+    def test_mid_ram_resolves_partial(self):
+        from hprobes.probe import (
+            _DEFAULT_AUTO_OVERHEAD_BYTES,
+            _DEFAULT_AUTO_SAFETY,
+            _FIT_PEAK_CALIBRATION,
+        )
+
+        k, reason = self._resolve(4.22e9)
+        expected = int(
+            (_DEFAULT_AUTO_SAFETY * 4.22e9 - self._CETT - _DEFAULT_AUTO_OVERHEAD_BYTES)
+            // (_FIT_PEAK_CALIBRATION * 8 * self._NR * 2)
+        )
+        assert k == expected
+        assert 0 < k < self._F
+        assert reason["capped_all_features"] is False
+        assert reason["top_k_resolved"] == k
+
+    def test_n_fits_shrinks_k(self):
+        k1, _ = self._resolve(4.22e9, n_fits=1)
+        k6, _ = self._resolve(4.22e9, n_fits=6)
+        assert k6 < k1
+        # per-feature cost scales as (1 + n_fits): 2 -> 7
+        assert abs(k1 / k6 - 7 / 2) < 0.01
+
+    def test_calibration_factor_reduces_k(self):
+        """The measured liblinear correction must make k more conservative."""
+        from hprobes.probe import _FIT_PEAK_CALIBRATION
+
+        k, _ = self._resolve(4.22e9)
+        uncorrected = int(k * _FIT_PEAK_CALIBRATION)
+        assert _FIT_PEAK_CALIBRATION > 1.5  # documented as ~2.18x measured
+        assert k < uncorrected / 1.5
+
+    def test_insufficient_ram_raises_with_hint(self):
+        with pytest.raises(MemoryError, match="top_k cannot help"):
+            self._resolve(2e9)
+
+    def test_max_sample_hint_is_plausible(self):
+        """The remediation hint must divide by per-sample CETT bytes (bytes/element x F)."""
+        from hprobes.probe import _DEFAULT_AUTO_OVERHEAD_BYTES, _resolve_auto_top_k
+
+        n_features = 400_000
+        n_valid = 200
+        expected = int((0.6 * 1.1e9 - _DEFAULT_AUTO_OVERHEAD_BYTES) // (4 * n_features))
+        with pytest.raises(MemoryError) as exc:
+            _resolve_auto_top_k(
+                n_valid=n_valid,
+                n_rows=160,
+                n_features=n_features,
+                n_fits=1,
+                cett_bytes=4 * n_valid * n_features,
+                cett_bytes_per_sample=4 * n_features,
+                safety=0.6,
+                available_bytes=1.1e9,
+            )
+        assert f"<= {expected:,}" in str(exc.value)
+        assert 0 < expected < 1_000_000  # sanity: a plausible sample count
+
+    def test_tiny_safety_suggests_increasing_safety(self):
+        with pytest.raises(MemoryError, match="increase --auto-safety"):
+            self._resolve(3e9, safety=0.01)
+
+    def test_unmeasurable_ram_raises(self, monkeypatch):
+        from hprobes import probe
+
+        monkeypatch.setattr(probe, "_available_ram_bytes", lambda: None)
+        with pytest.raises(MemoryError, match="cannot measure"):
+            probe._resolve_auto_top_k(n_valid=10, n_rows=8, n_features=100, n_fits=1, cett_bytes=0)
+
+    def test_ram_probe_returns_positive_or_none(self):
+        from hprobes.probe import _available_ram_bytes
+
+        value = _available_ram_bytes()
+        assert value is None or value > 0
+
+    def test_auto_top_k_accepted_by_init(self):
+        probe = HProbes(MODEL, TOK, top_k="auto")
+        assert probe._top_k_auto is True
+        assert probe.top_k == 0
+
+    def test_explicit_top_k_unchanged(self):
+        probe = HProbes(MODEL, TOK, top_k=5000)
+        assert probe._top_k_auto is False
+        assert probe.top_k == 5000

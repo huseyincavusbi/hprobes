@@ -231,3 +231,45 @@ class TestCLIArgParsing:
             ["transfer", "--probe", "p", "--model", "m", "--data", "d", "--max-tokens", "512"]
         )
         assert args.max_tokens == 512
+
+    def test_run_parser_accepts_auto_top_k_and_safety(self):
+        args = self._parse(
+            [
+                "run",
+                "--model",
+                "m",
+                "--data",
+                "d",
+                "--top-k",
+                "auto",
+                "--auto-safety",
+                "0.5",
+            ]
+        )
+        assert args.top_k == "auto"
+        assert args.auto_safety == 0.5
+
+
+class TestParseTopK:
+    def test_auto_aliases(self):
+        from hprobes.cli import _parse_top_k
+
+        assert _parse_top_k("auto") == "auto"
+        assert _parse_top_k("AUTO") == "auto"
+        assert _parse_top_k("-1") == "auto"
+
+    def test_numeric_values(self):
+        from hprobes.cli import _parse_top_k
+
+        assert _parse_top_k("0") == 0
+        assert _parse_top_k("5000") == 5000
+
+    def test_rejects_negative_and_junk(self):
+        import argparse
+
+        from hprobes.cli import _parse_top_k
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_top_k("-5")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_top_k("abc")
