@@ -59,6 +59,7 @@ def get_mlp_down_proj(model: torch.nn.Module, layer_idx: int) -> torch.nn.Module
       - down_proj (Llama, Gemma, Mistral)
       - c_proj (GPT2)
       - fc2 (OPT)
+      - shared_expert.down_proj (MoE models, e.g. Qwen3.8-Flash-Next)
     """
     layers = _get_transformer_layers(model)
     if layer_idx >= len(layers):
@@ -72,6 +73,10 @@ def get_mlp_down_proj(model: torch.nn.Module, layer_idx: int) -> torch.nn.Module
             if hasattr(mlp, name):
                 return getattr(mlp, name)
 
+        # MoE shared expert (Qwen3.5/3.8 MoE)
+        if hasattr(mlp, "shared_expert") and hasattr(mlp.shared_expert, "down_proj"):
+            return mlp.shared_expert.down_proj
+
     # Some architectures might have it at the block level directly
     for name in ["down_proj", "c_proj", "fc2"]:
         if hasattr(block, name):
@@ -79,7 +84,7 @@ def get_mlp_down_proj(model: torch.nn.Module, layer_idx: int) -> torch.nn.Module
 
     raise AttributeError(
         f"Could not find MLP down-projection layer in {type(block).__name__}. "
-        "Checked: .mlp.down_proj, .mlp.c_proj, .mlp.fc2"
+        "Checked: .mlp.down_proj, .mlp.c_proj, .mlp.fc2, .mlp.shared_expert.down_proj"
     )
 
 
