@@ -173,6 +173,24 @@ def _resolve_format(args, samples):
     return fmt, *format_keys(fmt)
 
 
+def _uses_mps(device: str) -> bool:
+    """True when a load should target MPS (explicit, or ``auto`` on Apple Silicon).
+
+    Loading with ``device_map="mps"`` can hang when the load forces a dtype
+    conversion (concurrent async materialization onto MPS,
+    huggingface/transformers#48029). MPS loads therefore go through CPU first.
+    """
+    if device == "mps":
+        return True
+    if device != "auto":
+        return False
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.backends.mps.is_available())
+
+
 def _load_model(args):
     """Load tokenizer and model from args. Returns (tokenizer, model)."""
     import torch
@@ -197,13 +215,17 @@ def _load_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
     load_kwargs = {
         "dtype": dtype_map[args.dtype],
-        "device_map": args.device,
         "trust_remote_code": args.trust_remote_code,
     }
     attn = getattr(args, "attn_implementation", "auto")
     if attn not in ("auto", None):
         load_kwargs["attn_implementation"] = attn
-    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    if _uses_mps(args.device):
+        model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+        model = model.to("mps")
+    else:
+        load_kwargs["device_map"] = args.device
+        model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model.eval()
     return tokenizer, model
 
