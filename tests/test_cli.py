@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from hprobes.cli import detect_format, format_keys, load_samples
+from hprobes.cli import _uses_mps, detect_format, format_keys, load_samples
 
 
 _MMLU_SAMPLE = {
@@ -112,6 +112,29 @@ class TestLoadSamples:
 
         with pytest.raises(SystemExit):
             load_samples(path, n=10)
+
+
+class TestUsesMps:
+    def test_explicit_mps(self):
+        assert _uses_mps("mps") is True
+
+    def test_cpu(self):
+        assert _uses_mps("cpu") is False
+
+    def test_cuda(self):
+        assert _uses_mps("cuda") is False
+
+    def test_auto_with_mps(self, monkeypatch):
+        import torch
+
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+        assert _uses_mps("auto") is True
+
+    def test_auto_without_mps(self, monkeypatch):
+        import torch
+
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+        assert _uses_mps("auto") is False
 
 
 class TestCLIArgParsing:
