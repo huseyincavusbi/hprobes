@@ -588,6 +588,8 @@ class HProbes:
         # Internal state
         self._layers: List[int] = []
         self._col_norms: Dict[int, torch.Tensor] = {}
+        self._layer_dims: Dict[int, int] = {}
+        self._layer_offsets: Dict[int, int] = {}
         self._intermediate_dim: int = 0
         self._n_features: int = 0
         self._top_k_idx: Optional[np.ndarray] = None
@@ -612,6 +614,21 @@ class HProbes:
         # Results storage (set after score() / causal_validate())
         self.score_results_: Optional[Dict] = None
         self.cv_results_: Optional[Dict[float, float]] = None
+
+    def _set_feature_layout(self) -> None:
+        """Compute per-layer dims and flat offsets from ``_col_norms``.
+
+        Supports models whose FFN intermediate dims differ per layer
+        (e.g. Gemma 4 E-series double-wide MLPs).
+        """
+        self._layer_dims = {layer: int(self._col_norms[layer].shape[0]) for layer in self._layers}
+        self._n_features = sum(self._layer_dims.values())
+        self._intermediate_dim = self._layer_dims[self._layers[0]]
+        self._layer_offsets = {}
+        offset = 0
+        for layer in self._layers:
+            self._layer_offsets[layer] = offset
+            offset += self._layer_dims[layer]
 
     # ------------------------------------------------------------------
     # Public API
@@ -660,8 +677,7 @@ class HProbes:
         self._answer_cue = answer_cue
         self._layers = available_layers(self.model)[:: self.layer_stride]
         self._col_norms = precompute_col_norms(self.model, self._layers)
-        self._intermediate_dim = next(iter(self._col_norms.values())).shape[0]
-        self._n_features = len(self._layers) * self._intermediate_dim
+        self._set_feature_layout()
         self._letter_ids = self._get_letter_ids()
         top_k = min(self.top_k, self._n_features) if self.top_k > 0 else self._n_features
 
@@ -872,8 +888,7 @@ class HProbes:
         """
         self._layers = available_layers(self.model)[:: self.layer_stride]
         self._col_norms = precompute_col_norms(self.model, self._layers)
-        self._intermediate_dim = next(iter(self._col_norms.values())).shape[0]
-        self._n_features = len(self._layers) * self._intermediate_dim
+        self._set_feature_layout()
         self._letter_ids = self._get_letter_ids()
         top_k = min(self.top_k, self._n_features) if self.top_k > 0 else self._n_features
 
@@ -1487,6 +1502,7 @@ class HProbes:
                 "model_name": model_name,
                 "n_layers": len(self._layers),
                 "intermediate_dim": self._intermediate_dim,
+                "layer_dims": {str(k): v for k, v in self._layer_dims.items()},
                 "total_features": self._n_features,
             },
         }
@@ -1507,6 +1523,7 @@ class HProbes:
             "h_neurons": self.h_neurons_,
             "layers": self._layers,
             "intermediate_dim": self._intermediate_dim,
+            "layer_dims": {str(k): v for k, v in self._layer_dims.items()},
             "n_features": self._n_features,
             "l1_C": self.l1_C,
             "top_k": self._top_k_reason["top_k_resolved"] if self._top_k_reason else self.top_k,
@@ -1654,9 +1671,10 @@ class HProbes:
         for layer, _ in probe.h_neurons_:
             probe.layer_distribution_[layer] = probe.layer_distribution_.get(layer, 0) + 1
 
+        probe._col_norms = precompute_col_norms(model, probe._layers)
+        probe._set_feature_layout()
         total = probe._n_features if probe._n_features > 0 else 1
         probe.neuron_ratio_ = (probe.n_neurons_ / total) * 1000
-        probe._col_norms = precompute_col_norms(model, probe._layers)
         probe._letter_ids = probe._get_letter_ids()
         probe.is_fitted_ = True
 
