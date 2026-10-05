@@ -630,6 +630,15 @@ class HProbes:
             self._layer_offsets[layer] = offset
             offset += self._layer_dims[layer]
 
+    def _flat_to_layer_neuron(self, flat_idx: int) -> Optional[Tuple[int, int]]:
+        """Map a flat CETT index to ``(layer, neuron)`` using per-layer offsets."""
+        for layer in self._layers:
+            offset = self._layer_offsets[layer]
+            dim = self._layer_dims[layer]
+            if offset <= flat_idx < offset + dim:
+                return layer, int(flat_idx - offset)
+        return None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -818,10 +827,9 @@ class HProbes:
         self.h_neurons_ = []
         for sel_idx in selected:
             flat_idx = int(self._top_k_idx[sel_idx])
-            layer_pos = flat_idx // self._intermediate_dim
-            neuron_pos = flat_idx % self._intermediate_dim
-            if layer_pos < len(self._layers):
-                self.h_neurons_.append((self._layers[layer_pos], int(neuron_pos)))
+            mapped = self._flat_to_layer_neuron(flat_idx)
+            if mapped is not None:
+                self.h_neurons_.append(mapped)
 
         self.n_neurons_ = len(self.h_neurons_)
         self.neuron_ratio_ = self.n_neurons_ / self._n_features * 1000
@@ -1173,10 +1181,9 @@ class HProbes:
         self.h_neurons_ = []
         for sel_idx in selected:
             flat_idx = int(self._top_k_idx[sel_idx])
-            layer_pos = flat_idx // self._intermediate_dim
-            neuron_pos = flat_idx % self._intermediate_dim
-            if layer_pos < len(self._layers):
-                self.h_neurons_.append((self._layers[layer_pos], int(neuron_pos)))
+            mapped = self._flat_to_layer_neuron(flat_idx)
+            if mapped is not None:
+                self.h_neurons_.append(mapped)
 
         self.n_neurons_ = len(self.h_neurons_)
         self.neuron_ratio_ = self.n_neurons_ / self._n_features * 1000
