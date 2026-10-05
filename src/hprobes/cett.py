@@ -59,6 +59,7 @@ def get_mlp_down_proj(model: torch.nn.Module, layer_idx: int) -> torch.nn.Module
       - down_proj (Llama, Gemma, Mistral)
       - c_proj (GPT2)
       - fc2 (OPT)
+      - shared_expert.down_proj (MoE models, e.g. Qwen3.8-Flash-Next)
     """
     layers = _get_transformer_layers(model)
     if layer_idx >= len(layers):
@@ -72,6 +73,10 @@ def get_mlp_down_proj(model: torch.nn.Module, layer_idx: int) -> torch.nn.Module
             if hasattr(mlp, name):
                 return getattr(mlp, name)
 
+        # MoE shared expert (Qwen3.5/3.8 MoE)
+        if hasattr(mlp, "shared_expert") and hasattr(mlp.shared_expert, "down_proj"):
+            return mlp.shared_expert.down_proj
+
     # Some architectures might have it at the block level directly
     for name in ["down_proj", "c_proj", "fc2"]:
         if hasattr(block, name):
@@ -79,8 +84,29 @@ def get_mlp_down_proj(model: torch.nn.Module, layer_idx: int) -> torch.nn.Module
 
     raise AttributeError(
         f"Could not find MLP down-projection layer in {type(block).__name__}. "
-        "Checked: .mlp.down_proj, .mlp.c_proj, .mlp.fc2"
+        "Checked: .mlp.down_proj, .mlp.c_proj, .mlp.fc2, .mlp.shared_expert.down_proj"
     )
+
+
+def _token_rows(t: torch.Tensor, token_position: int) -> torch.Tensor:
+    """Select one token row; supports flattened 2D MoE activations."""
+    if t.dim() == 3:
+        return t[0, token_position, :]
+    return t[token_position, :]
+
+
+def _sequence_rows(t: torch.Tensor) -> torch.Tensor:
+    """Return all token rows; supports flattened 2D MoE activations."""
+    return t[0] if t.dim() == 3 else t
+
+
+def _batched_token_rows(
+    t: torch.Tensor, batch_idx: torch.Tensor, token_pos: torch.Tensor, seq_len: int
+) -> torch.Tensor:
+    """Select (batch, position) rows; supports flattened 2D MoE activations."""
+    if t.dim() == 3:
+        return t[batch_idx, token_pos]
+    return t[batch_idx * seq_len + token_pos]
 
 
 def available_layers(model: torch.nn.Module) -> List[int]:
@@ -210,8 +236,8 @@ def forward_cett(
             def hook(module, input, output):
                 z = input[0]
                 h = output
-                z_cache[idx] = z[0, token_position, :].detach().float().cpu()
-                h_cache[idx] = h[0, token_position, :].detach().float().cpu()
+                z_cache[idx] = _token_rows(z, token_position).detach().float().cpu()
+                h_cache[idx] = _token_rows(h, token_position).detach().float().cpu()
                 return output
 
             return hook
@@ -271,8 +297,8 @@ def forward_cett_at_token(
 
         def make_hook(idx: int):
             def hook(module, input, output):
-                z_cache[idx] = input[0][0, -1, :].detach().float().cpu()
-                h_cache[idx] = output[0, -1, :].detach().float().cpu()
+                z_cache[idx] = _token_rows(input[0], -1).detach().float().cpu()
+                h_cache[idx] = _token_rows(output, -1).detach().float().cpu()
                 return output
 
             return hook
@@ -314,8 +340,8 @@ def forward_cett_span(
 
         def make_hook(idx: int):
             def hook(module, input, output):
-                z_cache[idx] = input[0][0].detach().float().cpu()
-                h_cache[idx] = output[0].detach().float().cpu()
+                z_cache[idx] = _sequence_rows(input[0]).detach().float().cpu()
+                h_cache[idx] = _sequence_rows(output).detach().float().cpu()
                 return output
 
             return hook
@@ -374,8 +400,8 @@ def forward_cett_dual_span(
 
         def make_hook(idx: int):
             def hook(module, input, output):
-                z_cache[idx] = input[0][0].detach().float().cpu()
-                h_cache[idx] = output[0].detach().float().cpu()
+                z_cache[idx] = _sequence_rows(input[0]).detach().float().cpu()
+                h_cache[idx] = _sequence_rows(output).detach().float().cpu()
                 return output
 
             return hook
@@ -561,6 +587,7 @@ def forward_cett_batch(
     """Batched forward pass — extract CETT for each sample."""
     batch_size = batch_tokens["input_ids"].shape[0]
     device = batch_tokens["input_ids"].device
+    seq_len = batch_tokens["input_ids"].shape[1]
     batch_idx = torch.arange(batch_size, device=device)
     token_pos_t = torch.tensor(token_positions, device=device)
 
@@ -573,8 +600,12 @@ def forward_cett_batch(
 
         def make_hook(idx: int):
             def hook(module, input, output):
-                z_cache[idx] = input[0][batch_idx, token_pos_t].detach().float()
-                h_cache[idx] = output[batch_idx, token_pos_t].detach().float()
+                z_cache[idx] = (
+                    _batched_token_rows(input[0], batch_idx, token_pos_t, seq_len).detach().float()
+                )
+                h_cache[idx] = (
+                    _batched_token_rows(output, batch_idx, token_pos_t, seq_len).detach().float()
+                )
                 return output
 
             return hook
@@ -620,6 +651,9 @@ def forward_cett_at_token_batch(
 
     extra_t = torch.tensor(extra_token_ids, device=device).unsqueeze(1)
     extended_ids = torch.cat([batch_tokens["input_ids"], extra_t], dim=1)
+    seq_len = extended_ids.shape[1]
+    batch_idx = torch.arange(batch_size, device=device)
+    last_pos_t = torch.full_like(batch_idx, seq_len - 1)
 
     extended: Dict[str, torch.Tensor] = {"input_ids": extended_ids}
     if "attention_mask" in batch_tokens:
@@ -637,8 +671,12 @@ def forward_cett_at_token_batch(
 
         def make_hook(idx: int):
             def hook(module, input, output):
-                z_cache[idx] = input[0][:, -1, :].detach().float()
-                h_cache[idx] = output[:, -1, :].detach().float()
+                z_cache[idx] = (
+                    _batched_token_rows(input[0], batch_idx, last_pos_t, seq_len).detach().float()
+                )
+                h_cache[idx] = (
+                    _batched_token_rows(output, batch_idx, last_pos_t, seq_len).detach().float()
+                )
                 return output
 
             return hook

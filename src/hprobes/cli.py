@@ -643,14 +643,19 @@ def _mcnemar(correct_a: List[bool], correct_b: List[bool]) -> Dict[str, float]:
 
 
 def _pick_random_neurons(
-    h_neurons: List[Tuple[int, int]], layers: List[int], intermediate_dim: int, rng
+    h_neurons: List[Tuple[int, int]], layers: List[int], layer_dims, rng
 ) -> List[Tuple[int, int]]:
-    """Pick random neurons from the same layers and same count as H-Neurons."""
+    """Pick random neurons from the same layers and same count as H-Neurons.
+
+    ``layer_dims`` is either an int (uniform intermediate dim) or a mapping
+    ``layer -> intermediate_dim`` for models with per-layer dims.
+    """
     neurons_by_layer = _neurons_by_layer(h_neurons)
     random_neurons = []
     for layer_idx, layer_neurons in neurons_by_layer.items():
         if layer_idx in layers:
-            candidates = set(range(intermediate_dim)) - set(layer_neurons)
+            dim = layer_dims.get(layer_idx, 0) if isinstance(layer_dims, dict) else layer_dims
+            candidates = set(range(dim)) - set(layer_neurons)
             if len(candidates) >= len(layer_neurons):
                 picks = rng.sample(sorted(candidates), len(layer_neurons))
                 random_neurons.extend((layer_idx, int(p)) for p in picks)
@@ -887,7 +892,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             if getattr(args, "random_baseline", False):
                 rng = _random.Random(args.seed + 1)
                 random_neurons = _pick_random_neurons(
-                    probe.h_neurons_, probe._layers, probe._intermediate_dim, rng
+                    probe.h_neurons_, probe._layers, probe._layer_dims, rng
                 )
                 print(f"\n  Random baseline ({len(random_neurons)} random neurons):")
                 r_rates, _r_per_sample = _causal_validation_run(

@@ -448,6 +448,40 @@ class TestCompareWith:
             assert all(isinstance(n, list) and len(n) == 2 for n in result["shared_neurons"])
 
 
+class TestHeterogeneousDims:
+    def _probe_with_dims(self, dims):
+        probe = HProbes.__new__(HProbes)
+        probe._layers = list(dims)
+        probe._col_norms = {layer: torch.zeros(dim) for layer, dim in dims.items()}
+        probe._set_feature_layout()
+        return probe
+
+    def test_set_feature_layout_heterogeneous(self):
+        probe = self._probe_with_dims({0: 64, 1: 64, 2: 128, 3: 128})
+
+        assert probe._layer_dims == {0: 64, 1: 64, 2: 128, 3: 128}
+        assert probe._n_features == 384
+        assert probe._intermediate_dim == 64
+        assert probe._layer_offsets == {0: 0, 1: 64, 2: 128, 3: 256}
+
+    def test_flat_to_layer_neuron_heterogeneous(self):
+        probe = self._probe_with_dims({0: 64, 1: 64, 2: 128, 3: 128})
+
+        assert probe._flat_to_layer_neuron(0) == (0, 0)
+        assert probe._flat_to_layer_neuron(63) == (0, 63)
+        assert probe._flat_to_layer_neuron(64) == (1, 0)
+        assert probe._flat_to_layer_neuron(128) == (2, 0)
+        assert probe._flat_to_layer_neuron(200) == (2, 72)
+        assert probe._flat_to_layer_neuron(383) == (3, 127)
+        assert probe._flat_to_layer_neuron(384) is None
+
+    def test_flat_to_layer_neuron_uniform_matches_division(self):
+        probe = self._probe_with_dims({0: 64, 1: 64, 2: 64, 3: 64})
+
+        for flat in range(256):
+            assert probe._flat_to_layer_neuron(flat) == (flat // 64, flat % 64)
+
+
 class TestSaveMetadata:
     def test_save_includes_metadata_field(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -474,6 +508,18 @@ class TestSaveMetadata:
             assert data["metadata"]["n_layers"] == len(_PROBE._layers)
             assert data["metadata"]["intermediate_dim"] == _PROBE._intermediate_dim
             assert data["metadata"]["total_features"] == _PROBE._n_features
+
+    def test_save_includes_layer_dims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = str(Path(tmp) / "probe")
+            _PROBE.save(base)
+
+            json_path = Path(base).with_suffix(".json")
+            data = json.loads(json_path.read_text())
+
+            expected = {str(k): v for k, v in _PROBE._layer_dims.items()}
+            assert data["metadata"]["layer_dims"] == expected
+            assert data["config"]["layer_dims"] == expected
 
     def test_model_name_extracted_from_config(self):
         with tempfile.TemporaryDirectory() as tmp:

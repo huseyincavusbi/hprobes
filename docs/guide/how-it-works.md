@@ -20,6 +20,13 @@ Where:
 
 The column norms `||W_down[:, j]||_2` are precomputed once and reused across all samples.
 
+### Model Support
+
+hprobes reads each layer's FFN down-projection (`down_proj`, `c_proj`, `fc2`). Two architecture variations are handled explicitly:
+
+- **Heterogeneous FFN dims** — models whose intermediate size differs per layer (e.g. Gemma 4 E-series double-wide MLPs) are supported: dims are tracked per layer and flat CETT indices map through per-layer offsets.
+- **MoE layers** — for MoE models with a dense shared expert (e.g. Qwen3.5/3.8 MoE), CETT is read from `shared_expert.down_proj`; flattened 2D `(tokens, dim)` activations from the shared expert are handled by the hooks. Routed experts (`experts.down_proj`) are not yet covered.
+
 ## H-Neuron Discovery
 
 The discovery pipeline has four steps:

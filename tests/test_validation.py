@@ -162,6 +162,19 @@ class TestRandomBaseline:
         # Only 2 total neurons in dim=2, both are H-Neurons → 0 candidates → 0 picked
         assert len(picked) == 0
 
+    def test_pick_random_neurons_per_layer_dims(self):
+        from hprobes.cli import _pick_random_neurons
+
+        h_neurons = [(2, 5), (2, 7), (3, 100)]
+        layer_dims = {0: 64, 1: 64, 2: 128, 3: 128}
+        rng = __import__("random").Random(42)
+        picked = _pick_random_neurons(h_neurons, [0, 1, 2, 3], layer_dims, rng)
+
+        assert len(picked) == len(h_neurons)
+        for layer, neuron in picked:
+            assert 0 <= neuron < layer_dims[layer]
+        assert not set(picked) & set(h_neurons)
+
 
 class TestClusterSelection:
     def test_independent_features(self):
