@@ -5,7 +5,10 @@ import torch
 import torch.nn as nn
 
 from hprobes.cett import (
+    _batched_token_rows,
     _get_transformer_layers,
+    _sequence_rows,
+    _token_rows,
     available_layers,
     forward_cett,
     forward_cett_span,
@@ -88,6 +91,40 @@ class _MultimodalLM(nn.Module):
 M = _CausalLM()
 
 
+class _SharedExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.down_proj = nn.Linear(_I, _H, bias=False)
+
+
+class _MoEMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Linear(_H, 2, bias=False)
+        self.experts = nn.ModuleList([_MLP() for _ in range(2)])
+        self.shared_expert = _SharedExpert()
+
+
+class _MoEBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = _MoEMLP()
+
+
+class _MoECausalLM(nn.Module):
+    """Mimics Qwen3.5/3.8 MoE: mlp has experts + shared_expert, no down_proj."""
+
+    def __init__(self, n=2):
+        super().__init__()
+
+        class _Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_MoEBlock() for _ in range(n)])
+
+        self.model = _Inner()
+
+
 def _tok(text="ABCDE"):
     ids = torch.tensor([[ord(c) for c in text]], dtype=torch.long)
     return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
@@ -110,6 +147,43 @@ class TestArchitectureDetection:
     def test_out_of_range_raises(self):
         with pytest.raises(IndexError):
             get_mlp_down_proj(M, 999)
+
+
+class TestMoESharedExpert:
+    def test_shared_expert_down_proj_found(self):
+        model = _MoECausalLM()
+        for layer_idx in range(2):
+            down = get_mlp_down_proj(model, layer_idx)
+            assert down is model.model.layers[layer_idx].mlp.shared_expert.down_proj
+
+    def test_shared_expert_col_norms(self):
+        model = _MoECausalLM()
+        norms = precompute_col_norms(model, [0, 1])
+        assert set(norms.keys()) == {0, 1}
+        assert norms[0].shape == (_I,)
+
+
+class TestFlattenedActivations:
+    def test_token_rows_3d(self):
+        t = torch.arange(2 * 3 * 4).float().reshape(2, 3, 4)
+        assert torch.equal(_token_rows(t, -1), t[0, -1, :])
+
+    def test_token_rows_2d(self):
+        t = torch.arange(3 * 4).float().reshape(3, 4)
+        assert torch.equal(_token_rows(t, -1), t[-1, :])
+
+    def test_sequence_rows_2d(self):
+        t = torch.arange(3 * 4).float().reshape(3, 4)
+        assert torch.equal(_sequence_rows(t), t)
+
+    def test_batched_token_rows_2d(self):
+        seq_len, dim = 3, 4
+        t = torch.arange(2 * seq_len * dim).float().reshape(2 * seq_len, dim)
+        batch_idx = torch.tensor([0, 1])
+        token_pos = torch.tensor([2, 0])
+        rows = _batched_token_rows(t, batch_idx, token_pos, seq_len)
+        assert torch.equal(rows[0], t[2])
+        assert torch.equal(rows[1], t[seq_len])
 
 
 class TestColNorms:
