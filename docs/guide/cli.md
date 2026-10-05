@@ -129,6 +129,8 @@ hprobes responses \
 
 All shared arguments (`--device`, `--dtype`, `--l1-c`, etc.) are the same as `hprobes run`.
 
+On macOS, MPS loads go through CPU first and are then moved to the device (`model.to("mps")`). Loading directly with `device_map="mps"` can hang when the load forces a dtype conversion (concurrent async materialization onto MPS, [transformers#48029](https://github.com/huggingface/transformers/issues/48029)); `HF_DEACTIVATE_ASYNC_LOAD=1` is the equivalent escape hatch.
+
 ## `hprobes transfer`
 
 Score a saved probe on a different model (transfer experiment).
