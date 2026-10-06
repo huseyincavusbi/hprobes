@@ -2604,6 +2604,7 @@ class HProbes:
                 sample_pos = len(valid_prompts)
                 valid_prompts.append(prompt)
                 valid_gt.append(gt)
+                valid_samples.append(sample)
                 record = {
                     "predicted": pred,
                     "ground_truth": gt,

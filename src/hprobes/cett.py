@@ -627,13 +627,13 @@ def forward_cett_batch(
 
     logits_matrix = out.logits[batch_idx, token_pos_t].detach().float().cpu()
 
-    z_all = torch.stack([z_cache[li] for li in layers], dim=0)
-    h_all = torch.stack([h_cache[li] for li in layers], dim=0)
-    col_norms_gpu = torch.stack([col_norms[li].to(device) for li in layers])
-
-    h_norm = torch.norm(h_all, dim=-1, keepdim=True) + 1e-8
-    cett = (torch.abs(z_all) * col_norms_gpu.unsqueeze(1)) / h_norm
-    cett_matrix = cett.permute(1, 0, 2).reshape(batch_size, -1).cpu()
+    cett_parts = []
+    for li in layers:
+        z = z_cache[li]
+        h = h_cache[li]
+        h_norm = torch.norm(h, dim=-1, keepdim=True) + 1e-8
+        cett_parts.append((torch.abs(z) * col_norms[li].to(device).unsqueeze(0)) / h_norm)
+    cett_matrix = torch.cat(cett_parts, dim=1).cpu()
 
     return cett_matrix, logits_matrix
 
@@ -696,13 +696,13 @@ def forward_cett_at_token_batch(
         for h in handles:
             h.remove()
 
-    z_all = torch.stack([z_cache[li] for li in layers], dim=0)
-    h_all = torch.stack([h_cache[li] for li in layers], dim=0)
-    col_norms_gpu = torch.stack([col_norms[li].to(device) for li in layers])
-
-    h_norm = torch.norm(h_all, dim=-1, keepdim=True) + 1e-8
-    cett = (torch.abs(z_all) * col_norms_gpu.unsqueeze(1)) / h_norm
-    cett_matrix = cett.permute(1, 0, 2).reshape(batch_size, -1).cpu()
+    cett_parts = []
+    for li in layers:
+        z = z_cache[li]
+        h = h_cache[li]
+        h_norm = torch.norm(h, dim=-1, keepdim=True) + 1e-8
+        cett_parts.append((torch.abs(z) * col_norms[li].to(device).unsqueeze(0)) / h_norm)
+    cett_matrix = torch.cat(cett_parts, dim=1).cpu()
 
     return cett_matrix
 

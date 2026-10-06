@@ -11,6 +11,7 @@ from hprobes.cett import (
     _token_rows,
     available_layers,
     forward_cett,
+    forward_cett_batch,
     forward_cett_span,
     get_mlp_down_proj,
     precompute_col_norms,
@@ -125,6 +126,50 @@ class _MoECausalLM(nn.Module):
         self.model = _Inner()
 
 
+class _HeteroMLP(nn.Module):
+    def __init__(self, intermediate):
+        super().__init__()
+        self.gate_proj = nn.Linear(_H, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, _H, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(torch.relu(self.gate_proj(x)))
+
+
+class _HeteroBlock(nn.Module):
+    def __init__(self, intermediate):
+        super().__init__()
+        self.mlp = _HeteroMLP(intermediate)
+
+
+class _HeteroBatchLM(nn.Module):
+    """Two layers with different FFN dims (Gemma 4 E-series style)."""
+
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(0)
+
+        class _Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_HeteroBlock(16), _HeteroBlock(32)])
+
+        self.model = _Inner()
+        self.lm_head = nn.Linear(_H, _V, bias=True)
+
+    def forward(self, input_ids=None, **kw):
+        x = input_ids.float().unsqueeze(-1).expand(-1, -1, _H)
+        for block in self.model.layers:
+            x = x + block.mlp(x)
+
+        class _Out:
+            pass
+
+        out = _Out()
+        out.logits = self.lm_head(x)
+        return out
+
+
 def _tok(text="ABCDE"):
     ids = torch.tensor([[ord(c) for c in text]], dtype=torch.long)
     return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
@@ -184,6 +229,23 @@ class TestFlattenedActivations:
         rows = _batched_token_rows(t, batch_idx, token_pos, seq_len)
         assert torch.equal(rows[0], t[2])
         assert torch.equal(rows[1], t[seq_len])
+
+
+class TestBatchedHeterogeneousDims:
+    def test_batched_cett_heterogeneous(self):
+        model = _HeteroBatchLM()
+        layers = list(range(len(_get_transformer_layers(model))))
+        col_norms = precompute_col_norms(model, layers)
+        tokens = {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+        }
+
+        cett, logits = forward_cett_batch(model, tokens, layers, col_norms, [2, 2])
+
+        assert cett.shape == (2, 16 + 32)
+        assert logits.shape == (2, _V)
+        assert not torch.isnan(cett).any()
 
 
 class TestColNorms:
