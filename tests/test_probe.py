@@ -482,6 +482,16 @@ class TestHeterogeneousDims:
             assert probe._flat_to_layer_neuron(flat) == (flat // 64, flat % 64)
 
 
+class TestBatchedFit:
+    def test_batched_fit_populates_val_samples(self):
+        probe = HProbes(MODEL, TOK, l1_C=10, batch_size=2, readout="logits")
+        probe.fit(SAMPLES, options_key="options", answer_key="answer")
+
+        assert probe.is_fitted_
+        assert len(probe._val_samples) == len(probe._val_prompts)
+        assert len(probe._val_samples) > 0
+
+
 class TestSaveMetadata:
     def test_save_includes_metadata_field(self):
         with tempfile.TemporaryDirectory() as tmp:
