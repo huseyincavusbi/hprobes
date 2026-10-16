@@ -1004,3 +1004,45 @@ class TestExtractRefitEquivalence:
         assert rows_key(art.meta["model_fp"], art.samples, cfg) == rows_key(
             art2.meta["model_fp"], art2.samples, cfg
         )
+
+
+class TestResponseRefitEquivalence:
+    """Issue #26: responses split path reproduces fit_from_responses exactly."""
+
+    SAMPLES = [
+        {
+            "question": f"Describe {i}.",
+            "response": f"The answer is X{i}.",
+            "answer_tokens": ["X"],
+            "judge": i % 2 == 0,
+        }
+        for i in range(10)
+    ]
+
+    def _pair(self):
+        a = HProbes(MODEL, TOK, l1_C=10)
+        a.fit_from_responses(self.SAMPLES)
+        b = HProbes(MODEL, TOK, l1_C=10)
+        art = b.extract_features_from_responses(self.SAMPLES)
+        b.fit_on_response_features(art)
+        return a, b, art
+
+    def test_split_matches_inline_outcomes(self):
+        a, b, art = self._pair()
+        assert art.meta["mode"] == "dual-span"
+        assert art.meta["n_answer_rows"] == len(art.rows) // 2
+        assert a.h_neurons_ == b.h_neurons_
+        assert a.accuracy_ == pytest.approx(b.accuracy_)
+        np.testing.assert_array_equal(a._top_k_idx, b._top_k_idx)
+        if a._clf is not None:
+            np.testing.assert_allclose(a._clf.coef_, b._clf.coef_)
+        assert a._predictions_ == b._predictions_
+
+    def test_cross_mode_refit_rejected(self):
+        _, b_live, art_live = TestExtractRefitEquivalence()._pair()
+        _, _, art_resp = self._pair()
+        with pytest.raises(ValueError, match="dual-span"):
+            b_live.fit_on_response_features(art_live)
+        c = HProbes(MODEL, TOK, l1_C=10)
+        with pytest.raises(ValueError, match="live-path"):
+            c.fit_on_features(art_resp)

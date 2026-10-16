@@ -701,6 +701,7 @@ class HProbes:
             welford_mean=np.array(self._welford_mean),
             welford_M2=np.array(self._welford_M2),
             meta={
+                "mode": "live",
                 "layers": list(self._layers),
                 "n_features": self._n_features,
                 "model_fp": fingerprint_model(self.model, self._layers),
@@ -734,6 +735,8 @@ class HProbes:
         variant sweeps share one artifact.
         """
         artifact.validate()
+        if artifact.meta.get("mode", "live") != "live":
+            raise ValueError("fit_on_features requires live-path rows")
         valid_prompts = artifact.prompts
         valid_gt = artifact.ground_truth
         per_sample = artifact.per_sample
@@ -936,7 +939,7 @@ class HProbes:
         )
         return self.fit_on_features(artifact, options_key=options_key)
 
-    def fit_from_responses(
+    def extract_features_from_responses(
         self,
         samples: List[Dict],
         question_key: str = "question",
@@ -944,42 +947,17 @@ class HProbes:
         answer_tokens_key: str = "answer_tokens",
         label_key: str = "judge",
         aggregation: str = "mean",
-    ) -> "HProbes":
-        """Discover H-Neurons from pre-generated responses.
+    ) -> CETTRows:
+        """Forward phase over pre-generated responses; return reusable rows (#26).
 
-        Methodology:
-          1. Tokenize full Q+A sequence
-          2. Compute per-token CETT: |z| * ||W_down|| / (||h|| + 1e-8)
-          3. Aggregate: mean over answer span, mean over non-answer span
-          4. Create 2 rows per sample: answer (label=correctness), other (label=0)
-          5. Train L1 logistic regression → positive-weight neurons = H-Neurons
-
-        Parameters
-        ----------
-        samples : list of dict
-            Each dict must contain question, response, answer_tokens (list of token
-            strings marking the factual span), and a correctness label.
-        question_key : str
-            Key for the question string. Default "question".
-        response_key : str
-            Key for the generated response string. Default "response".
-        answer_tokens_key : str
-            Key for list of answer token strings (the factual span). Default "answer_tokens".
-        label_key : str
-            Key for the correctness label. Accepts "true"/"false" strings or 1/0 ints.
-            Default "judge".
-        aggregation : "mean" | "max"
-            How to aggregate CETT over token spans. Default "mean".
-
-        Returns
-        -------
-        self
+        Dual-span rows (answer + other per sample) are stacked answer-block
+        first; ``meta["n_answer_rows"]`` records the split. Selection and
+        fitting happen downstream in :meth:`fit_on_response_features`.
         """
         self._layers = available_layers(self.model)[:: self.layer_stride]
         self._col_norms = precompute_col_norms(self.model, self._layers)
         self._set_feature_layout()
         self._letter_ids = self._get_letter_ids()
-        top_k = min(self.top_k, self._n_features) if self.top_k > 0 else self._n_features
 
         print(
             f"[hprobes] Layers: {len(self._layers)}  |  Features: {self._n_features:,}  |  Mode: H-Neuron (dual-span)"
@@ -1151,10 +1129,64 @@ class HProbes:
         if skipped:
             print(f"[hprobes] Skipped: {skipped}")
 
-        # Combine rows
-        cett_all = cett_ans + cett_other
-        y_all = labels_ans + labels_other
-        row_to_sample = list(range(len(cett_ans))) + list(range(len(cett_ans)))
+        if not cett_ans:
+            raise ValueError("no valid samples — extraction produced zero rows")
+        rows = np.stack(cett_ans + cett_other, axis=0)
+        n_answer = len(cett_ans)
+        artifact = CETTRows(
+            rows=rows,
+            labels=np.array(labels_ans + labels_other),
+            row_to_sample=list(range(n_answer)) + list(range(n_answer)),
+            prompts=list(valid_prompts),
+            ground_truth=list(valid_gt),
+            per_sample=list(per_sample),
+            samples=[
+                {"prompt": p, "label": g, **s}
+                for p, g, s in zip(valid_prompts, valid_gt, per_sample)
+            ],
+            welford_n=int(self._welford_n),
+            welford_mean=np.array(self._welford_mean),
+            welford_M2=np.array(self._welford_M2),
+            meta={
+                "mode": "dual-span",
+                "aggregation": aggregation,
+                "n_answer_rows": n_answer,
+                "layers": list(self._layers),
+                "n_features": self._n_features,
+                "model_fp": fingerprint_model(self.model, self._layers),
+                "config": {
+                    "question_key": question_key,
+                    "response_key": response_key,
+                    "answer_tokens_key": answer_tokens_key,
+                    "label_key": label_key,
+                    "batch_size": self.batch_size,
+                    "max_tokens": self.max_tokens,
+                },
+            },
+        )
+        artifact.validate()
+        return artifact
+
+    def fit_on_response_features(
+        self,
+        artifact: CETTRows,
+        top_k: Optional[int] = None,
+    ) -> "HProbes":
+        """Selection + fitting on cached dual-span rows (#26).
+
+        Bit-identical to the tail of :meth:`fit_from_responses` for the same
+        inputs. ``top_k`` overrides the constructor setting for this refit.
+        """
+        artifact.validate()
+        if artifact.meta.get("mode") != "dual-span":
+            raise ValueError("fit_on_response_features requires dual-span rows")
+        valid_prompts = artifact.prompts
+        valid_gt = artifact.ground_truth
+        per_sample = artifact.per_sample
+        row_to_sample = artifact.row_to_sample
+
+        override = self.top_k if top_k is None else top_k
+        resolved_top_k = min(override, self._n_features) if override > 0 else self._n_features
 
         n_valid = len(valid_prompts)
         self.accuracy_ = sum(p["is_correct"] for p in per_sample) / n_valid if n_valid > 0 else 0.0
@@ -1184,14 +1216,14 @@ class HProbes:
                 print(
                     f"  WARNING: resolved top_k={resolved} is aggressive — fewer samples raise it."
                 )
-            top_k = min(resolved, self._n_features) if resolved > 0 else self._n_features
+            resolved_top_k = min(resolved, self._n_features) if resolved > 0 else self._n_features
 
         # Variance pre-selection
         feature_var = self._welford_M2 / max(self._welford_n - 1, 1)
-        self._top_k_idx = np.argsort(feature_var)[-top_k:]
+        self._top_k_idx = np.argsort(feature_var)[-resolved_top_k:]
 
-        X = np.stack([v[self._top_k_idx] for v in cett_all], axis=0)
-        y = np.array(y_all)
+        X = artifact.rows[:, self._top_k_idx]
+        y = np.array(artifact.labels)
 
         # Sample-level train/val split
         sample_correct = np.array([int(p["is_correct"]) for p in per_sample])
@@ -1214,7 +1246,7 @@ class HProbes:
         self._val_prompts = [valid_prompts[i] for i in val_s]
         self._val_gt = [valid_gt[i] for i in val_s]
         # Evaluation protocol: answer-token rows only (strip non-answer controls)
-        ans_count = len(cett_ans)
+        ans_count = int(artifact.meta["n_answer_rows"])
         self._val_is_answer = np.array([idx < ans_count for idx in val_rows])
 
         # --- Cluster-based feature selection (optional) ---
@@ -1288,6 +1320,55 @@ class HProbes:
             print(f"[hprobes] Top layers: {top}")
 
         return self
+
+    def fit_from_responses(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        response_key: str = "response",
+        answer_tokens_key: str = "answer_tokens",
+        label_key: str = "judge",
+        aggregation: str = "mean",
+    ) -> "HProbes":
+        """Discover H-Neurons from pre-generated responses.
+
+        Methodology:
+          1. Tokenize full Q+A sequence
+          2. Compute per-token CETT: |z| * ||W_down|| / (||h|| + 1e-8)
+          3. Aggregate: mean over answer span, mean over non-answer span
+          4. Create 2 rows per sample: answer (label=correctness), other (label=0)
+          5. Train L1 logistic regression → positive-weight neurons = H-Neurons
+
+        Parameters
+        ----------
+        samples : list of dict
+            Each dict must contain question, response, answer_tokens (list of token
+            strings marking the factual span), and a correctness label.
+        question_key : str
+            Key for the question string. Default "question".
+        response_key : str
+            Key for the generated response string. Default "response".
+        answer_tokens_key : str
+            Key for list of answer token strings (the factual span). Default "answer_tokens".
+        label_key : str
+            Key for the correctness label. Accepts "true"/"false" strings or 1/0 ints.
+            Default "judge".
+        aggregation : "mean" | "max"
+            How to aggregate CETT over token spans. Default "mean".
+
+        Returns
+        -------
+        self
+        """
+        artifact = self.extract_features_from_responses(
+            samples,
+            question_key=question_key,
+            response_key=response_key,
+            answer_tokens_key=answer_tokens_key,
+            label_key=label_key,
+            aggregation=aggregation,
+        )
+        return self.fit_on_response_features(artifact)
 
     def score(self) -> Dict:
         """Evaluate probe AUROC and random neuron baseline on the held-out val split.
