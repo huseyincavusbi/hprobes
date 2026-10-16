@@ -93,3 +93,99 @@ def test_labels_length_mismatch_raises():
     routings, labels = _planted(n=10)
     with pytest.raises(ValueError, match="labels length"):
         routing_stats(routings, labels[:-1], n_experts=8)
+
+
+class TestRoutingOverride:
+    """#42: forced counterfactual routing at chosen positions."""
+
+    def setup_method(self):
+        torch.manual_seed(0)
+        from test_moe import _toy_experts
+
+        self.experts = _toy_experts(num_experts=4, d_in=8, d_inter=6)
+        self.hidden = torch.randn(6, 8)
+        self.top_k_index = torch.tensor([[0, 1], [2, 3], [0, 2], [1, 3], [0, 3], [2, 1]])
+        w = torch.rand(6, 2)
+        self.top_k_weights = w / w.sum(dim=-1, keepdim=True)
+
+    def _capture(self):
+        from hprobes.moe import MoECapture
+
+        cap = MoECapture(num_experts=4, layer=0)
+        handle = cap.attach(self.experts)
+        return cap, handle
+
+    def test_self_override_is_bit_identical(self):
+        base = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        cap, handle = self._capture()
+        cap.set_routing_override(
+            positions=[1, 3],
+            experts=self.top_k_index[[1, 3]],
+            weights=self.top_k_weights[[1, 3]],
+        )
+        again = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+        assert torch.equal(base, again)
+
+    def test_forced_override_changes_effective_routing_and_output(self):
+        base = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        cap, handle = self._capture()
+        cap.set_routing_override(
+            positions=[0, 5],
+            experts=torch.tensor([[3, 3], [3, 3]]),
+            weights=torch.full((2, 2), 0.5),
+        )
+        out = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+        assert not torch.equal(out, base)
+        rt = cap.routing_table()
+        assert rt[0].tolist() == [3, 3]
+        assert rt[5].tolist() == [3, 3]
+        # records (expert -> tokens actually computed) reflect the override
+        used = {}
+        for rec in cap.records:
+            used.setdefault(rec["expert"], set()).update(rec["tokens"].tolist())
+        assert 0 in used[3] and 5 in used[3]
+        assert 0 not in used[0]  # token 0 was re-routed away from expert 0
+
+    def test_override_scoped_to_positions(self):
+        cap, handle = self._capture()
+        cap.set_routing_override(
+            positions=[2], experts=torch.tensor([[3, 3]]), weights=torch.full((1, 2), 0.5)
+        )
+        self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+        used = {}
+        for rec in cap.records:
+            used.setdefault(rec["expert"], set()).update(int(t) for t in rec["tokens"])
+        # token 2 was re-routed to expert 3 and away from experts 0/2;
+        # other tokens keep the experts their own routing selected
+        # (tokens 3, 4 also use expert 3 via their original routing)
+        assert 2 in used[3]
+        assert 2 not in used[0]
+        assert 2 not in used[2]
+        assert 0 in used[0] and 4 in used[0]
+
+    def test_clear_override_restores_original_behavior(self):
+        base = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        cap, handle = self._capture()
+        cap.set_routing_override(
+            positions=[0], experts=torch.tensor([[3, 3]]), weights=torch.full((1, 2), 0.5)
+        )
+        self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        cap.clear_routing_override()
+        restored = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+        assert torch.equal(restored, base)
+
+    def test_override_validation(self):
+        cap, handle = self._capture()
+        with pytest.raises(ValueError, match="n_positions"):
+            cap.set_routing_override(positions=[0, 1], experts=torch.tensor([[1, 2]]))
+        with pytest.raises(ValueError, match="shape"):
+            cap.set_routing_override(
+                positions=[0],
+                experts=torch.tensor([[1, 2]]),
+                weights=torch.ones(1, 3),
+            )
+        handle.remove()
