@@ -1352,6 +1352,186 @@ class HProbes:
 
         return self
 
+    def fit_moe(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        layers: Optional[List[int]] = None,
+        score: str = "mean_abs",
+        per_expert_top_n: int = 64,
+        top_k: int = 2000,
+        min_active: int = 2,
+        routing_baseline: bool = True,
+        fusion: str = "concat",
+    ) -> "HProbes":
+        """Discover H-Neurons on MoE models via active-only per-expert CETT (#41).
+
+        Forwards run once per sample with :class:`hprobes.moe.MoECapture`
+        attached to every selected layer's experts module; prediction and
+        label come from the same forward's logits (dense-equivalent protocol).
+        Features are then selected two-stage and assembled sparse.
+
+        ``routing_baseline`` fits the routing-only control probe on the same
+        samples (features = per-token expert indicators at the decision
+        token); ``fusion="concat"`` also fits the fused neuron+routing probe.
+        Results land in ``self.moe_``.
+        """
+        from .moe import MoECapture, _MoEFeatures, fit_moe_probe
+
+        from .cett import _get_transformer_layers
+
+        blocks = _get_transformer_layers(self.model)
+        if layers is None:
+            layers = list(range(len(blocks)))
+        self._layers = list(layers)
+        self._letter_ids = self._get_letter_ids()
+        self._answer_cue = "\n\nAnswer:"
+        # MoE layout: intermediate dim from the stacked expert weights.
+        self._layer_dims = {
+            li: int(blocks[li].mlp.experts.down_proj.shape[2]) for li in self._layers
+        }
+        self._intermediate_dim = self._layer_dims[self._layers[0]]
+
+        device = next(self.model.parameters()).device
+        captures: List[MoECapture] = []
+        handles = []
+        num_experts = None
+        for li in self._layers:
+            experts_mod = blocks[li].mlp.experts
+            num_experts = int(experts_mod.down_proj.shape[0])
+            cap = MoECapture(num_experts=num_experts, layer=li)
+            handles.append(cap.attach(experts_mod))
+            captures.append(cap)
+
+        # Per-sample forward; capture stays active only during the forward.
+        feats: List[Dict[Tuple[int, int], Tuple[List[int], torch.Tensor, torch.Tensor]]] = []
+        routings: List[torch.Tensor] = []
+        labels: List[int] = []
+        prompts: List[str] = []
+        per_sample: List[Dict] = []
+        try:
+            for sample in samples:
+                if self.readout in ("generate", "both"):
+                    raise NotImplementedError(
+                        "fit_moe supports readout='logits'; generation readout not wired yet"
+                    )
+                prompt = self._format_moe_prompt(sample, question_key, options_key)
+                full = self._tokenize(prompt + self._answer_cue)
+                prompt_enc = self._tokenize(prompt)
+                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                with torch.no_grad():
+                    out = self.model(full["input_ids"].to(device))
+                logits = out.logits[0, decision_pos, :]
+                pred = self._predict_letter(logits)
+                gt = self._moe_gt_letter(sample, options_key, answer_key)
+                if pred is None or gt is None:
+                    continue
+                is_correct = self._moe_letter_match(pred, gt)
+                labels.append(0 if is_correct else 1)
+                prompts.append(prompt)
+                per_sample.append({"is_correct": is_correct, "pred": pred, "gt": gt})
+                feats.append(self._moe_decision_features(captures, decision_pos))
+                routings.append(
+                    torch.stack([cap.routing_table()[decision_pos] for cap in captures])
+                )
+        finally:
+            for h in handles:
+                h.remove()
+
+        if not feats:
+            raise ValueError("no valid samples — MoE extraction produced zero rows")
+
+        artifact = _MoEFeatures(
+            feats=feats,
+            routings=routings,
+            labels=np.array(labels),
+            prompts=prompts,
+            per_sample=per_sample,
+            capture_meta={
+                "layers": self._layers,
+                "num_experts": num_experts,
+                "model_fp": fingerprint_model(self.model, self._layers),
+                "score": score,
+                "per_expert_top_n": per_expert_top_n,
+                "top_k": top_k,
+                "min_active": min_active,
+            },
+        )
+        self.moe_ = fit_moe_probe(
+            artifact,
+            l1_C=self.l1_C,
+            validation_split=self.validation_split,
+            seed=self.seed,
+            fusion=fusion,
+        )
+        if routing_baseline:
+            self.moe_["routing_baseline"] = fit_moe_probe(
+                artifact,
+                l1_C=self.l1_C,
+                validation_split=self.validation_split,
+                seed=self.seed,
+                routing_only=True,
+            )
+        self.is_fitted_ = True
+        return self
+
+    @staticmethod
+    def _moe_decision_features(
+        captures, decision_pos: int
+    ) -> Dict[Tuple[int, int], Tuple[List[int], torch.Tensor, torch.Tensor]]:
+        """Decision-token activations keyed by (layer, expert) (issue #41).
+
+        Returns ``{(layer, expert): (tokens, acts, gates)}`` using each
+        capture's own routing table to mask the token dimension; the decision
+        row is looked up by position.
+        """
+        out: Dict[Tuple[int, int], Tuple[List[int], torch.Tensor, torch.Tensor]] = {}
+        for cap in captures:
+            for rec in cap.records:
+                sel = (rec["tokens"] == decision_pos).nonzero(as_tuple=False).flatten()
+                if sel.numel() == 0:
+                    continue
+                key = (cap.layer, int(rec["expert"]))
+                out[key] = (
+                    [decision_pos] * sel.numel(),
+                    rec["acts"][sel],
+                    rec["gates"][sel],
+                )
+        return out
+
+    def _format_moe_prompt(self, sample: Dict, question_key: str, options_key: str) -> str:
+        options = sample.get(options_key, {})
+        question = sample.get(question_key, "")
+        if isinstance(options, dict):
+            opt_txt = "\n".join(f"{k}. {v}" for k, v in options.items())
+        else:
+            opt_txt = "\n".join(f"{chr(65 + i)}. {v}" for i, v in enumerate(options))
+        return f"{question}\n{opt_txt}"
+
+    @staticmethod
+    def _moe_gt_letter(sample: Dict, options_key: str, answer_key: str) -> Optional[str]:
+        ans = sample.get(answer_key)
+        if ans is None:
+            return None
+        options = sample.get(options_key, {})
+        if isinstance(options, dict):
+            keys = list(options.keys())
+        else:
+            keys = [chr(65 + i) for i in range(len(options))]
+        if isinstance(ans, int) and 0 <= ans < len(keys):
+            return keys[ans]
+        if isinstance(ans, str) and ans in keys:
+            return ans
+        if isinstance(ans, str) and ans and ans[0].upper() in keys:
+            return ans[0].upper()
+        return None
+
+    @staticmethod
+    def _moe_letter_match(pred: Optional[str], gt: Optional[str]) -> bool:
+        return bool(pred and gt and pred.upper() == gt.upper())
+
     def fit_from_responses(
         self,
         samples: List[Dict],
