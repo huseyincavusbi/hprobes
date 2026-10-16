@@ -272,3 +272,97 @@ class TestCounterfactualRouting:
         b = probe.counterfactual_routing(self._samples(), layers=[0], doses=[1], seed=0)
         assert a["rescue"] == b["rescue"]
         assert a["random"] == b["random"]
+
+
+class TestCettRoutingCrossCheck:
+    """#42 requirement 5: do CETT-selected experts and routing agree?"""
+
+    def _names(self):
+        # CETT feature names from fit_moe: L{layer}:E{expert}:N{neuron}
+        return ["L0:E0:N3", "L0:E1:N5", "L1:E2:N1"]
+
+    def _stats(self, flagged_by_layer):
+        return {
+            "n_layers": 2,
+            "per_layer": [
+                {
+                    "layer": li,
+                    "top_flagged": [{"expert": e, "delta": 0.5, "p": 0.001} for e in experts],
+                }
+                for li, experts in flagged_by_layer.items()
+            ],
+        }
+
+    def test_overlap_and_jaccard(self):
+        from hprobes.routing import cett_routing_overlap
+
+        stats = self._stats({0: [1, 7], 1: [2]})
+        out = cett_routing_overlap(self._names(), stats)
+        # CETT experts: (0,0),(0,1),(1,2); flagged: (0,1),(0,7),(1,2)
+        assert out["n_cett_experts"] == 3
+        assert out["n_routing_flagged"] == 3
+        assert out["overlap"] == [[0, 1], [1, 2]]
+        assert abs(out["jaccard"] - 2 / 4) < 1e-9
+        assert out["per_layer"][0]["layer"] == 0
+
+    def test_no_overlap(self):
+        from hprobes.routing import cett_routing_overlap
+
+        out = cett_routing_overlap(self._names(), self._stats({0: [9], 1: [8]}))
+        assert out["overlap"] == []
+        assert out["jaccard"] == 0.0
+
+    def test_parses_only_wellformed_names(self):
+        from hprobes.routing import cett_routing_overlap
+
+        names = ["L0:E1:N0", "bogus", "L2:E0:N4"]
+        out = cett_routing_overlap(names, self._stats({0: [1]}))
+        assert out["n_cett_experts"] == 2
+        assert out["overlap"] == [[0, 1]]
+
+
+class TestMoeRoutingAnalysisEndToEnd:
+    """End-to-end on the fake MoE LM: stats + cross-check wiring."""
+
+    def test_analysis_runs_and_cross_checks_after_fit(self):
+        import _fake_moe
+        from test_probe import TOK
+
+        from hprobes.probe import HProbes
+
+        model = _fake_moe._FakeMoEModel()
+        probe = HProbes(model, TOK, readout="logits", l1_C=10)
+        samples = [
+            {"question": f"Q{i}?", "options": ["aa", f"x{i % 2}"], "answer": i % 2}
+            for i in range(8)
+        ]
+        probe.fit_moe(samples, layers=[0], per_expert_top_n=4, top_k=16, min_active=1)
+        stats = probe.moe_routing_analysis(samples, layers=[0], n_perm=50, seed=0)
+        assert stats["n_samples"] == 8
+        assert stats["n_layers"] == 1
+        assert "cett_cross_check" in stats
+        cc = stats["cett_cross_check"]
+        # Wiring check: counts are ints and jaccard is a probability. Whether
+        # the selected space is neurons or routing columns (both legal for L1)
+        # is data-dependent; overlap correctness is unit-tested separately.
+        assert isinstance(cc["n_cett_experts"], int)
+        assert isinstance(cc["n_routing_flagged"], int)
+        assert 0.0 <= cc["jaccard"] <= 1.0
+
+    def test_counterfactual_method_deterministic_and_noop(self):
+        import _fake_moe
+        from test_probe import TOK
+
+        from hprobes.probe import HProbes
+
+        model = _fake_moe._FakeMoEModel()
+        probe = HProbes(model, TOK, readout="logits")
+        samples = [
+            {"question": f"Q{i}?", "options": ["aa", "bb"], "answer": i % 2} for i in range(8)
+        ]
+        out = probe.counterfactual_routing(samples, layers=[0], doses=[1, 2], seed=0)
+        assert out["self_swap"]["flips"] == 0
+        assert out["self_swap"]["max_abs_entropy_delta"] == 0.0
+        assert out["doses"] == [1, 2]
+        assert len(out["rescue"]) == 2 and len(out["corruption"]) == 2
+        assert len(out["random"]) == 4
