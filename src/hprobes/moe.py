@@ -123,6 +123,10 @@ class MoECapture:
         self.records: List[Dict[str, Any]] = []
         self.sketch = MoESketch(num_experts=num_experts)
         self._ctx: Dict[str, torch.Tensor] = {}
+        # Routing-aware intervention state (#41 causal): when set, the
+        # wrapped forward rescales the target expert's activation rows --
+        # only where the expert was actually routed -- before down_proj.
+        self._intervention: Optional[Dict[str, Any]] = None
 
     def attach(self, experts_module: torch.nn.Module) -> torch.utils.hooks.RemovableHandle:
         """Wrap the experts module forward to capture per-expert activations.
@@ -160,6 +164,18 @@ class MoECapture:
                     current_state, self_mod.gate_up_proj[expert_idx]
                 ).chunk(2, dim=-1)
                 act = self_mod.act_fn(gate) * up
+                iv = cap._intervention
+                if iv is not None and expert_idx == iv.get("expert"):
+                    names = iv["features"]
+                    if iv["ablate"]:
+                        act = act.clone()
+                        for j in names:
+                            act[:, j] = 0.0
+                    else:
+                        alpha = float(iv["alpha"])
+                        act = act.clone()
+                        for j in names:
+                            act[:, j] = act[:, j] * alpha
                 cap.record_expert(expert_idx, act)
                 out = torch.nn.functional.linear(act, self_mod.down_proj[expert_idx])
                 out = out * top_k_weights[token_idx, top_k_pos, None]
@@ -204,6 +220,34 @@ class MoECapture:
                 "acts": activations.detach().float().cpu(),
             }
         )
+
+    def set_intervention(
+        self,
+        expert: int,
+        features: List[int],
+        alpha: Optional[float] = None,
+        ablate: bool = False,
+    ) -> None:
+        """Routing-aware intervention on one expert's neurons (#41 causal).
+
+        With ``ablate=True`` the listed neurons are zeroed; with ``alpha``
+        given they are scaled by it. Applies only inside this expert's routed
+        rows, i.e. exclusively at tokens where the router selected the expert
+        -- the structural-zeros requirement of the issue.
+        """
+        if not ablate and alpha is None:
+            raise ValueError("pass ablate=True or an alpha scale")
+        if not features:
+            raise ValueError("features must be a non-empty list of neuron indices")
+        self._intervention = {
+            "expert": int(expert),
+            "features": [int(j) for j in features],
+            "alpha": alpha,
+            "ablate": bool(ablate),
+        }
+
+    def clear_intervention(self) -> None:
+        self._intervention = None
 
     def routing_table(self) -> torch.Tensor:
         """Per-token selected experts from the last forward: (T, top_k)."""

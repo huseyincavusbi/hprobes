@@ -333,3 +333,67 @@ class TestMoEProbeFit:
         assert set(r["feature_names"]) == {"L0:E0", "L0:E1"}
         # routed indicator mirrors the planted routing
         assert r["kind"] == "routing_only"
+
+
+class TestRoutingAwareIntervention:
+    """#41 causal: interventions fire only at tokens where the expert is routed."""
+
+    def setup_method(self):
+        torch.manual_seed(0)
+        self.experts = _toy_experts(4, 8)
+        self.hidden = torch.randn(5, 8)
+        # expert 2 routed only to tokens [1, 4]; actor expert 0 on [0, 2, 3]
+        self.top_k_index = torch.tensor([[0, 1], [2, 3], [0, 1], [0, 3], [2, 1]])
+        w = torch.rand(5, 2)
+        self.top_k_weights = w / w.sum(dim=-1, keepdim=True)
+
+    def test_ablation_only_touches_routed_tokens(self):
+        base = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+
+        cap = MoECapture(num_experts=4, layer=0)
+        handle = cap.attach(self.experts)
+        cap.set_intervention(expert=2, features=list(range(6)), ablate=True)
+        ablated = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+
+        routed = {1, 4}
+        for t in range(5):
+            row_close = torch.allclose(ablated[t], base[t], atol=1e-6)
+            if t in routed:
+                assert not row_close, f"token {t} should change (expert 2 active)"
+            else:
+                assert row_close, f"token {t} must be untouched (expert 2 inactive)"
+
+    def test_alpha_scaling_direction(self):
+        cap = MoECapture(num_experts=4, layer=0)
+        handle = cap.attach(self.experts)
+        cap.set_intervention(expert=2, features=[0, 1], alpha=0.0)
+        scaled = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+        # alpha=0 equals full ablation of the listed features
+        cap2 = MoECapture(num_experts=4, layer=0)
+        h2 = cap2.attach(self.experts)
+        cap2.set_intervention(expert=2, features=[0, 1, 2, 3, 4, 5], ablate=True)
+        ablated = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        h2.remove()
+        assert not torch.allclose(scaled, ablated)
+
+    def test_clear_intervention_restores_baseline(self):
+        base = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        cap = MoECapture(num_experts=4, layer=0)
+        handle = cap.attach(self.experts)
+        cap.set_intervention(expert=2, features=[0], ablate=True)
+        self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        cap.clear_intervention()
+        restored = self.experts(self.hidden, self.top_k_index, self.top_k_weights)
+        handle.remove()
+        assert torch.equal(restored, base)
+
+    def test_rejects_empty_features(self):
+        cap = MoECapture(num_experts=4, layer=0)
+        try:
+            cap.set_intervention(expert=0, features=[], ablate=True)
+        except ValueError as e:
+            assert "features" in str(e)
+            return
+        raise AssertionError("expected ValueError")
