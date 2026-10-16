@@ -406,23 +406,27 @@ def _run_stability_check(
     identical for any ``n_jobs``.
     """
     from joblib import Parallel, delayed
+    from threadpoolctl import threadpool_limits
 
     n_samples = X_train.shape[0]
 
     def _fit_one(seed_offset: int) -> set:
-        idx = np.random.RandomState(base_seed + seed_offset).choice(
-            n_samples, size=n_samples, replace=True
-        )
-        Xb, yb = X_train[idx], y_train[idx]
-        clf, _ = _fit_logistic(
-            Xb,
-            yb,
-            solver,
-            l1_ratio=1,
-            C=l1_C,
-            max_iter=1000,
-            random_state=base_seed + seed_offset + 1,
-        )
+        # One BLAS thread per worker: multithreaded reductions can reorder
+        # last-bit arithmetic, so the cap keeps parallel runs bit-identical
+        # to sequential ones (enforced by the determinism tests).
+        with threadpool_limits(limits=1, user_api="blas"):
+            clf = LogisticRegression(
+                solver="liblinear",
+                l1_ratio=1,
+                C=l1_C,
+                max_iter=1000,
+                random_state=base_seed + seed_offset + 1,
+            )
+            idx = np.random.RandomState(base_seed + seed_offset).choice(
+                n_samples, size=n_samples, replace=True
+            )
+            Xb, yb = X_train[idx], y_train[idx]
+            clf.fit(Xb, yb)
         return set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
 
     n_jobs_resolved = _resolve_stability_jobs(n_jobs, X_train.shape[0], X_train.shape[1], n_runs)
@@ -431,7 +435,10 @@ def _run_stability_check(
             f"[hprobes] stability bootstraps: {n_runs} runs x n_jobs={n_jobs_resolved} "
             f"(est. peak {_estimate_peak_fit_bytes(X_train.shape[0], X_train.shape[1], n_jobs_resolved if n_jobs_resolved > 0 else n_runs) / 1e9:.1f} GB)"
         )
-    neuron_sets = Parallel(n_jobs=n_jobs_resolved, verbose=0)(
+    # Threading (not processes): workers share the read-only matrix in place,
+    # so there is no pickling, no copies and no oversubscription — at most one
+    # runnable thread per fit. Safe because fits are independent and seeded.
+    neuron_sets = Parallel(n_jobs=n_jobs_resolved, backend="threading", verbose=0)(
         delayed(_fit_one)(i) for i in range(n_runs)
     )
 
