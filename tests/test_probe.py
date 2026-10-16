@@ -964,3 +964,94 @@ class TestReadoutModes:
             rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
             assert rows
             assert all("generated" in row for row in rows)
+
+
+class TestExtractRefitEquivalence:
+    """Issue #26: split path (extract + refit) reproduces inline fit exactly."""
+
+    def _pair(self):
+        a = HProbes(MODEL, TOK, l1_C=10)
+        a.fit(SAMPLES, options_key="options", answer_key="answer")
+        b = HProbes(MODEL, TOK, l1_C=10)
+        art = b.extract_features(SAMPLES, options_key="options", answer_key="answer")
+        b.fit_on_features(art, options_key="options")
+        return a, b, art
+
+    def test_split_matches_inline_outcomes(self):
+        a, b, _ = self._pair()
+        assert a.h_neurons_ == b.h_neurons_
+        assert a.accuracy_ == pytest.approx(b.accuracy_)
+        assert a.n_neurons_ == b.n_neurons_
+        np.testing.assert_array_equal(a._top_k_idx, b._top_k_idx)
+        np.testing.assert_allclose(a._clf.coef_, b._clf.coef_)
+        assert a._predictions_ == b._predictions_
+
+    def test_top_k_override_only_reselects(self):
+        _, b, art = self._pair()
+        c = HProbes(MODEL, TOK, l1_C=10)
+        c.extract_features(SAMPLES, options_key="options", answer_key="answer")
+        c.fit_on_features(art, options_key="options", top_k=50)
+        assert len(c._top_k_idx) == 50
+        assert c.is_fitted_
+
+    def test_artifact_key_stable_across_extractions(self):
+        from hprobes.rows import rows_key
+
+        _, _, art = self._pair()
+        b = HProbes(MODEL, TOK, l1_C=10)
+        art2 = b.extract_features(SAMPLES, options_key="options", answer_key="answer")
+        cfg = dict(art.meta["config"])
+        assert rows_key(art.meta["model_fp"], art.samples, cfg) == rows_key(
+            art2.meta["model_fp"], art2.samples, cfg
+        )
+
+
+class TestResponseRefitEquivalence:
+    """Issue #26: responses split path reproduces fit_from_responses exactly."""
+
+    SAMPLES = [
+        {
+            "question": f"Describe {i}.",
+            "response": f"The answer is X{i}.",
+            "answer_tokens": ["X"],
+            "judge": i % 2 == 0,
+        }
+        for i in range(10)
+    ]
+
+    def _pair(self):
+        a = HProbes(MODEL, TOK, l1_C=10)
+        a.fit_from_responses(self.SAMPLES)
+        b = HProbes(MODEL, TOK, l1_C=10)
+        art = b.extract_features_from_responses(self.SAMPLES)
+        b.fit_on_response_features(art)
+        return a, b, art
+
+    def test_split_matches_inline_outcomes(self):
+        a, b, art = self._pair()
+        assert art.meta["mode"] == "dual-span"
+        assert art.meta["n_answer_rows"] == len(art.rows) // 2
+        assert a.h_neurons_ == b.h_neurons_
+        assert a.accuracy_ == pytest.approx(b.accuracy_)
+        np.testing.assert_array_equal(a._top_k_idx, b._top_k_idx)
+        if a._clf is not None:
+            np.testing.assert_allclose(a._clf.coef_, b._clf.coef_)
+        assert a._predictions_ == b._predictions_
+
+    def test_cross_mode_refit_rejected(self):
+        _, b_live, art_live = TestExtractRefitEquivalence()._pair()
+        _, _, art_resp = self._pair()
+        with pytest.raises(ValueError, match="dual-span"):
+            b_live.fit_on_response_features(art_live)
+        c = HProbes(MODEL, TOK, l1_C=10)
+        with pytest.raises(ValueError, match="live-path"):
+            c.fit_on_features(art_resp)
+
+    def test_fresh_probe_refit_matches(self):
+        a, _, art = TestExtractRefitEquivalence()._pair()
+        c = HProbes(MODEL, TOK, l1_C=10)
+        assert c._n_features == 0
+        c.fit_on_features(art, options_key="options")
+        assert c.h_neurons_ == a.h_neurons_
+        assert c.accuracy_ == pytest.approx(a.accuracy_)
+        np.testing.assert_allclose(c._clf.coef_, a._clf.coef_)

@@ -84,6 +84,24 @@ If H-Neurons are truly causal, suppressing them should change accuracy on the va
 
 Contrastive mode is recommended for most use cases. It produces more discriminative features because it captures the model's representation specifically at the point of answer generation.
 
+## Extract Once, Refit Many
+
+`fit()` couples the expensive forward phase (CETT extraction) with the cheap
+selection+fitting phase. For sweeps over multiple variants on the same samples
+(different `top_k`, control labels, bootstraps), split the two:
+
+```python
+rows = probe.extract_features(samples)          # forwards run once
+probe.fit_on_features(rows)                     # variant 1: defaults
+probe.fit_on_features(rows, top_k=1000)          # variant 2: reselect only
+```
+
+`extract_features_from_responses()` / `fit_on_response_features()` are the
+same split for pre-generated responses. Artifacts persist with
+`save_rows()` / `load_rows()` (arrays + JSON sidecar); `rows_key()` binds
+cached rows to exact weights, samples and extraction config, so stale rows
+can never be silently reused. Selection always stays downstream of the cache.
+
 ## Consistency Filtering
 
 When `n_consistency > 1`, the probe draws `n` samples from the restricted letter distribution (softmax over A–J logits) before committing to a prediction. If the draws disagree, the sample is skipped entirely.

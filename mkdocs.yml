@@ -49,6 +49,7 @@ nav:
   - API Reference:
     - HProbes: api/probe.md
     - CETT Functions: api/cett.md
+    - Cached Rows: api/rows.md
 
 markdown_extensions:
   - pymdownx.highlight:
