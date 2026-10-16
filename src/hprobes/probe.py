@@ -1421,6 +1421,10 @@ class HProbes:
                 full = self._tokenize(prompt + self._answer_cue)
                 prompt_enc = self._tokenize(prompt)
                 decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                # Per-forward records only: clear so sample k's features can
+                # never include sample j<k rows at a coincident position.
+                for cap in captures:
+                    cap.clear_records()
                 with torch.no_grad():
                     out = self.model(full["input_ids"].to(device))
                 logits = out.logits[0, decision_pos, :]
@@ -1476,6 +1480,279 @@ class HProbes:
             )
         self.is_fitted_ = True
         return self
+
+    def counterfactual_routing(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        layers: Optional[List[int]] = None,
+        doses: Optional[List[int]] = None,
+        seed: int = 0,
+    ) -> Dict[str, Any]:
+        """Counterfactual routing: rescue/corruption + controls (#42 standard 4).
+
+        Baseline pass records per-sample routing at the decision token; each
+        sample gets a matched opposite-label donor (nearest by length, then
+        entropy -- a documented difficulty proxy). Then, per dose (expert
+        slots replaced, capped at k):
+
+        - ``rescue``: incorrect samples take the donor's first ``dose`` slots
+        - ``corruption``: correct samples take the donor's first ``dose`` slots
+        - ``random``: frequency-matched random experts (both directions), the
+          non-donor control
+        - ``self_swap``: own routing re-imposed -- bit-exact no-op gate
+
+        Interventions apply at the decision token only (v1, documented);
+        ``seed`` controls the random control's draws.
+        """
+        from .cett import _get_transformer_layers
+        from .moe import MoECapture
+        from .routing import dose_rows, frequency_sampled_experts, match_donors
+
+        import torch as _t
+
+        blocks = _get_transformer_layers(self.model)
+        if layers is None:
+            layers = list(range(len(blocks)))
+        self._layers = list(layers)
+        self._letter_ids = self._get_letter_ids()
+        self._answer_cue = "\n\nAnswer:"
+        device = next(self.model.parameters()).device
+
+        captures = {}
+        handles = []
+        for li in self._layers:
+            experts_mod = blocks[li].mlp.experts
+            cap = MoECapture(num_experts=int(experts_mod.down_proj.shape[0]), layer=li)
+            handles.append(cap.attach(experts_mod))
+            captures[li] = cap
+
+        def _forward(sample: Dict) -> Dict:
+            prompt = self._format_moe_prompt(sample, question_key, options_key)
+            full = self._tokenize(prompt + self._answer_cue)
+            prompt_enc = self._tokenize(prompt)
+            decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+            for cap in captures.values():
+                cap.clear_records()
+            with _t.no_grad():
+                out = self.model(full["input_ids"].to(device))
+            logits = out.logits[0, decision_pos, :]
+            logp = _t.log_softmax(logits.float(), dim=-1)
+            return {
+                "decision_pos": decision_pos,
+                "pred": self._predict_letter(logits),
+                "entropy": float(-(logp.exp() * logp).sum()),
+                "routing": {
+                    li: [int(x) for x in captures[li].routing_table()[decision_pos].tolist()]
+                    for li in self._layers
+                },
+                "weights": {
+                    li: [float(x) for x in captures[li].gate_table()[decision_pos].tolist()]
+                    for li in self._layers
+                },
+                "prompt_len": int(prompt_enc["input_ids"].shape[1]),
+            }
+
+        try:
+            base: List[Dict] = []
+            for sample in samples:
+                gt = self._moe_gt_letter(sample, options_key, answer_key)
+                rec = _forward(sample)
+                if rec["pred"] is None or gt is None:
+                    continue
+                rec["gt"] = gt
+                rec["is_correct"] = self._moe_letter_match(rec["pred"], gt)
+                rec["sample"] = sample
+                base.append(rec)
+
+            labels = [0 if r["is_correct"] else 1 for r in base]
+            donors = match_donors(
+                labels, [r["prompt_len"] for r in base], [r["entropy"] for r in base]
+            )
+
+            usage: Dict[int, Dict[int, float]] = {li: {} for li in self._layers}
+            for r in base:
+                for li in self._layers:
+                    for e in r["routing"][li]:
+                        usage[li][e] = usage[li].get(e, 0.0) + 1.0
+
+            k = len(base[0]["routing"][self._layers[0]]) if base else 0
+            if doses is None:
+                doses = [1, 2, 5]
+            eff_doses = sorted({min(d, k) for d in doses if d >= 1})
+
+            def _intervened_forward(idx: int, mode: str, dose: int) -> Dict:
+                rec = base[idx]
+                donor_idx = donors.get(idx, idx)
+                for li in self._layers:
+                    if mode == "donor":
+                        e, w = dose_rows(
+                            rec["routing"][li],
+                            rec["weights"][li],
+                            base[donor_idx]["routing"][li],
+                            base[donor_idx]["weights"][li],
+                            dose,
+                        )
+                    elif mode == "random":
+                        picks = frequency_sampled_experts(
+                            usage[li], dose=dose, k=k, seed=seed + idx * 1000 + li
+                        )
+                        e = list(picks) + list(rec["routing"][li][len(picks) :])
+                        w = list(rec["weights"][li])
+                    else:  # self
+                        e, w = list(rec["routing"][li]), list(rec["weights"][li])
+                    captures[li].set_routing_override(
+                        [rec["decision_pos"]],
+                        _t.tensor([e], dtype=_t.long),
+                        _t.tensor([w], dtype=_t.float),
+                    )
+                post = _forward(rec["sample"])
+                for li in self._layers:
+                    captures[li].clear_routing_override()
+                return post
+
+            def _group(idxs: List[int], mode: str, dose: int, direction: str) -> Dict:
+                flips = 0
+                acc_after = 0.0
+                ent_delta = 0.0
+                for idx in idxs:
+                    post = _intervened_forward(idx, mode, dose)
+                    flips += int(post["pred"] != base[idx]["pred"])
+                    acc_after += (
+                        1.0 if self._moe_letter_match(post["pred"], base[idx]["gt"]) else 0.0
+                    )
+                    ent_delta += post["entropy"] - base[idx]["entropy"]
+                n = len(idxs)
+                return {
+                    "direction": direction,
+                    "dose": dose,
+                    "n_targets": n,
+                    "flip_rate": flips / n if n else 0.0,
+                    "accuracy_after": acc_after / n if n else 0.0,
+                    "mean_entropy_delta": ent_delta / n if n else 0.0,
+                }
+
+            self_swap = {"n": len(base), "flips": 0, "max_abs_entropy_delta": 0.0}
+            for idx in range(len(base)):
+                post = _intervened_forward(idx, "self", k)
+                self_swap["flips"] += int(post["pred"] != base[idx]["pred"])
+                self_swap["max_abs_entropy_delta"] = max(
+                    self_swap["max_abs_entropy_delta"],
+                    abs(post["entropy"] - base[idx]["entropy"]),
+                )
+
+            incorrect = [i for i, r in enumerate(base) if not r["is_correct"]]
+            correct = [i for i, r in enumerate(base) if r["is_correct"]]
+            rescue: List[Dict] = []
+            corruption: List[Dict] = []
+            random_rows: List[Dict] = []
+            for dose in eff_doses:
+                if incorrect:
+                    rescue.append(_group(incorrect, "donor", dose, "rescue"))
+                    random_rows.append(_group(incorrect, "random", dose, "rescue"))
+                if correct:
+                    corruption.append(_group(correct, "donor", dose, "corruption"))
+                    random_rows.append(_group(correct, "random", dose, "corruption"))
+        finally:
+            for h in handles:
+                h.remove()
+
+        result = {
+            "n_samples": len(base),
+            "k": k,
+            "doses": eff_doses,
+            "layers": self._layers,
+            "donor_matches": {"n_targets": len(donors), "donors": donors},
+            "self_swap": self_swap,
+            "rescue": rescue,
+            "corruption": corruption,
+            "random": random_rows,
+        }
+        self._counterfactual_routing = result
+        return result
+
+    def moe_routing_analysis(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        layers: Optional[List[int]] = None,
+        n_perm: int = 200,
+        seed: int = 0,
+    ) -> Dict[str, Any]:
+        """Routing vs correctness statistics (+ CETT cross-check if fitted).
+
+        One baseline forward per sample; records decision-token routing and
+        gate weights; compares correct vs incorrect via
+        :func:`hprobes.routing.routing_stats`. When ``fit_moe`` was run
+        first, appends ``cett_cross_check``: overlap between routing-flagged
+        experts and the experts hosting CETT-selected neurons (#42 vs #41).
+        """
+        from .cett import _get_transformer_layers
+        from .moe import MoECapture
+        from .routing import cett_routing_overlap, routing_stats
+
+        import torch as _t
+
+        blocks = _get_transformer_layers(self.model)
+        if layers is None:
+            layers = list(range(len(blocks)))
+        self._layers = list(layers)
+        self._letter_ids = self._get_letter_ids()
+        self._answer_cue = "\n\nAnswer:"
+        device = next(self.model.parameters()).device
+
+        captures = {}
+        handles = []
+        for li in self._layers:
+            experts_mod = blocks[li].mlp.experts
+            cap = MoECapture(num_experts=int(experts_mod.down_proj.shape[0]), layer=li)
+            handles.append(cap.attach(experts_mod))
+            captures[li] = cap
+
+        routings: List[Any] = []
+        gates: List[Any] = []
+        labels: List[int] = []
+        try:
+            for sample in samples:
+                prompt = self._format_moe_prompt(sample, question_key, options_key)
+                full = self._tokenize(prompt + self._answer_cue)
+                prompt_enc = self._tokenize(prompt)
+                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                for cap in captures.values():
+                    cap.clear_records()
+                with _t.no_grad():
+                    out = self.model(full["input_ids"].to(device))
+                pred = self._predict_letter(out.logits[0, decision_pos, :])
+                gt = self._moe_gt_letter(sample, options_key, answer_key)
+                if pred is None or gt is None:
+                    continue
+                labels.append(0 if self._moe_letter_match(pred, gt) else 1)
+                routings.append(
+                    _t.stack([captures[li].routing_table()[decision_pos] for li in self._layers])
+                )
+                gates.append(
+                    _t.stack([captures[li].gate_table()[decision_pos] for li in self._layers])
+                )
+        finally:
+            for h in handles:
+                h.remove()
+
+        if not routings:
+            raise ValueError("no valid samples — routing analysis produced zero rows")
+        n_experts = max(int(r.max()) for r in routings) + 1
+        stats = routing_stats(
+            routings, np.array(labels), gates=gates, n_experts=n_experts, n_perm=n_perm, seed=seed
+        )
+        moe = getattr(self, "moe_", None)
+        if moe and moe.get("feature_names"):
+            names = [moe["feature_names"][j] for j in moe.get("selected", [])]
+            stats["cett_cross_check"] = cett_routing_overlap(names, stats)
+        self._moe_routing_analysis = stats
+        return stats
 
     @staticmethod
     def _moe_decision_features(

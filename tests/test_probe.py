@@ -1055,3 +1055,44 @@ class TestResponseRefitEquivalence:
         assert c.h_neurons_ == a.h_neurons_
         assert c.accuracy_ == pytest.approx(a.accuracy_)
         np.testing.assert_allclose(c._clf.coef_, a._clf.coef_)
+
+
+class TestFitMoERecordIsolation:
+    """Regression: fit_moe must not leak capture records across samples (#42).
+
+    Captures are attached once for all samples; without clearing, sample k's
+    decision-feature dict inherits stale (layer, expert) rows from samples
+    j<k whenever their decision positions coincide (same prompt length).
+    """
+
+    def test_records_cleared_between_samples(self, monkeypatch):
+        import _fake_moe
+
+        from hprobes.probe import HProbes
+
+        model = _fake_moe._FakeMoEModel()
+        tok = TOK
+        # Equal-length prompts -> identical decision position index; different
+        # token ids -> different routing (routing = f(token id) in the fake).
+        samples = [
+            {"question": "Q0?", "options": ["aa", "bb"], "answer": 0},
+            {"question": "Q1?", "options": ["cc", "dd"], "answer": 1},
+        ]
+
+        probe = HProbes(model, tok, readout="logits")
+        seen = []
+        original = HProbes._moe_decision_features
+
+        def spy(captures, decision_pos):
+            snapshot = {cap.layer: len(cap.records) for cap in captures}
+            seen.append(snapshot)
+            return original(captures, decision_pos)
+
+        monkeypatch.setattr(HProbes, "_moe_decision_features", staticmethod(spy))
+        probe.fit_moe(samples, layers=[0], per_expert_top_n=4, top_k=16, min_active=1)
+
+        assert len(seen) == 2
+        # Each snapshot must count exactly one forward's records. Without the
+        # per-sample clear, snapshot 2 would include forward 1's records too.
+        assert seen[0] == seen[1], seen
+        assert seen[1][0] <= model.num_experts, seen

@@ -19,17 +19,24 @@ def _toy_experts(num_experts=4, d_in=8, d_inter=6):
             self.act_fn = nn.SiLU()
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
+            # Family-faithful ordering: mirrors Olmoe/Qwen2Moe/Qwen3.5MoE
+            # experts modules (one_hot -> permute -> slot-major where). Row
+            # order inside each expert's batched matmul matters for bitwise
+            # equality on some BLAS backends, so the toy must match the real
+            # families -- and the MoECapture wrapper replays exactly this.
             final = torch.zeros_like(hidden_states)
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index, num_classes=self.num_experts
+            ).permute(2, 1, 0)
             for e in range(self.num_experts):
-                mask = top_k_index == e
-                token_idx, slot_idx = torch.where(mask)
-                if token_idx.numel() == 0:
+                if expert_mask[e].sum() == 0:
                     continue
+                top_k_pos, token_idx = torch.where(expert_mask[e])
                 x = hidden_states[token_idx]
                 gate, up = torch.nn.functional.linear(x, self.gate_up_proj[e]).chunk(2, dim=-1)
                 act = self.act_fn(gate) * up
                 out = torch.nn.functional.linear(act, self.down_proj[e])
-                out = out * top_k_weights[token_idx, slot_idx, None]
+                out = out * top_k_weights[token_idx, top_k_pos, None]
                 final.index_add_(0, token_idx, out)
             return final
 
