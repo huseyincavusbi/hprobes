@@ -72,3 +72,19 @@ def test_rows_key_stable_and_sensitive():
     assert rows_key("fp2", samples, cfg) != k
     assert rows_key("fp", [{"question": "q2", "answer": "A"}], cfg) != k
     assert rows_key("fp", samples, {"layers": [1], "batch_size": 1}) != k
+
+
+def test_save_load_round_trip(tmp_path):
+    from hprobes.rows import load_rows, save_rows
+
+    art = _toy_rows()
+    paths = save_rows(art, str(tmp_path / "rows"))
+    assert len(paths) == 2
+    back = load_rows(str(tmp_path / "rows"))
+    np.testing.assert_array_equal(back.rows, art.rows)
+    np.testing.assert_array_equal(back.labels, art.labels)
+    assert back.row_to_sample == art.row_to_sample
+    assert back.prompts == art.prompts
+    assert back.samples == art.samples
+    assert back.meta == art.meta
+    np.testing.assert_allclose(back.variance(), art.variance(), rtol=1e-9)

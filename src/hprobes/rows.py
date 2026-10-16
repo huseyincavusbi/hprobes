@@ -102,3 +102,62 @@ def rows_key(model_fp: str, samples: List[Dict[str, Any]], config: Dict[str, Any
         default=str,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def save_rows(artifact: CETTRows, base_path: str) -> List[str]:
+    """Persist an artifact as ``<base>.npz`` (arrays) + ``<base>.json`` (rest).
+
+    Returns the written paths. Reload with :func:`load_rows`.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    artifact.validate()
+    base = Path(base_path)
+    npz_path = base.with_suffix(".npz")
+    json_path = base.with_suffix(".json")
+    np.savez_compressed(
+        npz_path,
+        rows=artifact.rows,
+        labels=np.asarray(artifact.labels),
+        row_to_sample=np.asarray(artifact.row_to_sample),
+        welford_mean=artifact.welford_mean,
+        welford_M2=artifact.welford_M2,
+    )
+    json_path.write_text(
+        json.dumps(
+            {
+                "welford_n": artifact.welford_n,
+                "prompts": artifact.prompts,
+                "ground_truth": artifact.ground_truth,
+                "per_sample": artifact.per_sample,
+                "samples": artifact.samples,
+                "meta": artifact.meta,
+            },
+            default=str,
+        )
+    )
+    return [str(npz_path), str(json_path)]
+
+
+def load_rows(base_path: str) -> CETTRows:
+    """Reload an artifact written by :func:`save_rows` (validated)."""
+    from pathlib import Path  # noqa: PLC0415
+
+    base = Path(base_path)
+    data = np.load(base.with_suffix(".npz"))
+    doc = json.loads(base.with_suffix(".json").read_text())
+    artifact = CETTRows(
+        rows=np.asarray(data["rows"]),
+        labels=np.asarray(data["labels"]),
+        row_to_sample=[int(i) for i in data["row_to_sample"]],
+        prompts=list(doc["prompts"]),
+        ground_truth=list(doc["ground_truth"]),
+        per_sample=list(doc["per_sample"]),
+        samples=list(doc["samples"]),
+        welford_n=int(doc["welford_n"]),
+        welford_mean=np.asarray(data["welford_mean"]),
+        welford_M2=np.asarray(data["welford_M2"]),
+        meta=dict(doc["meta"]),
+    )
+    artifact.validate()
+    return artifact
