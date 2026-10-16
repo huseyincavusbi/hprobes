@@ -125,6 +125,38 @@ def _available_ram_bytes() -> Optional[int]:
 
 
 _STABILITY_N_RUNS = 5  # matches _run_stability_check's default (bootstrap fits)
+# Fraction of available RAM the "auto" jobs budget may consume for concurrent
+# bootstrap fits (each holds float64 working copies; see _estimate_peak_fit_bytes).
+_STABILITY_JOBS_SAFETY = 0.5
+# Legacy large-matrix cutoff: above this byte size the bootstrap fits run
+# sequentially (matches the pre-#48 hard-coded behavior exactly).
+_STABILITY_LEGACY_BYTES = 2 * 1024**3
+
+
+def _resolve_stability_jobs(
+    n_jobs: Union[int, str, None],
+    n_rows: int,
+    n_features: int,
+    n_runs: int,
+    available_bytes: Optional[int] = None,
+) -> int:
+    """Resolve bootstrap concurrency for #48.
+
+    ``None`` reproduces the legacy heuristic exactly (all cores under the
+    cutoff, sequential above). An int is passed straight to joblib.
+    ``"auto"`` fits as many runs concurrently as the RAM budget allows.
+    """
+    if n_jobs is None:
+        return 1 if n_rows * n_features * 8 > _STABILITY_LEGACY_BYTES else -1
+    if isinstance(n_jobs, int):
+        return n_jobs
+    if n_jobs == "auto":
+        avail = available_bytes if available_bytes is not None else _available_ram_bytes()
+        per_fit = _estimate_peak_fit_bytes(n_rows, n_features, 1)
+        if avail is None or per_fit <= 0:
+            return 1
+        return max(1, min(n_runs, int(avail * _STABILITY_JOBS_SAFETY // per_fit)))
+    raise ValueError(f"stability_n_jobs must be an int, 'auto' or None, got {n_jobs!r}")
 
 
 def _estimate_peak_fit_bytes(n_rows: int, n_features: int, n_fits: int) -> int:
@@ -310,11 +342,14 @@ def _run_stability_check(
     l1_C: float,
     n_runs: int = 5,
     base_seed: int = 42,
+    n_jobs: Union[int, str, None] = None,
 ) -> Dict[str, Any]:
     """Bootstrap stability: refit L1 on bootstrapped versions of X_train, compare neurons.
 
     Returns dict with neuron consistency, Jaccard similarities, and per-run counts.
-    Runs bootstrap fits in parallel via joblib.
+    Bootstrap fits run in parallel via joblib; each run is independently seeded
+    (``base_seed + offset``) and results reassemble in order, so the outcome is
+    identical for any ``n_jobs``.
     """
     from joblib import Parallel, delayed
 
@@ -335,8 +370,15 @@ def _run_stability_check(
         clf.fit(Xb, yb)
         return set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
 
-    n_jobs = 1 if X_train.shape[1] * X_train.shape[0] * 8 > 2 * 1024**3 else -1
-    neuron_sets = Parallel(n_jobs=n_jobs, verbose=0)(delayed(_fit_one)(i) for i in range(n_runs))
+    n_jobs_resolved = _resolve_stability_jobs(n_jobs, X_train.shape[0], X_train.shape[1], n_runs)
+    if n_jobs is not None:
+        print(
+            f"[hprobes] stability bootstraps: {n_runs} runs x n_jobs={n_jobs_resolved} "
+            f"(est. peak {_estimate_peak_fit_bytes(X_train.shape[0], X_train.shape[1], n_jobs_resolved if n_jobs_resolved > 0 else n_runs) / 1e9:.1f} GB)"
+        )
+    neuron_sets = Parallel(n_jobs=n_jobs_resolved, verbose=0)(
+        delayed(_fit_one)(i) for i in range(n_runs)
+    )
 
     n_neurons_per_run = [len(s) for s in neuron_sets]
 
@@ -539,7 +581,14 @@ class HProbes:
         correlation: bool = False,
         cluster: bool = False,
         strict_memory: bool = False,
+        stability_n_jobs: Union[int, str, None] = None,
     ):
+        if stability_n_jobs is not None and not (
+            isinstance(stability_n_jobs, int) or stability_n_jobs == "auto"
+        ):
+            raise ValueError(
+                f"stability_n_jobs must be an int, 'auto' or None, got {stability_n_jobs!r}"
+            )
         self.model = model
         self.tokenizer = tokenizer
         self.l1_C = l1_C
@@ -548,6 +597,7 @@ class HProbes:
         self.correlation = correlation
         self.cluster = cluster
         self.strict_memory = strict_memory
+        self.stability_n_jobs = stability_n_jobs
         self._top_k_auto = isinstance(top_k, str) and top_k.strip().lower() in ("auto", "-1")
         self.top_k = 0 if self._top_k_auto else int(top_k)
         self.auto_safety = auto_safety
@@ -905,7 +955,12 @@ class HProbes:
             self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
         if self.stability and self.n_neurons_ > 0:
             self._stability_results_ = _run_stability_check(
-                X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
+                X_train,
+                y_train,
+                self.l1_C,
+                n_runs=5,
+                base_seed=self.seed,
+                n_jobs=self.stability_n_jobs,
             )
         if self.correlation and self.n_neurons_ > 0:
             self._correlation_results_ = _run_correlation_check(selected, X_train)
@@ -1340,7 +1395,12 @@ class HProbes:
             self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
         if self.stability and self.n_neurons_ > 0:
             self._stability_results_ = _run_stability_check(
-                X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
+                X_train,
+                y_train,
+                self.l1_C,
+                n_runs=5,
+                base_seed=self.seed,
+                n_jobs=self.stability_n_jobs,
             )
         if self.correlation and self.n_neurons_ > 0:
             self._correlation_results_ = _run_correlation_check(selected, X_train)
