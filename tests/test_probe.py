@@ -1313,3 +1313,41 @@ class TestStabilityNJobs:
         two = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=2)
         assert one == two
 
+
+
+class TestStabilityThreadingEngine:
+    """Issue #48 engine: shared-memory threads, one BLAS thread per worker."""
+
+    def test_parallel_uses_threading_backend(self, monkeypatch):
+        import joblib
+
+        from hprobes.probe import _run_stability_check
+
+        seen = {}
+
+        class FakeParallel:
+            def __init__(self, *args, **kwargs):
+                seen.update(kwargs)
+
+            def __call__(self, tasks):
+                return [f(*a, **k) for f, a, k in tasks]
+
+        monkeypatch.setattr(joblib, "Parallel", FakeParallel)
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(40, 100))
+        y = (rng.random(40) < 0.5).astype(int)
+        _run_stability_check(X, y, 1.0, n_runs=2, base_seed=0, n_jobs=2)
+        assert seen.get("backend") == "threading"
+
+    def test_determinism_five_jobs(self):
+        from hprobes.probe import _run_stability_check
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(60, 200))
+        y = (rng.random(60) < 0.5).astype(int)
+        if y.sum() in (0, 60):
+            y[:30] = 1
+        one = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=1)
+        five = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=5)
+        assert one == five
+
