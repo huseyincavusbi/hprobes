@@ -1421,6 +1421,10 @@ class HProbes:
                 full = self._tokenize(prompt + self._answer_cue)
                 prompt_enc = self._tokenize(prompt)
                 decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                # Per-forward records only: clear so sample k's features can
+                # never include sample j<k rows at a coincident position.
+                for cap in captures:
+                    cap.clear_records()
                 with torch.no_grad():
                     out = self.model(full["input_ids"].to(device))
                 logits = out.logits[0, decision_pos, :]

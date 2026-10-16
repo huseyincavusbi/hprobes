@@ -296,6 +296,16 @@ class MoECapture:
     def clear_routing_override(self) -> None:
         self._routing_override = None
 
+    def clear_records(self) -> None:
+        """Drop recorded per-forward rows.
+
+        Recorded activations are only valid for the forward that produced
+        them; callers running multiple forwards (per-sample loops,
+        counterfactual conditions) must clear between forwards so features
+        never leak across samples.
+        """
+        self.records.clear()
+
     def routing_table(self) -> torch.Tensor:
         """Per-token selected experts from the last forward: (T, top_k)."""
         return self._ctx["top_k_index"].detach().cpu()
