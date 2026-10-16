@@ -1512,6 +1512,13 @@ def main() -> None:
         help="How to aggregate CETT over answer span (default: mean)",
     )
     resp_p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        dest="max_new_tokens_consistency",
+        help="Max new tokens for generation (unused in responses mode; kept for CLI parity)",
+    )
+    resp_p.add_argument(
         "--output",
         default=None,
         help="Base path to save results (default: auto-named in cwd)",

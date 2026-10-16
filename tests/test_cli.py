@@ -175,6 +175,12 @@ class TestCLIArgParsing:
             )
             resp_p.add_argument("--label-key", default="judge", dest="label_key")
             resp_p.add_argument("--aggregation", default="mean")
+            resp_p.add_argument(
+                "--max-new-tokens",
+                type=int,
+                default=None,
+                dest="max_new_tokens_consistency",
+            )
             resp_p.add_argument("--output", default=None)
             _add_common_model_args(resp_p)
             _add_common_probe_args(resp_p)
@@ -242,6 +248,14 @@ class TestCLIArgParsing:
         assert args.answer_tokens_key == "toks"
         assert args.label_key == "correct"
         assert args.aggregation == "max"
+
+    def test_responses_max_new_tokens(self):
+        args = self._parse(["responses", "--model", "m", "--data", "d", "--max-new-tokens", "77"])
+        assert args.max_new_tokens_consistency == 77
+
+    def test_responses_max_new_tokens_default(self):
+        args = self._parse(["responses", "--model", "m", "--data", "d"])
+        assert args.max_new_tokens_consistency is None
 
     def test_transfer_output(self):
         args = self._parse(
