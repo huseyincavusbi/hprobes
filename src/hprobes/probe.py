@@ -30,6 +30,7 @@ from .cett import (
     scale_h_neurons,
     scale_h_neurons_batch,
 )
+from .rows import CETTRows, fingerprint_model
 
 _NOT_FITTED_MSG = "Call fit() before using this method."
 _MCQ_LETTERS = list("ABCDEFGHIJ")
@@ -643,7 +644,7 @@ class HProbes:
     # Public API
     # ------------------------------------------------------------------
 
-    def fit(
+    def extract_features(
         self,
         samples: List[Dict],
         question_key: str = "question",
@@ -652,47 +653,22 @@ class HProbes:
         prompt_fn: Optional[Callable[[Dict], str]] = None,
         answer_cue: str = "\n\nAnswer:",
         label_fn: Optional[Callable[[str, str, Dict], int]] = None,
-    ) -> "HProbes":
-        """Discover H-Neurons from MCQ samples.
+    ) -> CETTRows:
+        """Run the expensive forward phase once; return reusable rows (#26).
 
-        Parameters
-        ----------
-        samples : list of dict
-            Each dict should contain at minimum a question and a ground-truth answer.
-            For MCQ: {"question": "...", "options": {"A": "...", ...}, "answer": "A"}
-        question_key : str
-            Key for the question text in each sample dict. Default "question".
-        options_key : str
-            Key for the options dict in each sample dict. Default "options".
-        answer_key : str
-            Key for the ground-truth answer letter in each sample dict. Default "answer".
-        prompt_fn : callable, optional
-            Custom function that takes a sample dict and returns a formatted string.
-            If None, uses tokenizer.apply_chat_template() with MCQ formatting.
-        answer_cue : str
-            String appended to every prompt to elicit a single-letter answer.
-            Default "\\n\\nAnswer:".
-        label_fn : callable, optional
-            Custom labeling function (predicted, ground_truth, sample) -> int (0 or 1).
-            If None, uses default hallucination labeling: 1 if incorrect, 0 if correct.
-            For control probes, pass a custom function, e.g.:
-            - Answer letter control: lambda pred, gt, s: 1 if pred == "A" else 0
-            - Domain control: lambda pred, gt, s: 1 if s.get("subject") == "Anatomy" else 0
-
-        Returns
-        -------
-        self
+        Selection (variance top-k, priors, clustering) and fitting all happen
+        downstream in :meth:`fit_on_features`, so one artifact serves any
+        number of refit variants. Labels are computed with ``label_fn`` at
+        extraction time, exactly as in the inline path.
         """
         self._answer_cue = answer_cue
         self._layers = available_layers(self.model)[:: self.layer_stride]
         self._col_norms = precompute_col_norms(self.model, self._layers)
         self._set_feature_layout()
         self._letter_ids = self._get_letter_ids()
-        top_k = min(self.top_k, self._n_features) if self.top_k > 0 else self._n_features
 
         print(f"[hprobes] Layers: {len(self._layers)}  |  Features: {self._n_features:,}")
 
-        # --- Phase 1: extract CETT features ---
         (
             cett_raw,
             train_labels,
@@ -708,9 +684,64 @@ class HProbes:
             answer_key,
             prompt_fn,
             answer_cue,
-            top_k,
+            self._n_features,
             label_fn,
         )
+        if not cett_raw:
+            raise ValueError("no valid samples — extraction produced zero rows")
+        artifact = CETTRows(
+            rows=np.stack(cett_raw, axis=0),
+            labels=np.array(train_labels),
+            row_to_sample=list(row_to_sample),
+            prompts=list(valid_prompts),
+            ground_truth=list(valid_gt),
+            per_sample=list(per_sample),
+            samples=list(valid_samples),
+            welford_n=int(self._welford_n),
+            welford_mean=np.array(self._welford_mean),
+            welford_M2=np.array(self._welford_M2),
+            meta={
+                "layers": list(self._layers),
+                "n_features": self._n_features,
+                "model_fp": fingerprint_model(self.model, self._layers),
+                "config": {
+                    "question_key": question_key,
+                    "options_key": options_key,
+                    "answer_key": answer_key,
+                    "answer_cue": answer_cue,
+                    "batch_size": self.batch_size,
+                    "max_tokens": self.max_tokens,
+                    "readout": self.readout,
+                    "label_fn": getattr(label_fn, "__name__", None)
+                    if label_fn is not None
+                    else "default",
+                },
+            },
+        )
+        artifact.validate()
+        return artifact
+
+    def fit_on_features(
+        self,
+        artifact: CETTRows,
+        options_key: str = "options",
+        top_k: Optional[int] = None,
+    ) -> "HProbes":
+        """Variance selection + split + L1 probe on cached rows (#26).
+
+        Bit-identical to the tail of :meth:`fit` for the same inputs.
+        ``top_k`` overrides the constructor setting for this refit only, so
+        variant sweeps share one artifact.
+        """
+        artifact.validate()
+        valid_prompts = artifact.prompts
+        valid_gt = artifact.ground_truth
+        per_sample = artifact.per_sample
+        valid_samples = artifact.samples
+        row_to_sample = artifact.row_to_sample
+
+        override = self.top_k if top_k is None else top_k
+        resolved_top_k = min(override, self._n_features) if override > 0 else self._n_features
 
         n_valid = len(valid_prompts)
         self.accuracy_ = sum(p["is_correct"] for p in per_sample) / n_valid if n_valid > 0 else 0.0
@@ -742,15 +773,14 @@ class HProbes:
                 print(
                     f"  WARNING: resolved top_k={resolved} is aggressive — fewer samples raise it."
                 )
-            top_k = min(resolved, self._n_features) if resolved > 0 else self._n_features
+            resolved_top_k = min(resolved, self._n_features) if resolved > 0 else self._n_features
 
         # --- Variance pre-selection ---
-        feature_var = self._welford_M2 / max(self._welford_n - 1, 1)
-        self._top_k_idx = np.argsort(feature_var)[-top_k:]
+        feature_var = artifact.variance()
+        self._top_k_idx = np.argsort(feature_var)[-resolved_top_k:]
 
-        X = np.stack([v[self._top_k_idx] for v in cett_raw], axis=0)
-        del cett_raw
-        y = np.array(train_labels)
+        X = artifact.rows[:, self._top_k_idx]
+        y = np.array(artifact.labels)
 
         # --- Train/val split at sample level ---
         # Ground-truth correctness labels per sample (for stratification)
@@ -854,6 +884,57 @@ class HProbes:
             print(f"[hprobes] Top layers: {top}")
 
         return self
+
+    def fit(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        prompt_fn: Optional[Callable[[Dict], str]] = None,
+        answer_cue: str = "\n\nAnswer:",
+        label_fn: Optional[Callable[[str, str, Dict], int]] = None,
+    ) -> "HProbes":
+        """Discover H-Neurons from MCQ samples.
+
+        Parameters
+        ----------
+        samples : list of dict
+            Each dict should contain at minimum a question and a ground-truth answer.
+            For MCQ: {"question": "...", "options": {"A": "...", ...}, "answer": "A"}
+        question_key : str
+            Key for the question text in each sample dict. Default "question".
+        options_key : str
+            Key for the options dict in each sample dict. Default "options".
+        answer_key : str
+            Key for the ground-truth answer letter in each sample dict. Default "answer".
+        prompt_fn : callable, optional
+            Custom function that takes a sample dict and returns a formatted string.
+            If None, uses tokenizer.apply_chat_template() with MCQ formatting.
+        answer_cue : str
+            String appended to every prompt to elicit a single-letter answer.
+            Default "\\n\\nAnswer:".
+        label_fn : callable, optional
+            Custom labeling function (predicted, ground_truth, sample) -> int (0 or 1).
+            If None, uses default hallucination labeling: 1 if incorrect, 0 if correct.
+            For control probes, pass a custom function, e.g.:
+            - Answer letter control: lambda pred, gt, s: 1 if pred == "A" else 0
+            - Domain control: lambda pred, gt, s: 1 if s.get("subject") == "Anatomy" else 0
+
+        Returns
+        -------
+        self
+        """
+        artifact = self.extract_features(
+            samples,
+            question_key=question_key,
+            options_key=options_key,
+            answer_key=answer_key,
+            prompt_fn=prompt_fn,
+            answer_cue=answer_cue,
+            label_fn=label_fn,
+        )
+        return self.fit_on_features(artifact, options_key=options_key)
 
     def fit_from_responses(
         self,

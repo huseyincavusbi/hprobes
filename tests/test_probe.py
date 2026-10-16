@@ -964,3 +964,43 @@ class TestReadoutModes:
             rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
             assert rows
             assert all("generated" in row for row in rows)
+
+
+class TestExtractRefitEquivalence:
+    """Issue #26: split path (extract + refit) reproduces inline fit exactly."""
+
+    def _pair(self):
+        a = HProbes(MODEL, TOK, l1_C=10)
+        a.fit(SAMPLES, options_key="options", answer_key="answer")
+        b = HProbes(MODEL, TOK, l1_C=10)
+        art = b.extract_features(SAMPLES, options_key="options", answer_key="answer")
+        b.fit_on_features(art, options_key="options")
+        return a, b, art
+
+    def test_split_matches_inline_outcomes(self):
+        a, b, _ = self._pair()
+        assert a.h_neurons_ == b.h_neurons_
+        assert a.accuracy_ == pytest.approx(b.accuracy_)
+        assert a.n_neurons_ == b.n_neurons_
+        np.testing.assert_array_equal(a._top_k_idx, b._top_k_idx)
+        np.testing.assert_allclose(a._clf.coef_, b._clf.coef_)
+        assert a._predictions_ == b._predictions_
+
+    def test_top_k_override_only_reselects(self):
+        _, b, art = self._pair()
+        c = HProbes(MODEL, TOK, l1_C=10)
+        c.extract_features(SAMPLES, options_key="options", answer_key="answer")
+        c.fit_on_features(art, options_key="options", top_k=50)
+        assert len(c._top_k_idx) == 50
+        assert c.is_fitted_
+
+    def test_artifact_key_stable_across_extractions(self):
+        from hprobes.rows import rows_key
+
+        _, _, art = self._pair()
+        b = HProbes(MODEL, TOK, l1_C=10)
+        art2 = b.extract_features(SAMPLES, options_key="options", answer_key="answer")
+        cfg = dict(art.meta["config"])
+        assert rows_key(art.meta["model_fp"], art.samples, cfg) == rows_key(
+            art2.meta["model_fp"], art2.samples, cfg
+        )
