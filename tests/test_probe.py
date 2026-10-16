@@ -1046,3 +1046,12 @@ class TestResponseRefitEquivalence:
         c = HProbes(MODEL, TOK, l1_C=10)
         with pytest.raises(ValueError, match="live-path"):
             c.fit_on_features(art_resp)
+
+    def test_fresh_probe_refit_matches(self):
+        a, _, art = TestExtractRefitEquivalence()._pair()
+        c = HProbes(MODEL, TOK, l1_C=10)
+        assert c._n_features == 0
+        c.fit_on_features(art, options_key="options")
+        assert c.h_neurons_ == a.h_neurons_
+        assert c.accuracy_ == pytest.approx(a.accuracy_)
+        np.testing.assert_allclose(c._clf.coef_, a._clf.coef_)

@@ -631,6 +631,33 @@ class HProbes:
             self._layer_offsets[layer] = offset
             offset += self._layer_dims[layer]
 
+    def _ensure_layout_from_artifact(self, artifact: "CETTRows") -> None:
+        """Restore the feature layout from artifact meta on setup-less probes (#26).
+
+        A fresh probe refitting cached rows never ran extraction setup, so
+        ``_n_features`` is 0 and flat-index mapping has no offsets. The
+        layout is fully determined by the artifact (layers + per-layer dims
+        recorded at extraction); restore it and verify the row width matches.
+        """
+        if self._n_features:
+            return
+        try:
+            layers = list(artifact.meta["layers"])
+            layer_dims = {int(k): int(v) for k, v in artifact.meta["layer_dims"].items()}
+        except KeyError as e:
+            raise ValueError(f"artifact lacks layout meta ({e}); re-extract rows") from e
+        if artifact.rows.shape[1] != sum(layer_dims.values()):
+            raise ValueError("artifact row width disagrees with recorded layout")
+        self._layers = layers
+        self._layer_dims = layer_dims
+        self._n_features = sum(layer_dims.values())
+        self._intermediate_dim = layer_dims[layers[0]]
+        self._layer_offsets = {}
+        offset = 0
+        for layer in layers:
+            self._layer_offsets[layer] = offset
+            offset += layer_dims[layer]
+
     def _flat_to_layer_neuron(self, flat_idx: int) -> Optional[Tuple[int, int]]:
         """Map a flat CETT index to ``(layer, neuron)`` using per-layer offsets."""
         for layer in self._layers:
@@ -703,6 +730,7 @@ class HProbes:
             meta={
                 "mode": "live",
                 "layers": list(self._layers),
+                "layer_dims": {str(k): int(v) for k, v in self._layer_dims.items()},
                 "n_features": self._n_features,
                 "model_fp": fingerprint_model(self.model, self._layers),
                 "config": {
@@ -737,6 +765,7 @@ class HProbes:
         artifact.validate()
         if artifact.meta.get("mode", "live") != "live":
             raise ValueError("fit_on_features requires live-path rows")
+        self._ensure_layout_from_artifact(artifact)
         valid_prompts = artifact.prompts
         valid_gt = artifact.ground_truth
         per_sample = artifact.per_sample
@@ -1152,6 +1181,7 @@ class HProbes:
                 "aggregation": aggregation,
                 "n_answer_rows": n_answer,
                 "layers": list(self._layers),
+                "layer_dims": {str(k): int(v) for k, v in self._layer_dims.items()},
                 "n_features": self._n_features,
                 "model_fp": fingerprint_model(self.model, self._layers),
                 "config": {
@@ -1180,6 +1210,7 @@ class HProbes:
         artifact.validate()
         if artifact.meta.get("mode") != "dual-span":
             raise ValueError("fit_on_response_features requires dual-span rows")
+        self._ensure_layout_from_artifact(artifact)
         valid_prompts = artifact.prompts
         valid_gt = artifact.ground_truth
         per_sample = artifact.per_sample
