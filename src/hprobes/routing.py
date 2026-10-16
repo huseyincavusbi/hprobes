@@ -15,7 +15,12 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
-__all__ = ["routing_stats"]
+__all__ = [
+    "routing_stats",
+    "match_donors",
+    "dose_rows",
+    "frequency_sampled_experts",
+]
 
 
 def _stack_tables(tables: Sequence[torch.Tensor], what: str) -> np.ndarray:
@@ -193,3 +198,71 @@ def routing_stats(
         "jaccard": jaccard,
         "gate_entropy": gate_entropy,
     }
+
+
+def match_donors(
+    labels: Sequence[int],
+    lengths: Sequence[int],
+    entropies: Sequence[float],
+) -> Dict[int, int]:
+    """Nearest opposite-label donor per sample (#42 standard 3).
+
+    Donor = argmin over samples of the opposite label of
+    ``(|length diff|, |entropy diff|, index)`` -- a documented proxy for
+    question difficulty (option count is already fixed per dataset here;
+    extend the key when datasets mix option counts). Samples without any
+    opposite-label candidate are simply absent from the result.
+    """
+    donors: Dict[int, int] = {}
+    for i, lab in enumerate(labels):
+        best: Optional[int] = None
+        best_key = None
+        for j, lab_j in enumerate(labels):
+            if j == i or lab_j == lab:
+                continue
+            key = (abs(lengths[j] - lengths[i]), abs(entropies[j] - entropies[i]), j)
+            if best_key is None or key < best_key:
+                best, best_key = j, key
+        if best is not None:
+            donors[i] = int(best)
+    return donors
+
+
+def dose_rows(
+    own_experts: Sequence[int],
+    own_weights: Sequence[float],
+    donor_experts: Sequence[int],
+    donor_weights: Sequence[float],
+    dose: int,
+) -> tuple:
+    """Replace the first ``dose`` routing slots with the donor's (#42 standard 1).
+
+    Dose is capped at the row length (top-k). ``dose >= k`` is a full routing
+    takeover; ``dose == 0`` is a no-op returning the own row unchanged.
+    """
+    k = len(own_experts)
+    d = max(0, min(int(dose), k))
+    experts = list(donor_experts[:d]) + list(own_experts[d:])
+    weights = list(donor_weights[:d]) + list(own_weights[d:])
+    return experts, weights
+
+
+def frequency_sampled_experts(usage: Dict[int, float], dose: int, k: int, seed: int) -> List[int]:
+    """``dose`` distinct experts drawn by empirical usage frequency (#42 standard 4-c).
+
+    The random control draws from exactly the experts that were ever routed
+    (positive usage), weighted by their usage counts -- frequency-matched by
+    construction. Deterministic for a fixed ``seed``.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    exp_ids = sorted(usage)
+    counts = np.array([usage[e] for e in exp_ids], dtype=np.float64)
+    total = counts.sum()
+    if total <= 0 or dose <= 0:
+        return []
+    probs = counts / total
+    rng = np.random.default_rng(seed)
+    d = min(int(dose), len(exp_ids))
+    picked = rng.choice(len(exp_ids), size=d, replace=d > len(exp_ids), p=probs)
+    return [int(exp_ids[p]) for p in picked]
