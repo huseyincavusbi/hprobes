@@ -127,6 +127,10 @@ class MoECapture:
         # wrapped forward rescales the target expert's activation rows --
         # only where the expert was actually routed -- before down_proj.
         self._intervention: Optional[Dict[str, Any]] = None
+        # Counterfactual routing state (#42): when set, the wrapped forward
+        # replaces the router's decisions (experts + gates) at the given
+        # token positions before anything consumes them.
+        self._routing_override: Optional[Dict[str, Any]] = None
 
     def attach(self, experts_module: torch.nn.Module) -> torch.utils.hooks.RemovableHandle:
         """Wrap the experts module forward to capture per-expert activations.
@@ -145,6 +149,16 @@ class MoECapture:
         original_forward = experts_module.forward
 
         def wrapped_forward(self_mod, hidden_states, top_k_index, top_k_weights):
+            # Counterfactual routing (#42): swap the router's decisions at
+            # the requested positions before any consumer sees them.
+            ov = cap._routing_override
+            if ov is not None:
+                top_k_index = top_k_index.clone()
+                top_k_weights = top_k_weights.clone()
+                pos = ov["positions"].to(top_k_index.device)
+                top_k_index[pos] = ov["experts"].to(top_k_index.device)
+                if ov["weights"] is not None:
+                    top_k_weights[pos] = ov["weights"].to(top_k_weights.device)
             # Seed routing context: record_expert reads it per expert below.
             cap._ctx = {
                 "top_k_index": top_k_index.detach(),
@@ -248,6 +262,39 @@ class MoECapture:
 
     def clear_intervention(self) -> None:
         self._intervention = None
+
+    def set_routing_override(
+        self,
+        positions: List[int],
+        experts: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Force router decisions at chosen token positions (#42).
+
+        ``experts`` is ``(n_positions, k)`` forced expert indices (same ``k``
+        as the model's top-k); ``weights`` optionally overrides the gates for
+        those slots (default: keep the sample's own gates). Positions index
+        the flattened token dimension the experts module receives. Effective
+        routing (overridden values) is what ``routing_table()`` reports.
+        """
+        pos = torch.as_tensor(positions, dtype=torch.long)
+        exp = torch.as_tensor(experts, dtype=torch.long)
+        if exp.dim() != 2 or exp.shape[0] != pos.numel():
+            raise ValueError(
+                "experts must be (n_positions, k); got "
+                f"{tuple(exp.shape)} for {pos.numel()} positions"
+            )
+        w = None
+        if weights is not None:
+            w = torch.as_tensor(weights, dtype=torch.float)
+            if w.shape != exp.shape:
+                raise ValueError(
+                    f"weights shape {tuple(w.shape)} must match experts {tuple(exp.shape)}"
+                )
+        self._routing_override = {"positions": pos, "experts": exp, "weights": w}
+
+    def clear_routing_override(self) -> None:
+        self._routing_override = None
 
     def routing_table(self) -> torch.Tensor:
         """Per-token selected experts from the last forward: (T, top_k)."""
