@@ -1673,6 +1673,87 @@ class HProbes:
         self._counterfactual_routing = result
         return result
 
+    def moe_routing_analysis(
+        self,
+        samples: List[Dict],
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        layers: Optional[List[int]] = None,
+        n_perm: int = 200,
+        seed: int = 0,
+    ) -> Dict[str, Any]:
+        """Routing vs correctness statistics (+ CETT cross-check if fitted).
+
+        One baseline forward per sample; records decision-token routing and
+        gate weights; compares correct vs incorrect via
+        :func:`hprobes.routing.routing_stats`. When ``fit_moe`` was run
+        first, appends ``cett_cross_check``: overlap between routing-flagged
+        experts and the experts hosting CETT-selected neurons (#42 vs #41).
+        """
+        from .cett import _get_transformer_layers
+        from .moe import MoECapture
+        from .routing import cett_routing_overlap, routing_stats
+
+        import torch as _t
+
+        blocks = _get_transformer_layers(self.model)
+        if layers is None:
+            layers = list(range(len(blocks)))
+        self._layers = list(layers)
+        self._letter_ids = self._get_letter_ids()
+        self._answer_cue = "\n\nAnswer:"
+        device = next(self.model.parameters()).device
+
+        captures = {}
+        handles = []
+        for li in self._layers:
+            experts_mod = blocks[li].mlp.experts
+            cap = MoECapture(num_experts=int(experts_mod.down_proj.shape[0]), layer=li)
+            handles.append(cap.attach(experts_mod))
+            captures[li] = cap
+
+        routings: List[Any] = []
+        gates: List[Any] = []
+        labels: List[int] = []
+        try:
+            for sample in samples:
+                prompt = self._format_moe_prompt(sample, question_key, options_key)
+                full = self._tokenize(prompt + self._answer_cue)
+                prompt_enc = self._tokenize(prompt)
+                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                for cap in captures.values():
+                    cap.clear_records()
+                with _t.no_grad():
+                    out = self.model(full["input_ids"].to(device))
+                pred = self._predict_letter(out.logits[0, decision_pos, :])
+                gt = self._moe_gt_letter(sample, options_key, answer_key)
+                if pred is None or gt is None:
+                    continue
+                labels.append(0 if self._moe_letter_match(pred, gt) else 1)
+                routings.append(
+                    _t.stack([captures[li].routing_table()[decision_pos] for li in self._layers])
+                )
+                gates.append(
+                    _t.stack([captures[li].gate_table()[decision_pos] for li in self._layers])
+                )
+        finally:
+            for h in handles:
+                h.remove()
+
+        if not routings:
+            raise ValueError("no valid samples — routing analysis produced zero rows")
+        n_experts = max(int(r.max()) for r in routings) + 1
+        stats = routing_stats(
+            routings, np.array(labels), gates=gates, n_experts=n_experts, n_perm=n_perm, seed=seed
+        )
+        moe = getattr(self, "moe_", None)
+        if moe and moe.get("feature_names"):
+            names = [moe["feature_names"][j] for j in moe.get("selected", [])]
+            stats["cett_cross_check"] = cett_routing_overlap(names, stats)
+        self._moe_routing_analysis = stats
+        return stats
+
     @staticmethod
     def _moe_decision_features(
         captures, decision_pos: int

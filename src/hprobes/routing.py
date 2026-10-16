@@ -20,6 +20,7 @@ __all__ = [
     "match_donors",
     "dose_rows",
     "frequency_sampled_experts",
+    "cett_routing_overlap",
 ]
 
 
@@ -266,3 +267,59 @@ def frequency_sampled_experts(usage: Dict[int, float], dose: int, k: int, seed: 
     d = min(int(dose), len(exp_ids))
     picked = rng.choice(len(exp_ids), size=d, replace=d > len(exp_ids), p=probs)
     return [int(exp_ids[p]) for p in picked]
+
+
+def _parse_expert_name(name: str) -> Optional[tuple]:
+    """Parse a fit_moe feature name ``L{layer}:E{expert}:N{neuron}``."""
+    parts = name.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        if parts[0][0] != "L" or parts[1][0] != "E" or parts[2][0] != "N":
+            return None
+        return int(parts[0][1:]), int(parts[1][1:])
+    except (ValueError, IndexError):
+        return None
+
+
+def cett_routing_overlap(
+    cett_feature_names: Sequence[str], stats: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Cross-check CETT-selected experts against routing-flagged experts (#42).
+
+    ``cett_feature_names`` are the ``selected`` feature names from
+    ``fit_moe``'s probe (``L{layer}:E{expert}:N{neuron}``); ``stats`` is the
+    ``routing_stats`` output. Agreement = routing-flagged experts hosting
+    CETT-selected neurons -- overlap above chance argues routing and neurons
+    capture the same signal; low overlap argues dissociation.
+    """
+    cett_experts = set()
+    for name in cett_feature_names:
+        parsed = _parse_expert_name(str(name))
+        if parsed is not None:
+            cett_experts.add(parsed)
+    flagged = set()
+    per_layer = []
+    for layer_row in stats.get("per_layer", []):
+        layer = int(layer_row["layer"])
+        layer_flagged = {int(f["expert"]) for f in layer_row.get("top_flagged", [])}
+        flagged.update((layer, e) for e in layer_flagged)
+        layer_cett = {e for (li, e) in cett_experts if li == layer}
+        layer_overlap = layer_cett & layer_flagged
+        per_layer.append(
+            {
+                "layer": layer,
+                "n_cett_experts": len(layer_cett),
+                "n_routing_flagged": len(layer_flagged),
+                "n_overlap": len(layer_overlap),
+            }
+        )
+    overlap = sorted(cett_experts & flagged)
+    union = cett_experts | flagged
+    return {
+        "n_cett_experts": len(cett_experts),
+        "n_routing_flagged": len(flagged),
+        "overlap": [[li, e] for li, e in overlap],
+        "jaccard": len(overlap) / len(union) if union else 0.0,
+        "per_layer": per_layer,
+    }
