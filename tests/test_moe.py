@@ -245,3 +245,91 @@ class TestMoESparseDataset:
         norms = out["token_norms"]
         assert float(norms[0]) == 2.0
         assert float(norms[1]) == 6.0
+
+
+class TestMoEProbeFit:
+    """Fitting-level gates: signal recovery, null behavior, routing control."""
+
+    @staticmethod
+    def _artifact(n=60, seed=0):
+        import numpy as np
+
+        from hprobes.moe import _MoEFeatures
+
+        rng = np.random.default_rng(seed)
+        feats, routings, labels = [], [], []
+        for i in range(n):
+            y = i % 2
+            labels.append(y)
+            # planted: expert 0 neuron 0 fires MORE on incorrect samples (y=1),
+            # matching the H-Neuron convention (positive coef = error signal)
+            acts = rng.normal(size=(6, 2)).astype("float32")
+            acts[0, 0] = (2.0 if y == 1 else -2.0) + rng.normal(scale=0.3)
+            acts[1, 0] = rng.normal(size=2).astype("float32")[0]
+            feats.append(
+                {
+                    (0, 0): ([0], torch.tensor([acts[0]], dtype=torch.float), torch.tensor([0.9])),
+                    (0, 1): ([0], torch.tensor([acts[1]], dtype=torch.float), torch.tensor([0.5])),
+                }
+            )
+            routings.append(torch.tensor([[0, 1] if y == 0 else [1, 0]]))
+        return _MoEFeatures(
+            feats=feats,
+            routings=routings,
+            labels=np.array(labels),
+            prompts=[f"p{i}" for i in range(n)],
+            per_sample=[{"is_correct": bool(i % 2 == 0)} for i in range(n)],
+            capture_meta={
+                "layers": [0],
+                "num_experts": 2,
+                "score": "mean_abs",
+                "per_expert_top_n": 8,
+                "top_k": 16,
+                "min_active": 1,
+            },
+        )
+
+    def test_design_is_sparse_and_shaped(self):
+        from hprobes.moe import _design_from_features
+
+        art = self._artifact()
+        X, design = _design_from_features(
+            art, top_k=16, per_expert_top_n=8, score="mean_abs", min_active=1
+        )
+        assert X.shape == (60, len(design["feature_index"]))
+        # structural sparsity: features of an inactive expert are exactly zero,
+        # so each sample fires at most its per-expert picks (2 experts x picks)
+        picks = design["feature_index"]
+        per_expert = {}
+        for key, _ in picks:
+            per_expert[key] = per_expert.get(key, 0) + 1
+        max_fired = picks and (2 * max(per_expert.values()))
+        assert ((X != 0).sum(axis=1) <= max_fired).all()
+
+    def test_probe_recovers_planted_signal(self):
+        from hprobes.moe import fit_moe_probe
+
+        art = self._artifact()
+        r = fit_moe_probe(art, l1_C=1.0, seed=0)
+        assert r["n_selected"] > 0
+        names = [r["feature_names"][j] for j in r["selected"]]
+        assert any(n.startswith("L0:E0:") for n in names), names
+        assert r["perm_p"] < 0.05
+
+    def test_permutation_null_on_random_labels_is_not_significant(self):
+        from hprobes.moe import fit_moe_probe
+
+        art = self._artifact()
+        art.labels = np.random.default_rng(1).permutation(art.labels)
+        r = fit_moe_probe(art, l1_C=1.0, seed=0)
+        assert r["perm_p"] > 0.05
+
+    def test_routing_baseline_shape_and_columns(self):
+        from hprobes.moe import fit_moe_probe
+
+        art = self._artifact()
+        r = fit_moe_probe(art, routing_only=True, seed=0)
+        assert r["n_features"] == 2  # (layer0, expert0), (layer0, expert1)
+        assert set(r["feature_names"]) == {"L0:E0", "L0:E1"}
+        # routed indicator mirrors the planted routing
+        assert r["kind"] == "routing_only"
