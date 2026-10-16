@@ -23,7 +23,7 @@ shared by Olmoe/Qwen2Moe/Qwen3.5MoE/DeepSeek-style blocks in transformers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -213,3 +213,141 @@ class MoECapture:
     def summary(self) -> List[Dict[str, Any]]:
         """Per-(layer, expert) sketch statistics."""
         return self.sketch.summary()
+
+
+class MoESparseDataset:
+    """Two-stage feature selection and sparse row assembly for MoE probes.
+
+    Stage 1: per-expert neuron candidates, ranked within each expert by the
+    chosen score (variance or gate-weighted cumulative |activation|), floored
+    by ``n_active >= min_active`` to drop statistically-starved experts.
+    Stage 2: global top-k across all (layer, expert, neuron) candidates.
+    Rows are then assembled sparse: a token contributes values only for its
+    active experts' selected neurons; everything else is a structural zero.
+    """
+
+    def __init__(
+        self,
+        captures: List["MoECapture"],
+        score: str = "mean_abs",
+        per_expert_top_n: int = 64,
+        top_k: int = 2000,
+        min_active: int = 0,
+        gate_weighted: bool = True,
+        col_norms: Optional[Dict[Tuple[int, int], torch.Tensor]] = None,
+    ):
+        if score not in ("variance", "mean_abs"):
+            raise ValueError(f"score must be 'variance' or 'mean_abs', got {score!r}")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if per_expert_top_n <= 0:
+            raise ValueError("per_expert_top_n must be positive")
+        self.captures = captures
+        self.score = score
+        self.per_expert_top_n = per_expert_top_n
+        self.top_k = top_k
+        self.min_active = min_active
+        self.gate_weighted = gate_weighted
+        self.col_norms = col_norms or {}
+        self.features_: List[Dict[str, Any]] = []
+
+    def _expert_score(self, mean_abs: float, variance: float) -> float:
+        return variance if self.score == "variance" else mean_abs
+
+    def resolve_features(self) -> List[Dict[str, Any]]:
+        """Two-stage selection over all captures; returns the chosen features."""
+        candidates: List[Dict[str, Any]] = []
+        for cap in self.captures:
+            layer = cap.layer
+            for expert, slot in enumerate(cap.sketch.ensure_layer(layer)):
+                n = slot["n"]
+                if n == 0 or n < self.min_active or slot["mean"] is None:
+                    continue
+                mean = slot["mean"]
+                var = slot["M2"] / max(n - 1, 1)
+                mean_abs = mean.abs()
+                if self.score == "variance":
+                    ranking = var
+                else:
+                    ranking = mean_abs
+                k = min(self.per_expert_top_n, ranking.numel())
+                top_idx = torch.topk(ranking, k).indices.tolist()
+                gate_mean = slot["gate_sum"] / n
+                for neuron in top_idx:
+                    candidates.append(
+                        {
+                            "layer": layer,
+                            "expert": expert,
+                            "neuron": neuron,
+                            "expert_n_active": n,
+                            "expert_mean_abs": float(mean_abs.mean()),
+                            "expert_var_mean": float(var.mean()),
+                            "gate_mean": gate_mean,
+                            "score": float(ranking[neuron]),
+                        }
+                    )
+        candidates.sort(key=lambda c: (-c["score"], c["layer"], c["expert"], c["neuron"]))
+        self.features_ = candidates[: self.top_k]
+        return self.features_
+
+    def assemble_rows(self) -> Dict[str, Any]:
+        """Sparse per-token rows over the resolved features (single forward pass).
+
+        For every token, a feature fires only where its expert was selected;
+        the value is ``gate x activation`` (gate_weighted) or the raw
+        activation. Returns a CSR-style bundle: dense ``rows`` for tests,
+        plus CSR arrays for scalable consumers.
+        """
+        if not self.features_:
+            self.resolve_features()
+        by_layer_expert: Dict[Tuple[int, int], List[int]] = {}
+        for fi, feat in enumerate(self.features_):
+            by_layer_expert.setdefault((feat["layer"], feat["expert"]), []).append(fi)
+
+        # routing tables are per-capture (per layer); token count from the first.
+        first = self.captures[0]
+        n_tokens = int(first.routing_table().shape[0])
+        rows = torch.zeros(n_tokens, len(self.features_))
+        for cap in self.captures:
+            for rec in cap.records:
+                key = (cap.layer, rec["expert"])
+                fids = by_layer_expert.get(key)
+                if not fids:
+                    continue
+                for row_pos in range(rec["tokens"].shape[0]):
+                    tok = int(rec["tokens"][row_pos])
+                    if tok >= n_tokens:
+                        continue
+                    val_base = rec["acts"][row_pos].float()
+                    if self.gate_weighted:
+                        val_base = val_base * float(rec["gates"][row_pos])
+                    for fi in fids:
+                        neuron = self.features_[fi]["neuron"]
+                        rows[tok, fi] = float(val_base[neuron])
+        # CSR arrays for scalable consumers
+        nz = (rows != 0).nonzero(as_tuple=False)
+        csr = {
+            "indptr": torch.zeros(n_tokens + 1, dtype=torch.long),
+            "indices": nz[:, 1] if nz.numel() else torch.zeros(0, dtype=torch.long),
+            "data": rows[nz[:, 0], nz[:, 1]] if nz.numel() else torch.zeros(0),
+        }
+        counts = torch.zeros(n_tokens + 1, dtype=torch.long)
+        counts[1:] = (rows != 0).sum(dim=1)
+        csr["indptr"] = torch.cumsum(counts, dim=0)
+        token_norms = (
+            torch.stack([self._token_norms_for(cap) for cap in self.captures], dim=1).sum(dim=1)
+            if self.captures
+            else torch.zeros(n_tokens)
+        )
+        return {"rows": rows, "csr": csr, "token_norms": token_norms}
+
+    @staticmethod
+    def _token_norms_for(cap: "MoECapture") -> torch.Tensor:
+        norms = cap.__dict__.get("_token_norm")
+        if norms is None:
+            ctx = cap.__dict__.get("_ctx")
+            norms = ctx.get("token_norm") if isinstance(ctx, dict) else None
+        if norms is None:
+            r = cap.routing_table()
+            return torch.zeros(r.shape[0])
+        return norms.float()

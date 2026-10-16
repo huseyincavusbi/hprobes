@@ -134,3 +134,114 @@ class TestMoECapture:
         except TypeError:
             return  # missing routing args: family contract not met
         raise AssertionError("expected TypeError for non-MoE contract")
+
+
+class _Recorder:
+    """Lightweight capture double: no model, direct records."""
+
+    def __init__(self, layer, num_experts, n_tokens):
+        self.layer = layer
+        self.num_experts = num_experts
+        self.records = []
+        self._n_tokens = n_tokens
+        self._routing = None
+        self._gates = None
+        self.sketch = MoESketch(num_experts=num_experts)
+        self._token_norm = None
+
+    def routing_table(self):
+        return self._routing
+
+    def gate_table(self):
+        return self._gates
+
+    def set_routing(self, routing, gates):
+        self._routing = routing
+        self._gates = gates
+
+    def add_record(self, expert, tokens, gates, acts):
+        acts_t = torch.as_tensor(acts, dtype=torch.float)
+        gates_t = torch.tensor(gates, dtype=torch.float) if not torch.is_tensor(gates) else gates
+        self.sketch.update(self.layer, expert, acts_t, gates_t)
+        self.records.append(
+            {
+                "layer": self.layer,
+                "expert": expert,
+                "tokens": torch.tensor(tokens),
+                "slots": torch.zeros(len(tokens), dtype=torch.long),
+                "gates": gates_t,
+                "token_norm": torch.ones(len(tokens)),
+                "acts": acts_t,
+            }
+        )
+
+    def _ctx(self):
+        return {}
+
+
+class TestMoESparseDataset:
+    def _setup(self, score="mean_abs"):
+        cap = _Recorder(layer=0, num_experts=2, n_tokens=4)
+        cap.set_routing(
+            torch.tensor([[0, 1], [0, 1], [1, 0], [0, 1]]),
+            torch.tensor([[0.6, 0.4], [0.6, 0.4], [0.7, 0.3], [0.5, 0.5]]),
+        )
+        # expert 0 active on tokens [0,1,3] (slot 0) and [2] (slot 1)
+        cap.add_record(0, [0, 1, 3], [0.6, 0.6, 0.5], [[2.0, 0.0], [4.0, 1.0], [6.0, 2.0]])
+        cap.add_record(1, [0, 1, 2], [0.4, 0.4, 0.3], [[1.0, 1.0], [3.0, 2.0], [5.0, 4.0]])
+        return cap
+
+    def test_selection_scores_and_budget(self):
+        from hprobes.moe import MoESparseDataset
+
+        cap = self._setup()
+        ds = MoESparseDataset(captures=[cap], per_expert_top_n=2, top_k=4)
+        feats = ds.resolve_features()
+        assert len(feats) == 4
+        # stage-1 keeps only top-2 neurons per expert
+        assert sum(1 for f in feats if f["expert"] == 0) == 2
+
+    def test_min_active_floor_drops_rare_experts(self):
+        from hprobes.moe import MoESparseDataset
+
+        cap = _Recorder(layer=0, num_experts=2, n_tokens=3)
+        cap.set_routing(torch.tensor([[0], [0], [1]]), torch.ones(3, 1))
+        cap.add_record(0, [0, 1], [1.0, 1.0], [[1.0], [2.0]])
+        cap.add_record(1, [2], [1.0], [[9.0]])
+        ds = MoESparseDataset(captures=[cap], per_expert_top_n=4, top_k=10, min_active=2)
+        feats = ds.resolve_features()
+        assert all(f["expert"] == 0 for f in feats)
+
+    def test_gate_weighted_values_and_structural_zeros(self):
+        from hprobes.moe import MoESparseDataset
+
+        cap = self._setup()
+        ds = MoESparseDataset(captures=[cap], per_expert_top_n=1, top_k=10, gate_weighted=True)
+        ds.resolve_features()
+        out = ds.assemble_rows()
+        rows = out["rows"]
+        assert rows.shape == (4, len(ds.features_))
+        # expert-0 top neuron; token 0 value = gate 0.6 * activation of that neuron
+        f0 = next(f for f in ds.features_ if f["expert"] == 0)
+        expected = 0.6 * float(
+            torch.as_tensor([[2.0, 0.0], [4.0, 1.0], [6.0, 2.0]])[0, f0["neuron"]]
+        )
+        fi = ds.features_.index(f0)
+        assert abs(float(rows[0, fi]) - expected) < 1e-6
+        # expert-1 features are zero on token 3 (expert 1 routed only to 0,1,2)
+        f1s = [i for i, f in enumerate(ds.features_) if f["expert"] == 1]
+        assert all(float(rows[3, i]) == 0.0 for i in f1s)
+
+    def test_contribution_normalization_uses_total_write(self):
+        from hprobes.moe import MoESparseDataset
+
+        cap = _Recorder(layer=0, num_experts=1, n_tokens=2)
+        cap.set_routing(torch.tensor([[0], [0]]), torch.ones(2, 1))
+        cap.add_record(0, [0, 1], [1.0, 1.0], [[1.0], [3.0]])
+        cap._token_norm = torch.tensor([2.0, 6.0])  # explicit override
+        ds = MoESparseDataset(captures=[cap], per_expert_top_n=1, top_k=1)
+        ds.resolve_features()
+        out = ds.assemble_rows()
+        norms = out["token_norms"]
+        assert float(norms[0]) == 2.0
+        assert float(norms[1]) == 6.0
