@@ -1268,6 +1268,8 @@ class TestMoeWriteNorms:
         assert _mlp_write_norms(x).shape == (6,)
         assert _mlp_write_norms((x, None)).shape == (6,)
         assert torch.equal(_mlp_write_norms(x), _mlp_write_norms((x, None)))
+
+
 class TestStabilityNJobs:
     """Issue #48: bootstrap concurrency is scheduling-only (identical outcomes)."""
 
@@ -1314,30 +1316,24 @@ class TestStabilityNJobs:
         assert one == two
 
 
-
 class TestStabilityThreadingEngine:
-    """Issue #48 engine: shared-memory threads, one BLAS thread per worker."""
+    """Issue #48: concurrency must stay deterministic at real fit sizes too.
 
-    def test_parallel_uses_threading_backend(self, monkeypatch):
-        import joblib
+    The tiny-matrix tests cannot expose BLAS-level reordering (fits finish in
+    microseconds); this gate uses a matrix big enough that each fit takes real
+    milliseconds-seconds, which is where a bad engine would show drift.
+    """
 
+    @pytest.mark.slow
+    def test_determinism_at_demo_scale(self):
         from hprobes.probe import _run_stability_check
 
-        seen = {}
-
-        class FakeParallel:
-            def __init__(self, *args, **kwargs):
-                seen.update(kwargs)
-
-            def __call__(self, tasks):
-                return [f(*a, **k) for f, a, k in tasks]
-
-        monkeypatch.setattr(joblib, "Parallel", FakeParallel)
         rng = np.random.default_rng(0)
-        X = rng.normal(size=(40, 100))
-        y = (rng.random(40) < 0.5).astype(int)
-        _run_stability_check(X, y, 1.0, n_runs=2, base_seed=0, n_jobs=2)
-        assert seen.get("backend") == "threading"
+        X = rng.normal(size=(300, 20000)).astype(np.float32)
+        y = (rng.random(300) < 0.5).astype(int)
+        one = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=1)
+        two = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=2)
+        assert one == two
 
     def test_determinism_five_jobs(self):
         from hprobes.probe import _run_stability_check
@@ -1350,4 +1346,3 @@ class TestStabilityThreadingEngine:
         one = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=1)
         five = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=5)
         assert one == five
-
