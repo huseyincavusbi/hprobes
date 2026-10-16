@@ -189,3 +189,86 @@ class TestRoutingOverride:
                 weights=torch.ones(1, 3),
             )
         handle.remove()
+
+
+class TestCounterfactualRouting:
+    """#42 chunk 3: donor matching, doses, controls (five approved defaults)."""
+
+    def _probe(self):
+        import _fake_moe
+        from test_probe import TOK
+
+        from hprobes.probe import HProbes
+
+        model = _fake_moe._FakeMoEModel()
+        return HProbes(model, TOK, readout="logits")
+
+    def _samples(self, n=8):
+        # Answers alternate so both correct and incorrect samples exist under
+        # the fake model's deterministic prediction (first letter id).
+        return [{"question": f"Q{i}?", "options": ["aa", "bb"], "answer": i % 2} for i in range(n)]
+
+    def test_helper_match_donors_opposite_labels(self):
+        from hprobes.routing import match_donors
+
+        labels = [1, 0, 1, 0]
+        lengths = [10, 11, 12, 10]
+        entropies = [0.5, 0.5, 0.6, 0.5]
+        donors = match_donors(labels, lengths, entropies)
+        assert all(labels[i] != labels[d] for i, d in donors.items())
+        # For label-1 sample 0, nearest opposite is index 3 (length diff 0)
+        assert donors[0] == 3
+
+    def test_helper_dose_rows(self):
+        from hprobes.routing import dose_rows
+
+        own_e = [1, 2]
+        own_w = [0.6, 0.4]
+        donor_e = [3, 0]
+        donor_w = [0.7, 0.3]
+        e, w = dose_rows(own_e, own_w, donor_e, donor_w, dose=1)
+        assert e == [3, 2] and w == [0.7, 0.4]
+        e, w = dose_rows(own_e, own_w, donor_e, donor_w, dose=5)  # capped at k
+        assert e == [3, 0] and w == [0.7, 0.3]
+
+    def test_helper_frequency_sampled_experts_respects_usage(self):
+        from hprobes.routing import frequency_sampled_experts
+
+        usage = {0: 10.0, 1: 0.0, 2: 1.0, 3: 0.0}
+        seen = set()
+        for seed in range(20):
+            picks = frequency_sampled_experts(usage, dose=1, k=2, seed=seed)
+            seen.update(picks)
+            # only experts with positive usage may ever be drawn
+            assert all(p in (0, 2) for p in picks), picks
+        # expert 0 has 10x the usage of expert 2: it must dominate but both appear
+        assert 0 in seen and 2 in seen
+
+    def test_self_swap_is_exact_noop(self):
+        probe = self._probe()
+        result = probe.counterfactual_routing(self._samples(), layers=[0], doses=[1])
+        self_c = result["self_swap"]
+        # Default 4: self-swap must be a bit-exact no-op on prediction + entropy.
+        assert self_c["n"] > 0
+        assert self_c["flips"] == 0
+        assert self_c["max_abs_entropy_delta"] == 0.0
+
+    def test_dose_result_shape_and_controls(self):
+        probe = self._probe()
+        result = probe.counterfactual_routing(self._samples(), layers=[0], doses=[1, 2, 5])
+        assert result["donor_matches"]["n_targets"] > 0
+        doses_seen = {c["dose"] for c in result["rescue"] + result["corruption"]}
+        assert doses_seen == {1, 2}  # 5 capped to k=2, deduped
+        for c in result["rescue"] + result["corruption"] + result["random"]:
+            assert 0 <= c["flip_rate"] <= 1
+            assert 0 <= c["accuracy_after"] <= 1
+            assert c["n_targets"] > 0
+        # random controls exist for both directions
+        assert {"rescue", "corruption"} == {c["direction"] for c in result["random"]}
+
+    def test_deterministic_given_seed(self):
+        probe = self._probe()
+        a = probe.counterfactual_routing(self._samples(), layers=[0], doses=[1], seed=0)
+        b = probe.counterfactual_routing(self._samples(), layers=[0], doses=[1], seed=0)
+        assert a["rescue"] == b["rescue"]
+        assert a["random"] == b["random"]
