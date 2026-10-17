@@ -78,7 +78,11 @@ yields a ~5× denser set; probe AUROC is statistically indistinguishable
 the margins. Fit time is ~5× slower at realistic matrix sizes. **Never mix
 solvers within one comparison** (grid/table/claim) — use `solver="saga"` for
 all cells or `liblinear` for all cells; the effective solver is recorded in
-saved metadata (`config.solver_used`).
+saved metadata (`config.solver_used`). At the default tolerance (`tol=1e-4`),
+saga may exhaust `max_iter=1000` and emit a `ConvergenceWarning` while still
+returning an approximately-equal solution — a budget limit of the optimizer,
+not a failure (no int32 ceiling exists on saga's path); budget tuning is
+deferred until real above-ceiling (2³¹ units) runs provide evidence.
 
 ### 4. Causal Validation
 
