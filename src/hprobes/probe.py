@@ -146,6 +146,57 @@ _DEFAULT_AUTO_OVERHEAD_BYTES = 400 * 1024 * 1024  # interpreter/tokenizer slack
 _FIT_PEAK_CALIBRATION = 2.5
 
 
+# sklearn's liblinear wrapper casts element counts to 32-bit ints; element
+# counts (nonzeros for dense input, nnz for sparse) above this ceiling raise
+# OverflowError instead of silently truncating (#47).
+_LIBLINEAR_INT32_CEILING = 2**31 - 1
+
+
+def _liblinear_units(X) -> int:
+    """Element count sklearn's liblinear casts to int32 for ``X`` (#47).
+
+    Sparse: ``X.nnz``. Dense: the matrix size is returned without a scan
+    when it is at or below the ceiling (the nonzero count cannot exceed the
+    size, so the bound is safe); above it the exact nonzero count is
+    computed.
+    """
+    nnz = getattr(X, "nnz", None)
+    if nnz is not None:
+        return int(nnz)
+    size = int(np.size(X))
+    if size <= _LIBLINEAR_INT32_CEILING:
+        return size
+    return int(np.count_nonzero(X))
+
+
+def _resolve_solver(mode: str, units: int) -> str:
+    """Resolve ``auto`` against liblinear's int32 element ceiling (#47)."""
+    if mode == "auto":
+        return "saga" if units > _LIBLINEAR_INT32_CEILING else "liblinear"
+    return mode
+
+
+def _fit_logistic(X, y, solver: str, **kwargs):
+    """Fit LogisticRegression with a one-shot OverflowError fallback (#47).
+
+    ``solver`` arrives pre-resolved ("liblinear" or "saga"). If liblinear
+    still overflows (element-count cast inside sklearn), retry once with
+    saga and report; an OverflowError under saga propagates. Returns
+    ``(clf, solver_used)``.
+    """
+    try:
+        clf = LogisticRegression(solver=solver, **kwargs)
+        clf.fit(X, y)
+        return clf, solver
+    except OverflowError as e:
+        if solver == "saga":
+            raise
+        print(f"[hprobes] liblinear overflow ({e}) -- retrying with 'saga' (#47)")
+        clf = LogisticRegression(solver="saga", **kwargs)
+        clf.fit(X, y)
+        return clf, "saga"
+
+
 def _resolve_auto_top_k(
     *,
     n_valid: int,
@@ -249,6 +300,7 @@ def _run_l2_check(
     y_train: np.ndarray,
     l1_C: float,
     seed: int,
+    solver: str = "liblinear",
 ) -> Dict[str, Any]:
     """L2 collinearity check: compare L1-selected features against L2 weight ranking.
 
@@ -261,14 +313,15 @@ def _run_l2_check(
 
     Returns dict with L2 overlap, weight concentration, AUROC.
     """
-    clf_l2 = LogisticRegression(
-        solver="liblinear",
+    clf_l2, _ = _fit_logistic(
+        X_train,
+        y_train,
+        solver,
         l1_ratio=0,
         C=l1_C,
         max_iter=1000,
         random_state=seed,
     )
-    clf_l2.fit(X_train, y_train)
 
     coef_l2 = np.abs(clf_l2.coef_[0])
     top_l2 = np.argsort(coef_l2)[::-1]
@@ -310,6 +363,7 @@ def _run_stability_check(
     l1_C: float,
     n_runs: int = 5,
     base_seed: int = 42,
+    solver: str = "liblinear",
 ) -> Dict[str, Any]:
     """Bootstrap stability: refit L1 on bootstrapped versions of X_train, compare neurons.
 
@@ -321,18 +375,19 @@ def _run_stability_check(
     n_samples = X_train.shape[0]
 
     def _fit_one(seed_offset: int) -> set:
-        clf = LogisticRegression(
-            solver="liblinear",
+        idx = np.random.RandomState(base_seed + seed_offset).choice(
+            n_samples, size=n_samples, replace=True
+        )
+        Xb, yb = X_train[idx], y_train[idx]
+        clf, _ = _fit_logistic(
+            Xb,
+            yb,
+            solver,
             l1_ratio=1,
             C=l1_C,
             max_iter=1000,
             random_state=base_seed + seed_offset + 1,
         )
-        idx = np.random.RandomState(base_seed + seed_offset).choice(
-            n_samples, size=n_samples, replace=True
-        )
-        Xb, yb = X_train[idx], y_train[idx]
-        clf.fit(Xb, yb)
         return set(int(j) for j in np.where(clf.coef_[0] > 0)[0])
 
     n_jobs = 1 if X_train.shape[1] * X_train.shape[0] * 8 > 2 * 1024**3 else -1
@@ -539,6 +594,7 @@ class HProbes:
         correlation: bool = False,
         cluster: bool = False,
         strict_memory: bool = False,
+        solver: str = "auto",
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -548,6 +604,10 @@ class HProbes:
         self.correlation = correlation
         self.cluster = cluster
         self.strict_memory = strict_memory
+        if solver not in ("auto", "liblinear", "saga"):
+            raise ValueError(f"solver must be 'auto', 'liblinear' or 'saga', got {solver!r}")
+        self.solver = solver
+        self.solver_: Optional[str] = None
         self._top_k_auto = isinstance(top_k, str) and top_k.strip().lower() in ("auto", "-1")
         self.top_k = 0 if self._top_k_auto else int(top_k)
         self.auto_safety = auto_safety
@@ -865,13 +925,13 @@ class HProbes:
             correlation=self.correlation,
             strict=self.strict_memory,
         )
-        self._clf = LogisticRegression(
-            solver="liblinear",
-            l1_ratio=1,
-            C=self.l1_C,
-            max_iter=1000,
-            random_state=self.seed,
-        )
+        solver_used = _resolve_solver(self.solver, _liblinear_units(X_train))
+        if self.solver == "auto" and solver_used != "liblinear":
+            print(
+                f"[hprobes] solver auto->{solver_used}: "
+                f"{_liblinear_units(X_train):,} element units exceed liblinear's "
+                f"int32 ceiling ({_LIBLINEAR_INT32_CEILING:,})"
+            )
         n_classes = len(np.unique(y_train))
         if n_classes < 2:
             self.h_neurons_, self.n_neurons_, self.neuron_ratio_ = [], 0, 0.0
@@ -881,7 +941,16 @@ class HProbes:
             self._X_val, self._y_val = np.array([]), np.array([])
             print("[hprobes] Single-class training data — no H-Neurons found.")
             return self
-        self._clf.fit(X_train, y_train)
+        self._clf, solver_used = _fit_logistic(
+            X_train,
+            y_train,
+            solver_used,
+            l1_ratio=1,
+            C=self.l1_C,
+            max_iter=1000,
+            random_state=self.seed,
+        )
+        self.solver_ = solver_used
 
         coef = self._clf.coef_[0]
         selected = np.where(coef > 0)[0]
@@ -902,10 +971,17 @@ class HProbes:
         self.is_fitted_ = True
 
         if self.check_l2 and self.n_neurons_ > 0:
-            self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
+            self._l2_results_ = _run_l2_check(
+                selected, X_train, y_train, self.l1_C, self.seed, solver=self.solver_ or "liblinear"
+            )
         if self.stability and self.n_neurons_ > 0:
             self._stability_results_ = _run_stability_check(
-                X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
+                X_train,
+                y_train,
+                self.l1_C,
+                n_runs=5,
+                base_seed=self.seed,
+                solver=self.solver_ or "liblinear",
             )
         if self.correlation and self.n_neurons_ > 0:
             self._correlation_results_ = _run_correlation_check(selected, X_train)
@@ -1301,13 +1377,13 @@ class HProbes:
             correlation=self.correlation,
             strict=self.strict_memory,
         )
-        self._clf = LogisticRegression(
-            solver="liblinear",
-            l1_ratio=1,
-            C=self.l1_C,
-            max_iter=1000,
-            random_state=self.seed,
-        )
+        solver_used = _resolve_solver(self.solver, _liblinear_units(X_train))
+        if self.solver == "auto" and solver_used != "liblinear":
+            print(
+                f"[hprobes] solver auto->{solver_used}: "
+                f"{_liblinear_units(X_train):,} element units exceed liblinear's "
+                f"int32 ceiling ({_LIBLINEAR_INT32_CEILING:,})"
+            )
         n_classes = len(np.unique(y_train))
         if n_classes < 2:
             self.h_neurons_, self.n_neurons_, self.neuron_ratio_ = [], 0, 0.0
@@ -1317,7 +1393,16 @@ class HProbes:
             self._X_val, self._y_val = np.array([]), np.array([])
             print("[hprobes] Single-class training data — no H-Neurons found.")
             return self
-        self._clf.fit(X_train, y_train)
+        self._clf, solver_used = _fit_logistic(
+            X_train,
+            y_train,
+            solver_used,
+            l1_ratio=1,
+            C=self.l1_C,
+            max_iter=1000,
+            random_state=self.seed,
+        )
+        self.solver_ = solver_used
 
         coef = self._clf.coef_[0]
         selected = np.where(coef > 0)[0]
@@ -1337,10 +1422,17 @@ class HProbes:
         self.is_fitted_ = True
 
         if self.check_l2 and self.n_neurons_ > 0:
-            self._l2_results_ = _run_l2_check(selected, X_train, y_train, self.l1_C, self.seed)
+            self._l2_results_ = _run_l2_check(
+                selected, X_train, y_train, self.l1_C, self.seed, solver=self.solver_ or "liblinear"
+            )
         if self.stability and self.n_neurons_ > 0:
             self._stability_results_ = _run_stability_check(
-                X_train, y_train, self.l1_C, n_runs=5, base_seed=self.seed
+                X_train,
+                y_train,
+                self.l1_C,
+                n_runs=5,
+                base_seed=self.seed,
+                solver=self.solver_ or "liblinear",
             )
         if self.correlation and self.n_neurons_ > 0:
             self._correlation_results_ = _run_correlation_check(selected, X_train)
@@ -1913,7 +2005,7 @@ class HProbes:
             rand_idx = rng.choice(top_k, size=min(self.n_neurons_, top_k), replace=False)
 
             clf_rand = LogisticRegression(
-                solver="liblinear",
+                solver=self.solver_ or "liblinear",
                 l1_ratio=1,
                 C=self.l1_C,
                 max_iter=1000,
@@ -2193,6 +2285,8 @@ class HProbes:
             "threshold": self.threshold_,
             "n_consistency": self.n_consistency,
             "readout": self.readout,
+            "solver": self.solver,
+            "solver_used": self.solver_,
             "clf_classes": self._clf.classes_.tolist() if hasattr(self._clf, "classes_") else [],
         }
 
@@ -2290,15 +2384,17 @@ class HProbes:
             layer_stride=config["layer_stride"],
             seed=config["seed"],
             max_tokens=config["max_tokens"],
+            solver=config.get("solver", "auto"),
         )
 
-        # Reconstruct the LogisticRegression model
+        # Reconstruct the LogisticRegression model (solver only matters for refits)
         probe._clf = LogisticRegression(
-            solver="liblinear",
+            solver=config.get("solver_used") or "liblinear",
             l1_ratio=1,
             C=config["l1_C"],
             max_iter=1000,
         )
+        probe.solver_ = config.get("solver_used")
 
         if "clf_coef" in tensors:
             probe._clf.coef_ = tensors["clf_coef"].numpy()
@@ -2486,7 +2582,7 @@ class HProbes:
                 replace=False,
             )
             clf_rand = LogisticRegression(
-                solver="liblinear",
+                solver=self.solver_ or "liblinear",
                 l1_ratio=1,
                 C=self.l1_C,
                 max_iter=1000,
@@ -2743,7 +2839,7 @@ class HProbes:
                 replace=False,
             )
             clf_rand = LogisticRegression(
-                solver="liblinear",
+                solver=self.solver_ or "liblinear",
                 l1_ratio=1,
                 C=self.l1_C,
                 max_iter=1000,

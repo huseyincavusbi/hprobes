@@ -1096,3 +1096,99 @@ class TestFitMoERecordIsolation:
         # per-sample clear, snapshot 2 would include forward 1's records too.
         assert seen[0] == seen[1], seen
         assert seen[1][0] <= model.num_experts, seen
+
+
+# ---------------------------------------------------------------------------
+# solver fallback (#47): int32 pre-check + saga fallback
+# ---------------------------------------------------------------------------
+
+
+class TestSolverFallback:
+    def test_units_dense_small_is_size_bound(self):
+        from hprobes.probe import _liblinear_units
+
+        X = np.zeros((3, 5), dtype=np.float32)
+        assert _liblinear_units(X) == 15  # size bound, no scan needed
+
+    def test_units_sparse_is_nnz(self):
+        from scipy import sparse
+
+        from hprobes.probe import _liblinear_units
+
+        X = sparse.csr_matrix(np.eye(4, dtype=np.float32))
+        assert _liblinear_units(X) == 4
+
+    def test_resolve_solver_arithmetic(self):
+        from hprobes.probe import _LIBLINEAR_INT32_CEILING, _resolve_solver
+
+        ceil = _LIBLINEAR_INT32_CEILING
+        assert _resolve_solver("auto", ceil) == "liblinear"  # at ceiling = still safe
+        assert _resolve_solver("auto", ceil + 1) == "saga"
+        assert _resolve_solver("liblinear", ceil + 1) == "liblinear"  # explicit wins
+        assert _resolve_solver("saga", 1) == "saga"
+
+    def test_fit_logistic_falls_back_on_overflow(self, monkeypatch):
+        import hprobes.probe as probe_mod
+        from hprobes.probe import _fit_logistic
+
+        calls = []
+
+        class FlakyLR:
+            def __init__(self, solver=None, **kw):
+                self.solver = solver
+
+            def fit(self, X, y):
+                calls.append(self.solver)
+                if self.solver == "liblinear":
+                    raise OverflowError("value too large to convert to int")
+
+        monkeypatch.setattr(probe_mod, "LogisticRegression", FlakyLR)
+        clf, used = _fit_logistic(np.zeros((2, 2)), np.array([0, 1]), "liblinear")
+        assert calls == ["liblinear", "saga"]
+        assert used == "saga"
+
+    def test_fit_logistic_propagates_saga_overflow(self, monkeypatch):
+        import hprobes.probe as probe_mod
+        from hprobes.probe import _fit_logistic
+
+        class AlwaysOverflow:
+            def __init__(self, solver=None, **kw):
+                pass
+
+            def fit(self, X, y):
+                raise OverflowError("boom")
+
+        monkeypatch.setattr(probe_mod, "LogisticRegression", AlwaysOverflow)
+        with pytest.raises(OverflowError):
+            _fit_logistic(np.zeros((2, 2)), np.array([0, 1]), "saga")
+
+    def test_constructor_validates_solver(self):
+        with pytest.raises(ValueError, match="solver must be"):
+            HProbes(MODEL, TOK, solver="bogus")
+
+    def test_default_fit_records_liblinear(self):
+        # existing fixture probe was fit with default settings -> auto under ceiling
+        assert _PROBE.solver_ == "liblinear"
+
+    def test_fit_with_saga_forced_works_tiny(self):
+        p = HProbes(MODEL, TOK, l1_C=10, solver="saga")
+        p.fit(SAMPLES, options_key="options", answer_key="answer")
+        assert p.is_fitted_
+        assert p.solver_ == "saga"
+
+    def test_auto_resolves_over_ceiling_with_monkeypatched_units(self, monkeypatch):
+        import hprobes.probe as probe_mod
+        from hprobes.probe import _LIBLINEAR_INT32_CEILING
+
+        monkeypatch.setattr(probe_mod, "_liblinear_units", lambda X: _LIBLINEAR_INT32_CEILING + 1)
+        p = HProbes(MODEL, TOK, l1_C=10)  # solver auto
+        p.fit(SAMPLES, options_key="options", answer_key="answer")
+        assert p.solver_ == "saga"
+
+    def test_save_records_solver(self, tmp_path):
+        p = HProbes(MODEL, TOK, l1_C=10, solver="saga")
+        p.fit(SAMPLES, options_key="options", answer_key="answer")
+        json_path = p.save(str(tmp_path / "probe"))
+        data = json.loads(Path(json_path).read_text())
+        assert data["config"]["solver"] == "saga"
+        assert data["config"]["solver_used"] == "saga"
