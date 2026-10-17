@@ -727,6 +727,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             save_predictions=not args.no_predictions,
             readout=args.readout,
             readout_max_new_tokens=args.max_new_tokens_consistency or 16,
+            solver=getattr(args, "solver", "auto"),
         )
         probe.fit(samples, options_key=options_key, answer_key=answer_key)
         probe.model_id = args.model
@@ -815,6 +816,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             stability=getattr(args, "stability", False),
             correlation=getattr(args, "correlation", False),
             cluster=getattr(args, "cluster", False),
+            solver=getattr(args, "solver", "auto"),
         )
         probe.fit_from_responses(
             samples,
@@ -983,6 +985,7 @@ def cmd_responses(args: argparse.Namespace) -> None:
         validation_split=args.validation_split,
         seed=args.seed,
         max_tokens=args.max_tokens,
+        solver=getattr(args, "solver", "auto"),
     )
     probe.fit_from_responses(
         samples,
@@ -1282,6 +1285,18 @@ def _add_common_probe_args(p):
         default=1.0,
         dest="l1_c",
         help="Inverse L1 regularisation strength (default: 1.0)",
+    )
+    p.add_argument(
+        "--solver",
+        choices=["auto", "liblinear", "saga"],
+        default="auto",
+        dest="solver",
+        help=(
+            "L1 fit solver. 'auto' keeps liblinear and falls back to saga only when "
+            "the matrix exceeds liblinear's int32 element ceiling; 'saga' forces the "
+            "fallback (approx-equal, not bit-identical; record it in comparisons) "
+            "(default: auto)"
+        ),
     )
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     p.add_argument(
