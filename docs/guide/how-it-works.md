@@ -59,6 +59,27 @@ For each MCQ sample, the model predicts an answer letter by reading logits at th
 
 The `l1_C` parameter controls sparsity — lower values yield fewer, more confident H-Neurons.
 
+#### Large-matrix solver fallback (#47)
+
+liblinear casts element counts to 32-bit integers, so matrices with more than
+`2**31 - 1` nonzero units raise `OverflowError` at fit time (this bites 27B+
+models at all-features covering ~1M+ features). With `solver="auto"` (the
+default), the probe pre-checks the exact quantity liblinear checks and routes
+to `saga` — the only other L1-capable solver — only when the ceiling would be
+exceeded; below it, behavior stays byte-identical (liblinear). A residual
+`OverflowError` under `auto` triggers one logged retry with `saga`. Explicit
+`solver="saga"` is also available, e.g. to run a whole grid single-solver.
+
+**Sparsity/result caveats** (measured on GPT-2 + MedQA and ESM-2 650M masked
+residues): at equal `C`, saga recovers ~99% of liblinear's selected neurons but
+yields a ~5× denser set; probe AUROC is statistically indistinguishable
+(paired bootstrap CI spans zero). Matching liblinear's set density needs a
+`C` retune (~half, dataset-dependent), and even then the exact sets differ at
+the margins. Fit time is ~5× slower at realistic matrix sizes. **Never mix
+solvers within one comparison** (grid/table/claim) — use `solver="saga"` for
+all cells or `liblinear` for all cells; the effective solver is recorded in
+saved metadata (`config.solver_used`).
+
 ### 4. Causal Validation
 
 To confirm that H-Neurons causally influence hallucination (not just correlate with it), `causal_validate()` scales their activations during inference:
