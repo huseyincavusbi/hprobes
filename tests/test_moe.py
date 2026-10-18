@@ -253,6 +253,64 @@ class TestMoECapture:
         raise AssertionError("expected TypeError for non-MoE contract")
 
 
+class TestSharedExpertCapture:
+    @staticmethod
+    def _mlp(with_gate: bool = True):
+        class _Shared(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.down_proj = nn.Linear(4, 6, bias=False)
+
+            def forward(self, x):
+                return self.down_proj(x)
+
+        class _MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shared_expert = _Shared()
+                if with_gate:
+                    self.shared_expert_gate = nn.Linear(4, 1, bias=False)
+
+            def forward(self, x):
+                y = self.shared_expert(x)
+                if with_gate:
+                    y = torch.sigmoid(self.shared_expert_gate(x)) * y
+                return y
+
+        return _MLP()
+
+    def test_captures_decision_row_and_sigmoid_gate(self):
+        from hprobes.moe import SharedExpertCapture
+
+        torch.manual_seed(0)
+        mlp = self._mlp()
+        cap = SharedExpertCapture(mlp, 0)
+        assert cap.available
+        cap.attach()
+        x = torch.randn(3, 4)
+        mlp(x)
+        cap.remove()
+
+        tokens, acts, gates = cap.decision_feature(1)
+        assert tokens == [1]
+        assert acts.shape == (1, 4)
+        assert torch.allclose(acts[0], x[1])  # input to shared down_proj
+        expected_gate = torch.sigmoid(mlp.shared_expert_gate(x)).reshape(-1)[1]
+        assert torch.allclose(gates[0], expected_gate.detach())
+
+    def test_unavailable_without_shared_expert(self):
+        from hprobes.moe import SharedExpertCapture
+
+        class _MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = nn.Linear(4, 4)
+
+        cap = SharedExpertCapture(_MLP(), 0)
+        assert not cap.available
+        assert cap.decision_feature(0) is None
+
+
 class _Recorder:
     """Lightweight capture double: no model, direct records."""
 
@@ -422,6 +480,48 @@ class TestMoEProbeFit:
             per_expert[key] = per_expert.get(key, 0) + 1
         max_fired = picks and (2 * max(per_expert.values()))
         assert ((X != 0).sum(axis=1) <= max_fired).all()
+
+    def test_design_supports_shared_expert_keys(self):
+        from hprobes.moe import _MoEFeatures, _design_from_features
+
+        rng = np.random.default_rng(0)
+        feats = []
+        for i in range(8):
+            routed = rng.normal(size=(1, 3)).astype("float32")
+            shared = (rng.normal(size=(1, 4)) + 5.0).astype("float32")
+            feats.append(
+                {
+                    (0, 0): ([0], torch.from_numpy(routed), torch.tensor([0.5])),
+                    (0, "shared"): ([0], torch.from_numpy(shared), torch.tensor([0.7])),
+                }
+            )
+        art = _MoEFeatures(
+            feats=feats,
+            routings=[torch.tensor([[0]]) for _ in range(8)],
+            labels=np.array([0, 1] * 4),
+            prompts=[f"p{i}" for i in range(8)],
+            per_sample=[{} for _ in range(8)],
+            capture_meta={
+                "layers": [0],
+                "num_experts": 1,
+                "score": "mean_abs",
+                "per_expert_top_n": 2,
+                "top_k": 3,
+                "min_active": 1,
+            },
+        )
+        X, design = _design_from_features(
+            art, top_k=3, per_expert_top_n=2, score="mean_abs", min_active=1
+        )
+        assert X.shape == (8, len(design["feature_index"]))
+        keys = {k for k, _ in design["feature_index"]}
+        assert (0, "shared") in keys
+
+    def test_feature_name_shared_vs_routed(self):
+        from hprobes.moe import _feature_name
+
+        assert _feature_name(2, 5, 3) == "L2:E5:N3"
+        assert _feature_name(2, "shared", 3) == "L2:S:N3"
 
     def test_probe_recovers_planted_signal(self):
         from hprobes.moe import fit_moe_probe

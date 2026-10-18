@@ -381,6 +381,63 @@ class MoECapture:
         return self.sketch.summary()
 
 
+class SharedExpertCapture:
+    """Read-only capture of an always-on (shared) expert's activation.
+
+    MoE blocks with a dense shared expert (Qwen2Moe / Qwen3.5-style) apply it
+    to every token, so unlike routed experts there is no routing decision to
+    replay: the module's own forward runs untouched and we only observe it.
+    Hooks ``mlp.shared_expert.down_proj`` (input = pre-down_proj activation)
+    and, when present, ``mlp.shared_expert_gate`` (output -> sigmoid gate).
+    """
+
+    def __init__(self, mlp: torch.nn.Module, layer: int):
+        self.layer = layer
+        self._down = getattr(getattr(mlp, "shared_expert", None), "down_proj", None)
+        self._gate_mod = getattr(mlp, "shared_expert_gate", None)
+        self.acts: Optional[torch.Tensor] = None
+        self.gates: Optional[torch.Tensor] = None
+        self._handles: List[Any] = []
+
+    @property
+    def available(self) -> bool:
+        return self._down is not None
+
+    def attach(self) -> "SharedExpertCapture":
+        def hook_down(module, inputs, output):
+            x = inputs[0].detach()
+            self.acts = x.reshape(-1, x.shape[-1]).float()
+
+        self._handles.append(self._down.register_forward_hook(hook_down))
+        if self._gate_mod is not None:
+
+            def hook_gate(module, inputs, output):
+                self.gates = torch.sigmoid(output.detach().float().reshape(-1))
+
+            self._handles.append(self._gate_mod.register_forward_hook(hook_gate))
+        return self
+
+    def clear(self) -> None:
+        self.acts = None
+        self.gates = None
+
+    def remove(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def decision_feature(self, pos: int) -> Optional[Tuple[List[int], torch.Tensor, torch.Tensor]]:
+        """(tokens, acts, gates) for one token position, or None."""
+        if self.acts is None or pos >= self.acts.shape[0]:
+            return None
+        acts = self.acts[pos : pos + 1].cpu()
+        if self.gates is not None and pos < self.gates.shape[0]:
+            gates = self.gates[pos : pos + 1].cpu()
+        else:
+            gates = torch.ones(1)
+        return [pos], acts, gates
+
+
 def moe_col_norms(model: torch.nn.Module, layers: List[int]) -> Dict[Tuple[int, int], torch.Tensor]:
     """Per-expert column norms ||w_down^(l,e)[:, j]|| for routed experts.
 
@@ -543,12 +600,24 @@ class MoESparseDataset:
 class _MoEFeatures:
     """Decision-token MoE features for a fitted probe (issue #41)."""
 
-    feats: List[Dict[Tuple[int, int], Tuple[List[int], torch.Tensor, torch.Tensor]]]
+    feats: List[Dict[Tuple[int, Any], Tuple[List[int], torch.Tensor, torch.Tensor]]]
     routings: List[torch.Tensor]
     labels: np.ndarray
     prompts: List[str]
     per_sample: List[Dict[str, Any]]
     capture_meta: Dict[str, Any]
+
+
+def _expert_sort_key(expert: Any) -> Tuple[int, int]:
+    """Order routed experts (int) before the shared pseudo-expert."""
+    return (0, int(expert)) if isinstance(expert, int) else (1, 0)
+
+
+def _feature_name(layer: int, expert: Any, neuron: int) -> str:
+    """Probe feature name: ``L{l}:E{e}:N{n}`` routed, ``L{l}:S:N{n}`` shared."""
+    if isinstance(expert, int):
+        return f"L{layer}:E{expert}:N{neuron}"
+    return f"L{layer}:S:N{neuron}"
 
 
 def _design_from_features(
@@ -566,7 +635,7 @@ def _design_from_features(
     """
 
     # Per (layer, expert): stacked activations + gates, sample index per row.
-    grouped: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    grouped: Dict[Tuple[int, Any], Dict[str, Any]] = {}
     for si, feat in enumerate(artifact.feats):
         for key, (tokens, acts, gates) in feat.items():
             g = grouped.setdefault(key, {"acts": [], "gates": [], "samples": []})
@@ -575,9 +644,9 @@ def _design_from_features(
                 g["gates"].append(float(gates[r]))
                 g["samples"].append(si)
 
-    per_expert_pick: Dict[Tuple[int, int], List[int]] = {}
-    candidates: List[Tuple[float, Tuple[int, int], int]] = []
-    for key, g in sorted(grouped.items()):
+    per_expert_pick: Dict[Tuple[int, Any], List[int]] = {}
+    candidates: List[Tuple[float, Tuple[int, Any], int]] = []
+    for key, g in sorted(grouped.items(), key=lambda kv: (kv[0][0], _expert_sort_key(kv[0][1]))):
         A = torch.stack(g["acts"]).float()
         n = A.shape[0]
         if n < max(1, min_active):
@@ -592,7 +661,7 @@ def _design_from_features(
         for j in idx:
             candidates.append((float(ranking[j]), key, j))
 
-    candidates.sort(key=lambda c: (-c[0], c[1][0], c[1][1], c[2]))
+    candidates.sort(key=lambda c: (-c[0], c[1][0], _expert_sort_key(c[1][1]), c[2]))
     chosen = candidates[:top_k]
     feature_index = [(key, j) for _, key, j in chosen]
     col_of = {fk: c for c, fk in enumerate(feature_index)}
@@ -707,7 +776,7 @@ def fit_moe_probe(
         score=str(meta["score"]),
         min_active=int(meta["min_active"]),
     )
-    names = [f"L{lyr}:E{e}:N{j}" for (lyr, e), j in design["feature_index"]]
+    names = [_feature_name(lyr, e, j) for (lyr, e), j in design["feature_index"]]
     if fusion == "concat":
         Xr, rnames = _routing_matrix(artifact)
         X = np.concatenate([X, Xr], axis=1)
