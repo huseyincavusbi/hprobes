@@ -64,6 +64,16 @@ def test_fingerprint_stable_and_layer_sensitive():
     assert fingerprint_model(m, [0]) != fingerprint_model(m, [1])
 
 
+def test_fingerprint_handles_bf16_params():
+    """Low-precision params (real models) must fingerprint without fp32 copies."""
+    m = nn.Linear(8, 4).to(torch.bfloat16)
+    a = fingerprint_model(m, [0])
+    assert a == fingerprint_model(m, [0])
+    with torch.no_grad():
+        next(m.parameters()).add_(1.0)
+    assert fingerprint_model(m, [0]) != a
+
+
 def test_rows_key_stable_and_sensitive():
     samples = [{"question": "q", "answer": "A"}]
     cfg = {"layers": [0], "batch_size": 1}

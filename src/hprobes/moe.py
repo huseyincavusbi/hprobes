@@ -22,6 +22,7 @@ shared by Olmoe/Qwen2Moe/Qwen3.5MoE/DeepSeek-style blocks in transformers.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -132,7 +133,11 @@ class MoECapture:
         # token positions before anything consumes them.
         self._routing_override: Optional[Dict[str, Any]] = None
 
-    def attach(self, experts_module: torch.nn.Module) -> torch.utils.hooks.RemovableHandle:
+    def attach(
+        self,
+        experts_module: torch.nn.Module,
+        allow_eager_switch: bool = False,
+    ) -> torch.utils.hooks.RemovableHandle:
         """Wrap the experts module forward to capture per-expert activations.
 
         The family loop calls ``F.linear(act, down_proj[e])`` on *parameter
@@ -142,7 +147,41 @@ class MoECapture:
         the family's own one-hot would select, and we reuse the model's
         weights (gate_up_proj / down_proj parameters) to recompute them.
         Outputs are bit-identical to the family implementation.
+
+        Requires the model to run the ``eager`` experts implementation:
+        transformers dispatches ``batched_mm``/``grouped_mm`` fast experts
+        paths for loaded models, and the eager replay would then diverge from
+        the model's actual forward. Load with
+        ``experts_implementation="eager"``, or pass
+        ``allow_eager_switch=True`` to switch a loaded model's config in
+        place (a warning is emitted; every subsequent forward of the model
+        then runs the eager loop).
         """
+        config = getattr(experts_module, "config", None)
+        impls = {
+            getattr(config, "_experts_implementation", None),
+            getattr(config, "_experts_implementation_internal", None),
+        }
+        dispatched = sorted(i for i in impls if i not in (None, "eager"))
+        if dispatched:
+            if not allow_eager_switch:
+                raise ValueError(
+                    f"experts module dispatches {dispatched[0]!r} from transformers' experts "
+                    "interface, but MoECapture replays the 'eager' implementation and would "
+                    "not be bit-identical to the model. Load the model with "
+                    "`experts_implementation='eager'`, or pass `allow_eager_switch=True` to "
+                    "switch this model in place (affects all subsequent forwards in this "
+                    "process)."
+                )
+            warnings.warn(
+                f"switching experts implementation from {dispatched[0]!r} to 'eager' in "
+                "place; all subsequent forwards of this model now run the eager experts "
+                "loop.",
+                stacklevel=2,
+            )
+            for field_name in ("_experts_implementation", "_experts_implementation_internal"):
+                if hasattr(config, field_name):
+                    setattr(config, field_name, "eager")
         import types
 
         cap = self
@@ -156,9 +195,13 @@ class MoECapture:
                 top_k_index = top_k_index.clone()
                 top_k_weights = top_k_weights.clone()
                 pos = ov["positions"].to(top_k_index.device)
-                top_k_index[pos] = ov["experts"].to(top_k_index.device)
+                top_k_index[pos] = ov["experts"].to(
+                    device=top_k_index.device, dtype=top_k_index.dtype
+                )
                 if ov["weights"] is not None:
-                    top_k_weights[pos] = ov["weights"].to(top_k_weights.device)
+                    top_k_weights[pos] = ov["weights"].to(
+                        device=top_k_weights.device, dtype=top_k_weights.dtype
+                    )
             # Seed routing context: record_expert reads it per expert below.
             cap._ctx = {
                 "top_k_index": top_k_index.detach(),
@@ -166,12 +209,18 @@ class MoECapture:
                 "token_norm": hidden_states.detach().float().norm(dim=-1).cpu(),
             }
             with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=cap.num_experts)
+                # num_experts + 1 mirrors the family one-hot: the extra class
+                # is a sentinel for dropped slots, skipped in the loop below.
+                expert_mask = torch.nn.functional.one_hot(
+                    top_k_index, num_classes=cap.num_experts + 1
+                )
                 expert_mask = expert_mask.permute(2, 1, 0)
                 expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             final_hidden_states = torch.zeros_like(hidden_states)
             for expert_idx in expert_hit:
                 expert_idx = int(expert_idx[0])
+                if expert_idx == cap.num_experts:
+                    continue
                 top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
                 current_state = hidden_states[token_idx]
                 gate, up = torch.nn.functional.linear(
@@ -190,7 +239,7 @@ class MoECapture:
                         act = act.clone()
                         for j in names:
                             act[:, j] = act[:, j] * alpha
-                cap.record_expert(expert_idx, act)
+                cap.record_expert(expert_idx, act, top_k_pos=top_k_pos, token_idx=token_idx)
                 out = torch.nn.functional.linear(act, self_mod.down_proj[expert_idx])
                 out = out * top_k_weights[token_idx, top_k_pos, None]
                 final_hidden_states.index_add_(0, token_idx, out.to(final_hidden_states.dtype))
@@ -205,17 +254,31 @@ class MoECapture:
 
         return _Handle()
 
-    def record_expert(self, expert: int, activations: torch.Tensor) -> None:
-        """Called once per expert per layer-forward with its pre-down_proj activations."""
+    def record_expert(
+        self,
+        expert: int,
+        activations: torch.Tensor,
+        top_k_pos: Optional[torch.Tensor] = None,
+        token_idx: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Called once per expert per layer-forward with its pre-down_proj activations.
+
+        ``top_k_pos`` and ``token_idx`` are the (slot, token) routing rows for
+        this expert in the family loop's row order; the wrapping loop passes
+        its own indices so recorded rows pair 1:1 with ``activations``.
+        External callers may omit them: they are then re-derived in the same
+        slot-major order of the loop's ``(k, T)`` expert mask.
+        """
         ctx = self._ctx
         if not ctx:
             raise RuntimeError("record_expert called before routing context was captured")
         top_k_index = ctx["top_k_index"]
         top_k_weights = ctx["top_k_weights"]
-        # token positions x slots where this expert is selected
-        mask = top_k_index == expert
-        token_idx, slot_idx = torch.where(mask)
-        gates = top_k_weights[token_idx, slot_idx]
+        if top_k_pos is None or token_idx is None:
+            # row-major over the (k, T) expert mask: same order as the family
+            # loop's torch.where(expert_mask[expert_idx]) row replay.
+            top_k_pos, token_idx = torch.where((top_k_index == expert).t())
+        gates = top_k_weights[token_idx, top_k_pos]
         if activations.shape[0] != token_idx.shape[0]:
             raise ValueError(
                 f"activation rows {activations.shape[0]} != selected tokens {token_idx.shape[0]} "
@@ -228,7 +291,7 @@ class MoECapture:
                 "layer": self.layer,
                 "expert": expert,
                 "tokens": token_idx.detach().cpu(),
-                "slots": slot_idx.detach().cpu(),
+                "slots": top_k_pos.detach().cpu(),
                 "gates": gates.detach().float().cpu(),
                 "token_norm": norm.detach().float().cpu(),
                 "acts": activations.detach().float().cpu(),

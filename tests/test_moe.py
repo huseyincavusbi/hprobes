@@ -1,6 +1,7 @@
 """Tests for active-only per-expert MoE capture (issue #41, phase 0)."""
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -20,15 +21,18 @@ def _toy_experts(num_experts=4, d_in=8, d_inter=6):
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
             # Family-faithful ordering: mirrors Olmoe/Qwen2Moe/Qwen3.5MoE
-            # experts modules (one_hot -> permute -> slot-major where). Row
+            # experts modules (one_hot -> permute -> slot-major where), including
+            # the extra sentinel class (num_experts + 1) that is skipped. Row
             # order inside each expert's batched matmul matters for bitwise
             # equality on some BLAS backends, so the toy must match the real
             # families -- and the MoECapture wrapper replays exactly this.
             final = torch.zeros_like(hidden_states)
             expert_mask = torch.nn.functional.one_hot(
-                top_k_index, num_classes=self.num_experts
+                top_k_index, num_classes=self.num_experts + 1
             ).permute(2, 1, 0)
-            for e in range(self.num_experts):
+            for e in range(self.num_experts + 1):
+                if e == self.num_experts:
+                    continue
                 if expert_mask[e].sum() == 0:
                     continue
                 top_k_pos, token_idx = torch.where(expert_mask[e])
@@ -119,6 +123,112 @@ class TestMoECapture:
         summary = cap.summary()
         total = sum(row["n_active"] for row in summary)
         assert total == self.top_k_index.numel()
+
+    def test_records_pair_rows_with_family_loop_order(self):
+        """Recorded metadata must pair 1:1 with the activation rows.
+
+        Regression: metadata was re-derived token-major while the family loop
+        replays the slot-major order of its ``(k, T)`` expert mask, permuting
+        ``tokens``/``slots``/``gates`` relative to ``acts`` whenever an expert
+        sat at crossing (token, slot) pairs.
+        """
+        hidden = self.hidden
+        # expert 0 at (t0, s1) and (t1, s0): token-major is [t0s1, t1s0],
+        # slot-major (loop order) is [t1s0, t0s1] -- the orders diverge.
+        top_k_index = torch.tensor([[1, 0], [0, 1], [2, 3], [3, 2], [2, 0], [1, 3]])
+        weights = torch.full((6, 2), 0.5)
+
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        handle = cap.attach(self.experts)
+        self.experts(hidden, top_k_index, weights)
+        handle.remove()
+
+        rows = 0
+        for rec in cap.records:
+            e = rec["expert"]
+            toks = rec["tokens"]
+            # Recompute in the same batched form the loop used: per-row 1-D
+            # evaluation is not bit-comparable (BLAS uses different kernels
+            # for single-row vs batched inputs). Comparing the full tensor
+            # also pins the row ORDER, not just per-row content.
+            gate, up = torch.nn.functional.linear(hidden[toks], self.experts.gate_up_proj[e]).chunk(
+                2, dim=-1
+            )
+            expected = self.experts.act_fn(gate) * up
+            assert torch.equal(rec["acts"], expected)
+            for j in range(toks.shape[0]):
+                t, s = int(toks[j]), int(rec["slots"][j])
+                assert float(rec["gates"][j]) == float(weights[t, s])
+                rows += 1
+        assert rows == top_k_index.numel()
+
+    def test_attach_rejects_non_eager_experts_implementation(self):
+        """Dispatched `batched_mm`/`grouped_mm` paths void the eager replay."""
+
+        class _Cfg:
+            _experts_implementation = "grouped_mm"
+
+        self.experts.config = _Cfg()
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        with pytest.raises(ValueError, match="eager"):
+            cap.attach(self.experts)
+        _Cfg._experts_implementation = "eager"
+        handle = cap.attach(self.experts)
+        handle.remove()
+
+    def test_attach_allow_eager_switch(self):
+        """Explicit opt-in may switch a loaded model to eager in place."""
+
+        class _Cfg:
+            _experts_implementation = "grouped_mm"
+
+        cfg = _Cfg()
+        self.experts.config = cfg
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        with pytest.warns(UserWarning, match="eager"):
+            handle = cap.attach(self.experts, allow_eager_switch=True)
+        assert cfg._experts_implementation == "eager"
+        handle.remove()
+
+    def test_sentinel_expert_class_skipped_like_family(self):
+        """The extra one-hot class is a sentinel: skip it, never record it.
+
+        transformers' expert modules build one_hot with ``num_experts + 1``
+        classes and silently drop rows routed to the sentinel class; the
+        capture replay must mirror that instead of crashing or recording it.
+        """
+        sentinel = self.num_experts
+        top_k_index = torch.tensor([[0, sentinel], [1, 2], [sentinel, 3], [2, 0], [3, 1], [0, 2]])
+        weights = torch.full((6, 2), 0.5)
+        base = self.experts(self.hidden, top_k_index, weights)
+
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        handle = cap.attach(self.experts)
+        wrapped = self.experts(self.hidden, top_k_index, weights)
+        handle.remove()
+
+        assert torch.equal(wrapped, base)
+        assert all(rec["expert"] != sentinel for rec in cap.records)
+
+    def test_routing_override_casts_to_model_dtype(self):
+        """Override tensors must be cast to the routing tensors' dtypes.
+
+        Real models route in bf16; fp32 override weights previously hit an
+        in-place index-put dtype error inside the capture wrapper.
+        """
+        top_k_index = torch.tensor([[0, 1], [2, 3], [0, 3], [1, 2], [0, 2], [1, 3]])
+        top_k_weights = torch.full((6, 2), 0.5, dtype=torch.bfloat16)
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        handle = cap.attach(self.experts)
+        cap.set_routing_override(
+            [3], torch.tensor([[2, 1]]), torch.tensor([[0.25, 0.75]], dtype=torch.float)
+        )
+        out = self.experts(self.hidden, top_k_index, top_k_weights)
+        handle.remove()
+        assert out.dtype == self.hidden.dtype
+        assert cap._ctx["top_k_weights"].dtype == torch.bfloat16
+        eff_w = cap.gate_table()
+        assert [float(x) for x in eff_w[3]] == [0.25, 0.75]
 
     def test_routing_and_gate_tables(self):
         cap = MoECapture(num_experts=self.num_experts, layer=0)
