@@ -1470,7 +1470,7 @@ class HProbes:
         token); ``fusion="concat"`` also fits the fused neuron+routing probe.
         Results land in ``self.moe_``.
         """
-        from .moe import MoECapture, _MoEFeatures, fit_moe_probe
+        from .moe import MoECapture, SharedExpertCapture, _MoEFeatures, fit_moe_probe
 
         from .cett import _get_transformer_layers
 
@@ -1497,6 +1497,15 @@ class HProbes:
             handles.append(cap.attach(experts_mod))
             captures.append(cap)
 
+        # Always-on shared experts (Qwen2Moe / Qwen3.5-style) are captured
+        # read-only alongside the routed experts: same decision-token protocol.
+        shared_captures: List[SharedExpertCapture] = []
+        for li in self._layers:
+            cap_s = SharedExpertCapture(blocks[li].mlp, li)
+            if cap_s.available:
+                cap_s.attach()
+                shared_captures.append(cap_s)
+
         # Per-sample forward; capture stays active only during the forward.
         feats: List[Dict[Tuple[int, int], Tuple[List[int], torch.Tensor, torch.Tensor]]] = []
         routings: List[torch.Tensor] = []
@@ -1515,6 +1524,8 @@ class HProbes:
                 # never include sample j<k rows at a coincident position.
                 for cap in captures:
                     cap.clear_records()
+                for cap_s in shared_captures:
+                    cap_s.clear()
                 with torch.no_grad():
                     out = self.model(full["input_ids"].to(device))
                 logits = out.logits[0, decision_pos, :]
@@ -1528,13 +1539,20 @@ class HProbes:
                 labels.append(0 if is_correct else 1)
                 prompts.append(prompt)
                 per_sample.append({"is_correct": is_correct, "pred": pred, "gt": gt})
-                feats.append(self._moe_decision_features(captures, decision_pos))
+                feats_sample = self._moe_decision_features(captures, decision_pos)
+                for cap_s in shared_captures:
+                    shared = cap_s.decision_feature(decision_pos)
+                    if shared is not None:
+                        feats_sample[(cap_s.layer, "shared")] = shared
+                feats.append(feats_sample)
                 routings.append(
                     torch.stack([cap.routing_table()[decision_pos] for cap in captures])
                 )
         finally:
             for h in handles:
                 h.remove()
+            for cap_s in shared_captures:
+                cap_s.remove()
 
         if not feats:
             raise ValueError("no valid samples — MoE extraction produced zero rows")
@@ -1548,6 +1566,7 @@ class HProbes:
             capture_meta={
                 "layers": self._layers,
                 "num_experts": num_experts,
+                "shared_layers": [cap_s.layer for cap_s in shared_captures],
                 "model_fp": fingerprint_model(self.model, self._layers),
                 "score": score,
                 "per_expert_top_n": per_expert_top_n,

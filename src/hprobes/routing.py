@@ -269,6 +269,17 @@ def frequency_sampled_experts(usage: Dict[int, float], dose: int, k: int, seed: 
     return [int(exp_ids[p]) for p in picked]
 
 
+def _is_shared_feature_name(name: str) -> bool:
+    """True for shared-expert features (``L{layer}:S:N{neuron}``)."""
+    parts = name.split(":")
+    return (
+        len(parts) == 3
+        and parts[0].startswith("L")
+        and parts[1] == "S"
+        and parts[2].startswith("N")
+    )
+
+
 def _parse_expert_name(name: str) -> Optional[tuple]:
     """Parse a fit_moe feature name ``L{layer}:E{expert}:N{neuron}``."""
     parts = name.split(":")
@@ -291,11 +302,18 @@ def cett_routing_overlap(
     ``fit_moe``'s probe (``L{layer}:E{expert}:N{neuron}``); ``stats`` is the
     ``routing_stats`` output. Agreement = routing-flagged experts hosting
     CETT-selected neurons -- overlap above chance argues routing and neurons
-    capture the same signal; low overlap argues dissociation.
+    capture the same signal; low overlap argues dissociation. Shared-expert
+    features (``L{layer}:S:N{neuron}``) have no routing analog and are
+    counted separately in ``n_shared_features``.
     """
     cett_experts = set()
+    n_shared = 0
     for name in cett_feature_names:
-        parsed = _parse_expert_name(str(name))
+        text = str(name)
+        if _is_shared_feature_name(text):
+            n_shared += 1
+            continue
+        parsed = _parse_expert_name(text)
         if parsed is not None:
             cett_experts.add(parsed)
     flagged = set()
@@ -318,6 +336,7 @@ def cett_routing_overlap(
     union = cett_experts | flagged
     return {
         "n_cett_experts": len(cett_experts),
+        "n_shared_features": n_shared,
         "n_routing_flagged": len(flagged),
         "overlap": [[li, e] for li, e in overlap],
         "jaccard": len(overlap) / len(union) if union else 0.0,

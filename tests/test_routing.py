@@ -320,6 +320,15 @@ class TestCettRoutingCrossCheck:
         assert out["n_cett_experts"] == 2
         assert out["overlap"] == [[0, 1]]
 
+    def test_counts_shared_features_separately(self):
+        from hprobes.routing import cett_routing_overlap
+
+        names = ["L0:E1:N0", "L0:S:N2", "L1:S:N7"]
+        out = cett_routing_overlap(names, self._stats({0: [1]}))
+        assert out["n_cett_experts"] == 1
+        assert out["n_shared_features"] == 2
+        assert out["overlap"] == [[0, 1]]
+
 
 class TestMoeRoutingAnalysisEndToEnd:
     """End-to-end on the fake MoE LM: stats + cross-check wiring."""

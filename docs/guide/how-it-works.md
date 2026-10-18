@@ -25,7 +25,7 @@ The column norms `||W_down[:, j]||_2` are precomputed once and reused across all
 hprobes reads each layer's FFN down-projection (`down_proj`, `c_proj`, `fc2`). Two architecture variations are handled explicitly:
 
 - **Heterogeneous FFN dims** — models whose intermediate size differs per layer (e.g. Gemma 4 E-series double-wide MLPs) are supported: dims are tracked per layer and flat CETT indices map through per-layer offsets.
-- **MoE layers** — for MoE models with a dense shared expert (e.g. Qwen3.5/3.8 MoE), CETT is read from `shared_expert.down_proj`; flattened 2D `(tokens, dim)` activations from the shared expert are handled by the hooks. Routed experts (`experts.down_proj`) are not yet covered.
+- **MoE layers** — two capture paths exist. Dense extraction reads the layer's FFN down-projection, which for MoE models with a dense shared expert (e.g. Qwen2MoE / Qwen3.5 MoE) is `shared_expert.down_proj`; flattened 2D `(tokens, dim)` activations from the shared expert are handled by the hooks. Routed experts are covered by the MoE pipeline (`fit_moe`), which replays the experts loop and captures active-only per-expert CETT. When a shared expert is present, `fit_moe` also captures it read-only and fuses it into the same probe design (`L{layer}:S:N{neuron}` features, gate-weighted by `sigmoid(shared_expert_gate)` when available).
 
 ## H-Neuron Discovery
 
@@ -33,7 +33,7 @@ The discovery pipeline has four steps:
 
 ### 1. Feature Extraction
 
-For each MCQ sample, the model predicts an answer letter by reading logits at the last prompt token. CETT is extracted and the prediction is compared against the ground truth.
+For each MCQ sample, the model predicts an answer letter by reading logits at the last token of the prompt (the answer cue, when used, is part of the prompt). CETT is extracted and the prediction is compared against the ground truth.
 
 ### 2. Labeling
 
