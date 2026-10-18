@@ -166,6 +166,60 @@ class TestPredictLetter:
         logits[ord("C")] = 10.0
         assert _PROBE._predict_letter(logits) == "C"
 
+    def test_option_restricted_argmax(self):
+        logits = torch.zeros(_V)
+        logits[ord("C")] = 10.0
+        logits[ord("B")] = 1.0
+        assert _PROBE._predict_letter(logits, letters=["A", "B"]) == "B"
+        assert _PROBE._predict_letter(logits, letters=["A", "B", "C"]) == "C"
+
+
+class TestMoeFullEncoding:
+    def test_uses_answer_cue_and_last_token(self, monkeypatch):
+        seen = {}
+
+        def fake_tokenize(text):
+            seen["text"] = text
+            return {"input_ids": torch.zeros(1, 7, dtype=torch.long)}
+
+        monkeypatch.setattr(_PROBE, "_tokenize", fake_tokenize)
+        monkeypatch.setattr(_PROBE, "_answer_cue", "\n\nAnswer:", raising=False)
+        _, pos = _PROBE._moe_full_encoding("Q?\nA. x")
+        assert seen["text"].endswith("\n\nAnswer:")
+        assert pos == 6
+
+
+class TestMoeLetterIds:
+    def test_space_prefixed_letters_use_leading_space(self):
+        calls = []
+
+        class _Enc:
+            def encode(self, text, add_special_tokens=False):
+                calls.append(text)
+                return [32, ord(text[-1])]
+
+        probe = HProbes(_PROBE.model, _Enc())
+        ids = probe._get_letter_ids(space_prefixed=True)
+        assert calls and all(t.startswith(" ") for t in calls)
+        assert ids["A"] == ord("A")
+        assert ids["D"] == ord("D")
+
+    def test_bare_ids_unchanged_by_default(self):
+        ids = _PROBE._get_letter_ids()
+        assert ids["A"] == ord("A")
+        assert ids["D"] == ord("D")
+
+
+class TestOptionLetters:
+    def test_dict_options(self):
+        assert HProbes._option_letters({"options": {"A": "x", "B": "y"}}, "options") == ["A", "B"]
+
+    def test_list_options(self):
+        assert HProbes._option_letters({"options": ["x", "y", "z"]}, "options") == ["A", "B", "C"]
+
+    def test_missing_options(self):
+        assert HProbes._option_letters({}, "options") is None
+
 
 class TestWelfordUpdate:
     def test_mean_converges(self):

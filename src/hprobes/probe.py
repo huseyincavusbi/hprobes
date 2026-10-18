@@ -1478,7 +1478,7 @@ class HProbes:
         if layers is None:
             layers = list(range(len(blocks)))
         self._layers = list(layers)
-        self._letter_ids = self._get_letter_ids()
+        self._letter_ids = self._get_letter_ids(space_prefixed=True)
         self._answer_cue = "\n\nAnswer:"
         # MoE layout: intermediate dim from the stacked expert weights.
         self._layer_dims = {
@@ -1510,9 +1510,7 @@ class HProbes:
                         "fit_moe supports readout='logits'; generation readout not wired yet"
                     )
                 prompt = self._format_moe_prompt(sample, question_key, options_key)
-                full = self._tokenize(prompt + self._answer_cue)
-                prompt_enc = self._tokenize(prompt)
-                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                full, decision_pos = self._moe_full_encoding(prompt)
                 # Per-forward records only: clear so sample k's features can
                 # never include sample j<k rows at a coincident position.
                 for cap in captures:
@@ -1520,7 +1518,9 @@ class HProbes:
                 with torch.no_grad():
                     out = self.model(full["input_ids"].to(device))
                 logits = out.logits[0, decision_pos, :]
-                pred = self._predict_letter(logits)
+                pred = self._predict_letter(
+                    logits, letters=self._option_letters(sample, options_key)
+                )
                 gt = self._moe_gt_letter(sample, options_key, answer_key)
                 if pred is None or gt is None:
                     continue
@@ -1609,7 +1609,7 @@ class HProbes:
         if layers is None:
             layers = list(range(len(blocks)))
         self._layers = list(layers)
-        self._letter_ids = self._get_letter_ids()
+        self._letter_ids = self._get_letter_ids(space_prefixed=True)
         self._answer_cue = "\n\nAnswer:"
         device = next(self.model.parameters()).device
 
@@ -1623,9 +1623,7 @@ class HProbes:
 
         def _forward(sample: Dict) -> Dict:
             prompt = self._format_moe_prompt(sample, question_key, options_key)
-            full = self._tokenize(prompt + self._answer_cue)
-            prompt_enc = self._tokenize(prompt)
-            decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+            full, decision_pos = self._moe_full_encoding(prompt)
             for cap in captures.values():
                 cap.clear_records()
             with _t.no_grad():
@@ -1634,7 +1632,9 @@ class HProbes:
             logp = _t.log_softmax(logits.float(), dim=-1)
             return {
                 "decision_pos": decision_pos,
-                "pred": self._predict_letter(logits),
+                "pred": self._predict_letter(
+                    logits, letters=self._option_letters(sample, options_key)
+                ),
                 "entropy": float(-(logp.exp() * logp).sum()),
                 "routing": {
                     li: [int(x) for x in captures[li].routing_table()[decision_pos].tolist()]
@@ -1644,7 +1644,7 @@ class HProbes:
                     li: [float(x) for x in captures[li].gate_table()[decision_pos].tolist()]
                     for li in self._layers
                 },
-                "prompt_len": int(prompt_enc["input_ids"].shape[1]),
+                "prompt_len": int(self._tokenize(prompt)["input_ids"].shape[1]),
             }
 
         try:
@@ -1793,7 +1793,7 @@ class HProbes:
         if layers is None:
             layers = list(range(len(blocks)))
         self._layers = list(layers)
-        self._letter_ids = self._get_letter_ids()
+        self._letter_ids = self._get_letter_ids(space_prefixed=True)
         self._answer_cue = "\n\nAnswer:"
         device = next(self.model.parameters()).device
 
@@ -1811,14 +1811,15 @@ class HProbes:
         try:
             for sample in samples:
                 prompt = self._format_moe_prompt(sample, question_key, options_key)
-                full = self._tokenize(prompt + self._answer_cue)
-                prompt_enc = self._tokenize(prompt)
-                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                full, decision_pos = self._moe_full_encoding(prompt)
                 for cap in captures.values():
                     cap.clear_records()
                 with _t.no_grad():
                     out = self.model(full["input_ids"].to(device))
-                pred = self._predict_letter(out.logits[0, decision_pos, :])
+                pred = self._predict_letter(
+                    out.logits[0, decision_pos, :],
+                    letters=self._option_letters(sample, options_key),
+                )
                 gt = self._moe_gt_letter(sample, options_key, answer_key)
                 if pred is None or gt is None:
                     continue
@@ -1878,6 +1879,28 @@ class HProbes:
         else:
             opt_txt = "\n".join(f"{chr(65 + i)}. {v}" for i, v in enumerate(options))
         return f"{question}\n{opt_txt}"
+
+    def _moe_full_encoding(self, prompt: str):
+        """Tokenize ``prompt + answer cue`` and return (encoding, last-token index).
+
+        The MoE readout must use the last token the model actually sees; the
+        answer cue is part of the input, so the decision position is the final
+        token of the combined encoding.
+        """
+        full = self._tokenize(prompt + self._answer_cue)
+        return full, int(full["input_ids"].shape[1]) - 1
+
+    @staticmethod
+    def _option_letters(sample: Dict, options_key: str) -> Optional[List[str]]:
+        """MCQ letter keys for a sample (dict keys or positional letters)."""
+        options = sample.get(options_key, {})
+        if isinstance(options, dict):
+            letters = [str(k) for k in options]
+        elif isinstance(options, (list, tuple)):
+            letters = [chr(65 + i) for i in range(len(options))]
+        else:
+            return None
+        return letters or None
 
     @staticmethod
     def _moe_gt_letter(sample: Dict, options_key: str, answer_key: str) -> Optional[str]:
@@ -3194,18 +3217,31 @@ class HProbes:
     # Tokenizer / logit helpers
     # ------------------------------------------------------------------
 
-    def _get_letter_ids(self) -> Dict[str, int]:
-        """Map MCQ letters → single token id each."""
+    def _get_letter_ids(self, space_prefixed: bool = False) -> Dict[str, int]:
+        """Map MCQ letters → single token id each.
+
+        ``space_prefixed`` targets the tokens models emit in text (``" A"``
+        rather than ``"A"``); the last id is used so a split prefix cannot
+        shadow the letter token.
+        """
         letter_ids = {}
         for letter in _MCQ_LETTERS:
-            ids = self.tokenizer.encode(letter, add_special_tokens=False)
+            text = f" {letter}" if space_prefixed else letter
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
             if ids:
-                letter_ids[letter] = ids[0]
+                letter_ids[letter] = ids[-1] if space_prefixed else ids[0]
         return letter_ids
 
-    def _predict_letter(self, logits: torch.Tensor) -> str:
-        """Pick the MCQ letter with the highest logit."""
-        return max(self._letter_ids.items(), key=lambda kv: logits[kv[1]].item())[0]
+    def _predict_letter(self, logits: torch.Tensor, letters: Optional[List[str]] = None) -> str:
+        """Pick the MCQ letter with the highest logit.
+
+        ``letters`` optionally restricts the argmax to the sample's option
+        keys (e.g. A-D for four-option questions).
+        """
+        candidates = {k: v for k, v in self._letter_ids.items() if letters is None or k in letters}
+        if not candidates:
+            candidates = self._letter_ids
+        return max(candidates.items(), key=lambda kv: logits[kv[1]].item())[0]
 
     def _consistency_predict(self, tokens: Dict[str, torch.Tensor], n: int) -> Optional[str]:
         """Sample n predictions from the letter distribution and return the agreed letter.
