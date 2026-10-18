@@ -90,11 +90,13 @@ def fingerprint_model(model: Any, layers: List[int]) -> str:
     parameter tensors: catches silent weight swaps without hashing
     gigabytes. Deterministic for a fixed state dict, and never copies
     the full parameter set to host memory (see ``_chunked_sums``).
+    Meta parameters (accelerate CPU/disk offload placeholders) carry no
+    data and are skipped.
     """
 
-    params = list(model.parameters())
+    params = [p for p in model.parameters() if not p.is_meta]
     if not params:
-        raise ValueError("model has no parameters to fingerprint")
+        raise ValueError("model has no materialized parameters to fingerprint")
     picks = [params[0], params[len(params) // 2], params[-1]]
     parts = [type(model).__name__, str(list(layers))]
     for p in picks:
