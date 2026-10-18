@@ -22,6 +22,7 @@ shared by Olmoe/Qwen2Moe/Qwen3.5MoE/DeepSeek-style blocks in transformers.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -132,7 +133,11 @@ class MoECapture:
         # token positions before anything consumes them.
         self._routing_override: Optional[Dict[str, Any]] = None
 
-    def attach(self, experts_module: torch.nn.Module) -> torch.utils.hooks.RemovableHandle:
+    def attach(
+        self,
+        experts_module: torch.nn.Module,
+        allow_eager_switch: bool = False,
+    ) -> torch.utils.hooks.RemovableHandle:
         """Wrap the experts module forward to capture per-expert activations.
 
         The family loop calls ``F.linear(act, down_proj[e])`` on *parameter
@@ -147,7 +152,10 @@ class MoECapture:
         transformers dispatches ``batched_mm``/``grouped_mm`` fast experts
         paths for loaded models, and the eager replay would then diverge from
         the model's actual forward. Load with
-        ``experts_implementation="eager"``.
+        ``experts_implementation="eager"``, or pass
+        ``allow_eager_switch=True`` to switch a loaded model's config in
+        place (a warning is emitted; every subsequent forward of the model
+        then runs the eager loop).
         """
         config = getattr(experts_module, "config", None)
         impls = {
@@ -156,12 +164,24 @@ class MoECapture:
         }
         dispatched = sorted(i for i in impls if i not in (None, "eager"))
         if dispatched:
-            raise ValueError(
-                f"experts module dispatches {dispatched[0]!r} from transformers' experts "
-                "interface, but MoECapture replays the 'eager' implementation and would "
-                "not be bit-identical to the model. Load the model with "
-                "`experts_implementation='eager'`."
+            if not allow_eager_switch:
+                raise ValueError(
+                    f"experts module dispatches {dispatched[0]!r} from transformers' experts "
+                    "interface, but MoECapture replays the 'eager' implementation and would "
+                    "not be bit-identical to the model. Load the model with "
+                    "`experts_implementation='eager'`, or pass `allow_eager_switch=True` to "
+                    "switch this model in place (affects all subsequent forwards in this "
+                    "process)."
+                )
+            warnings.warn(
+                f"switching experts implementation from {dispatched[0]!r} to 'eager' in "
+                "place; all subsequent forwards of this model now run the eager experts "
+                "loop.",
+                stacklevel=2,
             )
+            for field_name in ("_experts_implementation", "_experts_implementation_internal"):
+                if hasattr(config, field_name):
+                    setattr(config, field_name, "eager")
         import types
 
         cap = self

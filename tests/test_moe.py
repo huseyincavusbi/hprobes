@@ -176,6 +176,20 @@ class TestMoECapture:
         handle = cap.attach(self.experts)
         handle.remove()
 
+    def test_attach_allow_eager_switch(self):
+        """Explicit opt-in may switch a loaded model to eager in place."""
+
+        class _Cfg:
+            _experts_implementation = "grouped_mm"
+
+        cfg = _Cfg()
+        self.experts.config = cfg
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        with pytest.warns(UserWarning, match="eager"):
+            handle = cap.attach(self.experts, allow_eager_switch=True)
+        assert cfg._experts_implementation == "eager"
+        handle.remove()
+
     def test_sentinel_expert_class_skipped_like_family(self):
         """The extra one-hot class is a sentinel: skip it, never record it.
 
