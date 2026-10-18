@@ -120,6 +120,44 @@ class TestMoECapture:
         total = sum(row["n_active"] for row in summary)
         assert total == self.top_k_index.numel()
 
+    def test_records_pair_rows_with_family_loop_order(self):
+        """Recorded metadata must pair 1:1 with the activation rows.
+
+        Regression: metadata was re-derived token-major while the family loop
+        replays the slot-major order of its ``(k, T)`` expert mask, permuting
+        ``tokens``/``slots``/``gates`` relative to ``acts`` whenever an expert
+        sat at crossing (token, slot) pairs.
+        """
+        hidden = self.hidden
+        # expert 0 at (t0, s1) and (t1, s0): token-major is [t0s1, t1s0],
+        # slot-major (loop order) is [t1s0, t0s1] -- the orders diverge.
+        top_k_index = torch.tensor([[1, 0], [0, 1], [2, 3], [3, 2], [2, 0], [1, 3]])
+        weights = torch.full((6, 2), 0.5)
+
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        handle = cap.attach(self.experts)
+        self.experts(hidden, top_k_index, weights)
+        handle.remove()
+
+        rows = 0
+        for rec in cap.records:
+            e = rec["expert"]
+            toks = rec["tokens"]
+            # Recompute in the same batched form the loop used: per-row 1-D
+            # evaluation is not bit-comparable (BLAS uses different kernels
+            # for single-row vs batched inputs). Comparing the full tensor
+            # also pins the row ORDER, not just per-row content.
+            gate, up = torch.nn.functional.linear(hidden[toks], self.experts.gate_up_proj[e]).chunk(
+                2, dim=-1
+            )
+            expected = self.experts.act_fn(gate) * up
+            assert torch.equal(rec["acts"], expected)
+            for j in range(toks.shape[0]):
+                t, s = int(toks[j]), int(rec["slots"][j])
+                assert float(rec["gates"][j]) == float(weights[t, s])
+                rows += 1
+        assert rows == top_k_index.numel()
+
     def test_routing_and_gate_tables(self):
         cap = MoECapture(num_experts=self.num_experts, layer=0)
         handle = cap.attach(self.experts)

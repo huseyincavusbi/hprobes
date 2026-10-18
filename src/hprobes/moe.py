@@ -190,7 +190,7 @@ class MoECapture:
                         act = act.clone()
                         for j in names:
                             act[:, j] = act[:, j] * alpha
-                cap.record_expert(expert_idx, act)
+                cap.record_expert(expert_idx, act, top_k_pos=top_k_pos, token_idx=token_idx)
                 out = torch.nn.functional.linear(act, self_mod.down_proj[expert_idx])
                 out = out * top_k_weights[token_idx, top_k_pos, None]
                 final_hidden_states.index_add_(0, token_idx, out.to(final_hidden_states.dtype))
@@ -205,17 +205,31 @@ class MoECapture:
 
         return _Handle()
 
-    def record_expert(self, expert: int, activations: torch.Tensor) -> None:
-        """Called once per expert per layer-forward with its pre-down_proj activations."""
+    def record_expert(
+        self,
+        expert: int,
+        activations: torch.Tensor,
+        top_k_pos: Optional[torch.Tensor] = None,
+        token_idx: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Called once per expert per layer-forward with its pre-down_proj activations.
+
+        ``top_k_pos`` and ``token_idx`` are the (slot, token) routing rows for
+        this expert in the family loop's row order; the wrapping loop passes
+        its own indices so recorded rows pair 1:1 with ``activations``.
+        External callers may omit them: they are then re-derived in the same
+        slot-major order of the loop's ``(k, T)`` expert mask.
+        """
         ctx = self._ctx
         if not ctx:
             raise RuntimeError("record_expert called before routing context was captured")
         top_k_index = ctx["top_k_index"]
         top_k_weights = ctx["top_k_weights"]
-        # token positions x slots where this expert is selected
-        mask = top_k_index == expert
-        token_idx, slot_idx = torch.where(mask)
-        gates = top_k_weights[token_idx, slot_idx]
+        if top_k_pos is None or token_idx is None:
+            # row-major over the (k, T) expert mask: same order as the family
+            # loop's torch.where(expert_mask[expert_idx]) row replay.
+            top_k_pos, token_idx = torch.where((top_k_index == expert).t())
+        gates = top_k_weights[token_idx, top_k_pos]
         if activations.shape[0] != token_idx.shape[0]:
             raise ValueError(
                 f"activation rows {activations.shape[0]} != selected tokens {token_idx.shape[0]} "
@@ -228,7 +242,7 @@ class MoECapture:
                 "layer": self.layer,
                 "expert": expert,
                 "tokens": token_idx.detach().cpu(),
-                "slots": slot_idx.detach().cpu(),
+                "slots": top_k_pos.detach().cpu(),
                 "gates": gates.detach().float().cpu(),
                 "token_norm": norm.detach().float().cpu(),
                 "acts": activations.detach().float().cpu(),
