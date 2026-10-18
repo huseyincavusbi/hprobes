@@ -210,6 +210,26 @@ class TestMoECapture:
         assert torch.equal(wrapped, base)
         assert all(rec["expert"] != sentinel for rec in cap.records)
 
+    def test_routing_override_casts_to_model_dtype(self):
+        """Override tensors must be cast to the routing tensors' dtypes.
+
+        Real models route in bf16; fp32 override weights previously hit an
+        in-place index-put dtype error inside the capture wrapper.
+        """
+        top_k_index = torch.tensor([[0, 1], [2, 3], [0, 3], [1, 2], [0, 2], [1, 3]])
+        top_k_weights = torch.full((6, 2), 0.5, dtype=torch.bfloat16)
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        handle = cap.attach(self.experts)
+        cap.set_routing_override(
+            [3], torch.tensor([[2, 1]]), torch.tensor([[0.25, 0.75]], dtype=torch.float)
+        )
+        out = self.experts(self.hidden, top_k_index, top_k_weights)
+        handle.remove()
+        assert out.dtype == self.hidden.dtype
+        assert cap._ctx["top_k_weights"].dtype == torch.bfloat16
+        eff_w = cap.gate_table()
+        assert [float(x) for x in eff_w[3]] == [0.25, 0.75]
+
     def test_routing_and_gate_tables(self):
         cap = MoECapture(num_experts=self.num_experts, layer=0)
         handle = cap.attach(self.experts)

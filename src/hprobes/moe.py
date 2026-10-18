@@ -195,9 +195,13 @@ class MoECapture:
                 top_k_index = top_k_index.clone()
                 top_k_weights = top_k_weights.clone()
                 pos = ov["positions"].to(top_k_index.device)
-                top_k_index[pos] = ov["experts"].to(top_k_index.device)
+                top_k_index[pos] = ov["experts"].to(
+                    device=top_k_index.device, dtype=top_k_index.dtype
+                )
                 if ov["weights"] is not None:
-                    top_k_weights[pos] = ov["weights"].to(top_k_weights.device)
+                    top_k_weights[pos] = ov["weights"].to(
+                        device=top_k_weights.device, dtype=top_k_weights.dtype
+                    )
             # Seed routing context: record_expert reads it per expert below.
             cap._ctx = {
                 "top_k_index": top_k_index.detach(),
