@@ -87,16 +87,24 @@ def fingerprint_model(model: Any, layers: List[int]) -> str:
     """Cheap stable fingerprint of model weights for cache keys.
 
     Hashes element counts plus sums of the first, middle and last
-    parameter tensors: catches silent weight swaps without hashing
-    gigabytes. Deterministic for a fixed state dict, and never copies
-    the full parameter set to host memory (see ``_chunked_sums``).
+    materialized parameter tensors: catches silent weight swaps without
+    hashing gigabytes. The structural signature (shapes + dtypes of ALL
+    parameters, including offloaded meta placeholders) is always included,
+    so offload never hides model structure. Deterministic for a fixed
+    state dict; meta parameters carry no values and are skipped as data
+    sources only.
     """
 
     params = list(model.parameters())
     if not params:
         raise ValueError("model has no parameters to fingerprint")
-    picks = [params[0], params[len(params) // 2], params[-1]]
+    materialized = [p for p in params if not p.is_meta]
+    if not materialized:
+        raise ValueError("model has no materialized parameters to fingerprint")
+    picks = [materialized[0], materialized[len(materialized) // 2], materialized[-1]]
     parts = [type(model).__name__, str(list(layers))]
+    shape_sig = "|".join(f"{tuple(p.shape)}:{p.dtype}" for p in params)
+    parts.append(hashlib.sha256(shape_sig.encode()).hexdigest()[:16])
     for p in picks:
         total, total_abs = _chunked_sums(p)
         parts.append(f"{p.numel()}:{total:.6f}:{total_abs:.6f}")

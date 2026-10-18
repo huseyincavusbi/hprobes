@@ -74,6 +74,39 @@ def test_fingerprint_handles_bf16_params():
     assert fingerprint_model(m, [0]) != a
 
 
+def test_fingerprint_skips_meta_parameters():
+    """Offloaded (meta) parameters carry no data and must be skipped."""
+
+    class _WithMeta(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Parameter(torch.zeros(2, 2))
+            self.b = nn.Parameter(torch.empty(2, 2, device="meta"))
+
+        def forward(self, x):
+            return x
+
+    m = _WithMeta()
+    fp = fingerprint_model(m, [0])
+    assert isinstance(fp, str)
+    assert fp == fingerprint_model(m, [0])
+
+
+def test_fingerprint_covers_structure_of_meta_parameters():
+    """Offloaded params have no values, but their structure must still hash."""
+
+    class _Model(nn.Module):
+        def __init__(self, meta_shape):
+            super().__init__()
+            self.a = nn.Parameter(torch.zeros(2, 2))
+            self.b = nn.Parameter(torch.empty(*meta_shape, device="meta"))
+
+        def forward(self, x):
+            return x
+
+    assert fingerprint_model(_Model((3, 3)), [0]) != fingerprint_model(_Model((4, 4)), [0])
+
+
 def test_rows_key_stable_and_sensitive():
     samples = [{"question": "q", "answer": "A"}]
     cfg = {"layers": [0], "batch_size": 1}
