@@ -185,12 +185,18 @@ class MoECapture:
                 "token_norm": hidden_states.detach().float().norm(dim=-1).cpu(),
             }
             with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=cap.num_experts)
+                # num_experts + 1 mirrors the family one-hot: the extra class
+                # is a sentinel for dropped slots, skipped in the loop below.
+                expert_mask = torch.nn.functional.one_hot(
+                    top_k_index, num_classes=cap.num_experts + 1
+                )
                 expert_mask = expert_mask.permute(2, 1, 0)
                 expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             final_hidden_states = torch.zeros_like(hidden_states)
             for expert_idx in expert_hit:
                 expert_idx = int(expert_idx[0])
+                if expert_idx == cap.num_experts:
+                    continue
                 top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
                 current_state = hidden_states[token_idx]
                 gate, up = torch.nn.functional.linear(

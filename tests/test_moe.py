@@ -21,15 +21,18 @@ def _toy_experts(num_experts=4, d_in=8, d_inter=6):
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
             # Family-faithful ordering: mirrors Olmoe/Qwen2Moe/Qwen3.5MoE
-            # experts modules (one_hot -> permute -> slot-major where). Row
+            # experts modules (one_hot -> permute -> slot-major where), including
+            # the extra sentinel class (num_experts + 1) that is skipped. Row
             # order inside each expert's batched matmul matters for bitwise
             # equality on some BLAS backends, so the toy must match the real
             # families -- and the MoECapture wrapper replays exactly this.
             final = torch.zeros_like(hidden_states)
             expert_mask = torch.nn.functional.one_hot(
-                top_k_index, num_classes=self.num_experts
+                top_k_index, num_classes=self.num_experts + 1
             ).permute(2, 1, 0)
-            for e in range(self.num_experts):
+            for e in range(self.num_experts + 1):
+                if e == self.num_experts:
+                    continue
                 if expert_mask[e].sum() == 0:
                     continue
                 top_k_pos, token_idx = torch.where(expert_mask[e])
@@ -172,6 +175,26 @@ class TestMoECapture:
         _Cfg._experts_implementation = "eager"
         handle = cap.attach(self.experts)
         handle.remove()
+
+    def test_sentinel_expert_class_skipped_like_family(self):
+        """The extra one-hot class is a sentinel: skip it, never record it.
+
+        transformers' expert modules build one_hot with ``num_experts + 1``
+        classes and silently drop rows routed to the sentinel class; the
+        capture replay must mirror that instead of crashing or recording it.
+        """
+        sentinel = self.num_experts
+        top_k_index = torch.tensor([[0, sentinel], [1, 2], [sentinel, 3], [2, 0], [3, 1], [0, 2]])
+        weights = torch.full((6, 2), 0.5)
+        base = self.experts(self.hidden, top_k_index, weights)
+
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        handle = cap.attach(self.experts)
+        wrapped = self.experts(self.hidden, top_k_index, weights)
+        handle.remove()
+
+        assert torch.equal(wrapped, base)
+        assert all(rec["expert"] != sentinel for rec in cap.records)
 
     def test_routing_and_gate_tables(self):
         cap = MoECapture(num_experts=self.num_experts, layer=0)
