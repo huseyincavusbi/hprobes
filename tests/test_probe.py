@@ -166,6 +166,13 @@ class TestPredictLetter:
         logits[ord("C")] = 10.0
         assert _PROBE._predict_letter(logits) == "C"
 
+    def test_option_restricted_argmax(self):
+        logits = torch.zeros(_V)
+        logits[ord("C")] = 10.0
+        logits[ord("B")] = 1.0
+        assert _PROBE._predict_letter(logits, letters=["A", "B"]) == "B"
+        assert _PROBE._predict_letter(logits, letters=["A", "B", "C"]) == "C"
+
 
 class TestMoeFullEncoding:
     def test_uses_answer_cue_and_last_token(self, monkeypatch):
@@ -201,6 +208,17 @@ class TestMoeLetterIds:
         ids = _PROBE._get_letter_ids()
         assert ids["A"] == ord("A")
         assert ids["D"] == ord("D")
+
+
+class TestOptionLetters:
+    def test_dict_options(self):
+        assert HProbes._option_letters({"options": {"A": "x", "B": "y"}}, "options") == ["A", "B"]
+
+    def test_list_options(self):
+        assert HProbes._option_letters({"options": ["x", "y", "z"]}, "options") == ["A", "B", "C"]
+
+    def test_missing_options(self):
+        assert HProbes._option_letters({}, "options") is None
 
 
 class TestWelfordUpdate:

@@ -1518,7 +1518,9 @@ class HProbes:
                 with torch.no_grad():
                     out = self.model(full["input_ids"].to(device))
                 logits = out.logits[0, decision_pos, :]
-                pred = self._predict_letter(logits)
+                pred = self._predict_letter(
+                    logits, letters=self._option_letters(sample, options_key)
+                )
                 gt = self._moe_gt_letter(sample, options_key, answer_key)
                 if pred is None or gt is None:
                     continue
@@ -1630,7 +1632,9 @@ class HProbes:
             logp = _t.log_softmax(logits.float(), dim=-1)
             return {
                 "decision_pos": decision_pos,
-                "pred": self._predict_letter(logits),
+                "pred": self._predict_letter(
+                    logits, letters=self._option_letters(sample, options_key)
+                ),
                 "entropy": float(-(logp.exp() * logp).sum()),
                 "routing": {
                     li: [int(x) for x in captures[li].routing_table()[decision_pos].tolist()]
@@ -1812,7 +1816,10 @@ class HProbes:
                     cap.clear_records()
                 with _t.no_grad():
                     out = self.model(full["input_ids"].to(device))
-                pred = self._predict_letter(out.logits[0, decision_pos, :])
+                pred = self._predict_letter(
+                    out.logits[0, decision_pos, :],
+                    letters=self._option_letters(sample, options_key),
+                )
                 gt = self._moe_gt_letter(sample, options_key, answer_key)
                 if pred is None or gt is None:
                     continue
@@ -1882,6 +1889,18 @@ class HProbes:
         """
         full = self._tokenize(prompt + self._answer_cue)
         return full, int(full["input_ids"].shape[1]) - 1
+
+    @staticmethod
+    def _option_letters(sample: Dict, options_key: str) -> Optional[List[str]]:
+        """MCQ letter keys for a sample (dict keys or positional letters)."""
+        options = sample.get(options_key, {})
+        if isinstance(options, dict):
+            letters = [str(k) for k in options]
+        elif isinstance(options, (list, tuple)):
+            letters = [chr(65 + i) for i in range(len(options))]
+        else:
+            return None
+        return letters or None
 
     @staticmethod
     def _moe_gt_letter(sample: Dict, options_key: str, answer_key: str) -> Optional[str]:
@@ -3213,9 +3232,16 @@ class HProbes:
                 letter_ids[letter] = ids[-1] if space_prefixed else ids[0]
         return letter_ids
 
-    def _predict_letter(self, logits: torch.Tensor) -> str:
-        """Pick the MCQ letter with the highest logit."""
-        return max(self._letter_ids.items(), key=lambda kv: logits[kv[1]].item())[0]
+    def _predict_letter(self, logits: torch.Tensor, letters: Optional[List[str]] = None) -> str:
+        """Pick the MCQ letter with the highest logit.
+
+        ``letters`` optionally restricts the argmax to the sample's option
+        keys (e.g. A-D for four-option questions).
+        """
+        candidates = {k: v for k, v in self._letter_ids.items() if letters is None or k in letters}
+        if not candidates:
+            candidates = self._letter_ids
+        return max(candidates.items(), key=lambda kv: logits[kv[1]].item())[0]
 
     def _consistency_predict(self, tokens: Dict[str, torch.Tensor], n: int) -> Optional[str]:
         """Sample n predictions from the letter distribution and return the agreed letter.
