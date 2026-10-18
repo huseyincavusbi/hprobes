@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -65,21 +65,41 @@ class CETTRows:
         return self.welford_M2 / max(self.welford_n - 1, 1)
 
 
+def _chunked_sums(param: Any, chunk: int = 1 << 22) -> Tuple[float, float]:
+    """Sum and abs-sum of a parameter without materializing fp32 copies.
+
+    Parameters can be huge (a bf16 7B model holds ~14 GB of weights); a
+    whole-tensor ``.cpu().float()`` would need tens of gigabytes of host
+    memory. Chunked fp32 accumulation keeps peak extra memory at ~16 MB
+    and stays deterministic for a fixed state dict.
+    """
+    flat = param.detach().reshape(-1)
+    total = 0.0
+    total_abs = 0.0
+    for start in range(0, flat.numel(), chunk):
+        part = flat[start : start + chunk].float().cpu()
+        total += float(part.sum())
+        total_abs += float(part.abs().sum())
+    return total, total_abs
+
+
 def fingerprint_model(model: Any, layers: List[int]) -> str:
     """Cheap stable fingerprint of model weights for cache keys.
 
     Hashes element counts plus sums of the first, middle and last
     parameter tensors: catches silent weight swaps without hashing
-    gigabytes. Deterministic for a fixed state dict.
+    gigabytes. Deterministic for a fixed state dict, and never copies
+    the full parameter set to host memory (see ``_chunked_sums``).
     """
 
-    params = [p.detach().cpu().float() for p in model.parameters()]
+    params = list(model.parameters())
     if not params:
         raise ValueError("model has no parameters to fingerprint")
     picks = [params[0], params[len(params) // 2], params[-1]]
     parts = [type(model).__name__, str(list(layers))]
     for p in picks:
-        parts.append(f"{p.numel()}:{float(p.sum()):.6f}:{float(p.abs().sum()):.6f}")
+        total, total_abs = _chunked_sums(p)
+        parts.append(f"{p.numel()}:{total:.6f}:{total_abs:.6f}")
     try:
         import transformers  # noqa: PLC0415
 
