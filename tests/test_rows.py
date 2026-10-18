@@ -92,6 +92,21 @@ def test_fingerprint_skips_meta_parameters():
     assert fp == fingerprint_model(m, [0])
 
 
+def test_fingerprint_covers_structure_of_meta_parameters():
+    """Offloaded params have no values, but their structure must still hash."""
+
+    class _Model(nn.Module):
+        def __init__(self, meta_shape):
+            super().__init__()
+            self.a = nn.Parameter(torch.zeros(2, 2))
+            self.b = nn.Parameter(torch.empty(*meta_shape, device="meta"))
+
+        def forward(self, x):
+            return x
+
+    assert fingerprint_model(_Model((3, 3)), [0]) != fingerprint_model(_Model((4, 4)), [0])
+
+
 def test_rows_key_stable_and_sensitive():
     samples = [{"question": "q", "answer": "A"}]
     cfg = {"layers": [0], "batch_size": 1}
