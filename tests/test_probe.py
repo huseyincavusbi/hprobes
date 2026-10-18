@@ -167,6 +167,21 @@ class TestPredictLetter:
         assert _PROBE._predict_letter(logits) == "C"
 
 
+class TestMoeFullEncoding:
+    def test_uses_answer_cue_and_last_token(self, monkeypatch):
+        seen = {}
+
+        def fake_tokenize(text):
+            seen["text"] = text
+            return {"input_ids": torch.zeros(1, 7, dtype=torch.long)}
+
+        monkeypatch.setattr(_PROBE, "_tokenize", fake_tokenize)
+        monkeypatch.setattr(_PROBE, "_answer_cue", "\n\nAnswer:", raising=False)
+        _, pos = _PROBE._moe_full_encoding("Q?\nA. x")
+        assert seen["text"].endswith("\n\nAnswer:")
+        assert pos == 6
+
+
 class TestWelfordUpdate:
     def test_mean_converges(self):
         p = HProbes(MODEL, TOK)

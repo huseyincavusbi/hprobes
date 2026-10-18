@@ -1510,9 +1510,7 @@ class HProbes:
                         "fit_moe supports readout='logits'; generation readout not wired yet"
                     )
                 prompt = self._format_moe_prompt(sample, question_key, options_key)
-                full = self._tokenize(prompt + self._answer_cue)
-                prompt_enc = self._tokenize(prompt)
-                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                full, decision_pos = self._moe_full_encoding(prompt)
                 # Per-forward records only: clear so sample k's features can
                 # never include sample j<k rows at a coincident position.
                 for cap in captures:
@@ -1623,9 +1621,7 @@ class HProbes:
 
         def _forward(sample: Dict) -> Dict:
             prompt = self._format_moe_prompt(sample, question_key, options_key)
-            full = self._tokenize(prompt + self._answer_cue)
-            prompt_enc = self._tokenize(prompt)
-            decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+            full, decision_pos = self._moe_full_encoding(prompt)
             for cap in captures.values():
                 cap.clear_records()
             with _t.no_grad():
@@ -1644,7 +1640,7 @@ class HProbes:
                     li: [float(x) for x in captures[li].gate_table()[decision_pos].tolist()]
                     for li in self._layers
                 },
-                "prompt_len": int(prompt_enc["input_ids"].shape[1]),
+                "prompt_len": int(self._tokenize(prompt)["input_ids"].shape[1]),
             }
 
         try:
@@ -1811,9 +1807,7 @@ class HProbes:
         try:
             for sample in samples:
                 prompt = self._format_moe_prompt(sample, question_key, options_key)
-                full = self._tokenize(prompt + self._answer_cue)
-                prompt_enc = self._tokenize(prompt)
-                decision_pos = int(prompt_enc["input_ids"].shape[1]) - 1
+                full, decision_pos = self._moe_full_encoding(prompt)
                 for cap in captures.values():
                     cap.clear_records()
                 with _t.no_grad():
@@ -1878,6 +1872,16 @@ class HProbes:
         else:
             opt_txt = "\n".join(f"{chr(65 + i)}. {v}" for i, v in enumerate(options))
         return f"{question}\n{opt_txt}"
+
+    def _moe_full_encoding(self, prompt: str):
+        """Tokenize ``prompt + answer cue`` and return (encoding, last-token index).
+
+        The MoE readout must use the last token the model actually sees; the
+        answer cue is part of the input, so the decision position is the final
+        token of the combined encoding.
+        """
+        full = self._tokenize(prompt + self._answer_cue)
+        return full, int(full["input_ids"].shape[1]) - 1
 
     @staticmethod
     def _moe_gt_letter(sample: Dict, options_key: str, answer_key: str) -> Optional[str]:
