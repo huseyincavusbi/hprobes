@@ -182,6 +182,27 @@ class TestMoeFullEncoding:
         assert pos == 6
 
 
+class TestMoeLetterIds:
+    def test_space_prefixed_letters_use_leading_space(self):
+        calls = []
+
+        class _Enc:
+            def encode(self, text, add_special_tokens=False):
+                calls.append(text)
+                return [32, ord(text[-1])]
+
+        probe = HProbes(_PROBE.model, _Enc())
+        ids = probe._get_letter_ids(space_prefixed=True)
+        assert calls and all(t.startswith(" ") for t in calls)
+        assert ids["A"] == ord("A")
+        assert ids["D"] == ord("D")
+
+    def test_bare_ids_unchanged_by_default(self):
+        ids = _PROBE._get_letter_ids()
+        assert ids["A"] == ord("A")
+        assert ids["D"] == ord("D")
+
+
 class TestWelfordUpdate:
     def test_mean_converges(self):
         p = HProbes(MODEL, TOK)

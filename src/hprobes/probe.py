@@ -1478,7 +1478,7 @@ class HProbes:
         if layers is None:
             layers = list(range(len(blocks)))
         self._layers = list(layers)
-        self._letter_ids = self._get_letter_ids()
+        self._letter_ids = self._get_letter_ids(space_prefixed=True)
         self._answer_cue = "\n\nAnswer:"
         # MoE layout: intermediate dim from the stacked expert weights.
         self._layer_dims = {
@@ -1607,7 +1607,7 @@ class HProbes:
         if layers is None:
             layers = list(range(len(blocks)))
         self._layers = list(layers)
-        self._letter_ids = self._get_letter_ids()
+        self._letter_ids = self._get_letter_ids(space_prefixed=True)
         self._answer_cue = "\n\nAnswer:"
         device = next(self.model.parameters()).device
 
@@ -1789,7 +1789,7 @@ class HProbes:
         if layers is None:
             layers = list(range(len(blocks)))
         self._layers = list(layers)
-        self._letter_ids = self._get_letter_ids()
+        self._letter_ids = self._get_letter_ids(space_prefixed=True)
         self._answer_cue = "\n\nAnswer:"
         device = next(self.model.parameters()).device
 
@@ -3198,13 +3198,19 @@ class HProbes:
     # Tokenizer / logit helpers
     # ------------------------------------------------------------------
 
-    def _get_letter_ids(self) -> Dict[str, int]:
-        """Map MCQ letters → single token id each."""
+    def _get_letter_ids(self, space_prefixed: bool = False) -> Dict[str, int]:
+        """Map MCQ letters → single token id each.
+
+        ``space_prefixed`` targets the tokens models emit in text (``" A"``
+        rather than ``"A"``); the last id is used so a split prefix cannot
+        shadow the letter token.
+        """
         letter_ids = {}
         for letter in _MCQ_LETTERS:
-            ids = self.tokenizer.encode(letter, add_special_tokens=False)
+            text = f" {letter}" if space_prefixed else letter
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
             if ids:
-                letter_ids[letter] = ids[0]
+                letter_ids[letter] = ids[-1] if space_prefixed else ids[0]
         return letter_ids
 
     def _predict_letter(self, logits: torch.Tensor) -> str:
