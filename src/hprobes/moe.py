@@ -142,7 +142,26 @@ class MoECapture:
         the family's own one-hot would select, and we reuse the model's
         weights (gate_up_proj / down_proj parameters) to recompute them.
         Outputs are bit-identical to the family implementation.
+
+        Requires the model to run the ``eager`` experts implementation:
+        transformers dispatches ``batched_mm``/``grouped_mm`` fast experts
+        paths for loaded models, and the eager replay would then diverge from
+        the model's actual forward. Load with
+        ``experts_implementation="eager"``.
         """
+        config = getattr(experts_module, "config", None)
+        impls = {
+            getattr(config, "_experts_implementation", None),
+            getattr(config, "_experts_implementation_internal", None),
+        }
+        dispatched = sorted(i for i in impls if i not in (None, "eager"))
+        if dispatched:
+            raise ValueError(
+                f"experts module dispatches {dispatched[0]!r} from transformers' experts "
+                "interface, but MoECapture replays the 'eager' implementation and would "
+                "not be bit-identical to the model. Load the model with "
+                "`experts_implementation='eager'`."
+            )
         import types
 
         cap = self

@@ -1,6 +1,7 @@
 """Tests for active-only per-expert MoE capture (issue #41, phase 0)."""
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -157,6 +158,20 @@ class TestMoECapture:
                 assert float(rec["gates"][j]) == float(weights[t, s])
                 rows += 1
         assert rows == top_k_index.numel()
+
+    def test_attach_rejects_non_eager_experts_implementation(self):
+        """Dispatched `batched_mm`/`grouped_mm` paths void the eager replay."""
+
+        class _Cfg:
+            _experts_implementation = "grouped_mm"
+
+        self.experts.config = _Cfg()
+        cap = MoECapture(num_experts=self.num_experts, layer=0)
+        with pytest.raises(ValueError, match="eager"):
+            cap.attach(self.experts)
+        _Cfg._experts_implementation = "eager"
+        handle = cap.attach(self.experts)
+        handle.remove()
 
     def test_routing_and_gate_tables(self):
         cap = MoECapture(num_experts=self.num_experts, layer=0)
