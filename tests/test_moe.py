@@ -769,3 +769,101 @@ class TestRoutingAwareIntervention:
             assert "features" in str(e)
             return
         raise AssertionError("expected ValueError")
+
+
+class _FakeOffloadHook:
+    """Minimal accelerate-style offload hook (contract mirrored from hooks.py)."""
+
+    offload = True
+
+    def __init__(self, weights_map, device):
+        self.weights_map = weights_map
+        self.execution_device = device
+        self.pre_calls = 0
+        self.post_calls = 0
+
+    def pre_forward(self, module, *args, **kwargs):
+        self.pre_calls += 1
+        for name, param in module.named_parameters():
+            if param.device.type == "meta":
+                setattr(
+                    module,
+                    name,
+                    nn.Parameter(self.weights_map[name].to(self.execution_device)),
+                )
+        return (
+            tuple(a.to(self.execution_device) if torch.is_tensor(a) else a for a in args),
+            kwargs,
+        )
+
+    def post_forward(self, module, output):
+        self.post_calls += 1
+        for name, param in list(module.named_parameters()):
+            if param.device.type != "meta":
+                setattr(
+                    module,
+                    name,
+                    nn.Parameter(torch.empty_like(param, device="meta")),
+                )
+        return output
+
+
+class TestOffloadedExperts:
+    """#68: meta-device experts must never replay silently or produce NaN."""
+
+    def _inputs(self):
+        idx = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]])
+        return torch.randn(5, 8), idx, torch.full(idx.shape, 0.5)
+
+    def test_meta_experts_without_hook_raise(self):
+        experts = _toy_experts()
+        experts.down_proj = nn.Parameter(torch.empty_like(experts.down_proj, device="meta"))
+        with pytest.raises(ValueError, match="offloaded experts"):
+            MoECapture(num_experts=4, layer=0).attach(experts)
+
+    def test_meta_experts_with_non_offload_hook_raise(self):
+        experts = _toy_experts()
+
+        class _NoOffload:
+            offload = False
+            weights_map = None
+            execution_device = torch.device("cpu")
+
+            def pre_forward(self, module, *args, **kwargs):
+                return args, kwargs
+
+            def post_forward(self, module, output):
+                return output
+
+        experts.gate_up_proj = nn.Parameter(torch.empty_like(experts.gate_up_proj, device="meta"))
+        experts._hf_hook = _NoOffload()
+        with pytest.raises(ValueError, match="offloaded experts"):
+            MoECapture(num_experts=4, layer=0).attach(experts)
+
+    def test_replay_materializes_and_restores(self):
+        torch.manual_seed(0)
+        experts = _toy_experts()
+        hidden, idx, weights = self._inputs()
+        with torch.no_grad():
+            baseline = experts(hidden, idx, weights).clone()
+
+        real = {name: param.detach().clone() for name, param in experts.named_parameters()}
+        for name in real:
+            setattr(experts, name, nn.Parameter(torch.empty_like(real[name], device="meta")))
+        hook = _FakeOffloadHook(real, torch.device("cpu"))
+        experts._hf_hook = hook
+
+        cap = MoECapture(num_experts=4, layer=0)
+        handle = cap.attach(experts)
+        try:
+            with torch.no_grad():
+                out = experts(hidden, idx, weights)
+        finally:
+            handle.remove()
+
+        assert torch.equal(out, baseline)
+        assert hook.pre_calls == 1
+        assert hook.post_calls == 1
+        assert cap.records
+        assert experts.gate_up_proj.device.type == "meta"
+        assert experts.down_proj.device.type == "meta"
