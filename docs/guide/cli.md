@@ -145,6 +145,10 @@ hprobes moe \
 | `--fusion` | `concat` | `concat` = neuron features + routing indicators; `neuron` = neuron features only |
 | `--no-routing-baseline` | off | Skip the routing-only control probe fitted alongside the main probe |
 | `--normalize-write` | off | Divide features by the layer's total FFN write norm at the decision token, mirroring dense CETT |
+| `--routing-analysis` | off | After fitting: routing-vs-correctness analysis — per-layer usage deltas with permutation nulls, gate entropy, routing churn, and the CETT × routing cross-check (one extra forward per sample) |
+| `--n-perm` | `200` | Permutations for the `--routing-analysis` nulls |
+| `--counterfactual` | off | After fitting: counterfactual routing — matched-donor rescue/corruption, frequency-matched random control, self-swap no-op gate (many extra forwards; bound the sweep with `--doses`) |
+| `--doses` | `1,2,5` (capped at k) | Expert-slot doses for `--counterfactual` |
 | `--experts-implementation` | `auto` | `eager` loads the published capture protocol; `auto` keeps the model default |
 | `--output` | auto-named | Base path for the results JSON |
 | `--device` / `--dtype` / `--attn-implementation` / `--trust-remote-code` | as `run` | Model-loading options |
@@ -172,6 +176,11 @@ passing one prints a note and the flag is ignored.
 
 Feature names use `L{layer}:E{expert}:N{neuron}` for routed experts and
 `L{layer}:S:N{neuron}` for shared experts.
+
+With `--routing-analysis` the JSON additionally carries `routing_analysis` (per-layer usage
+deltas with permutation p-values, gate entropy, Jaccard churn, and `cett_cross_check` against
+the fitted probe); with `--counterfactual` it carries `counterfactual` (`rescue`,
+`corruption`, `random` rows per dose, `self_swap` gate, donor matching).
 
 ## `hprobes responses`
 
