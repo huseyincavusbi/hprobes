@@ -589,6 +589,95 @@ class TestMoEProbeFit:
                 self._artifact(), top_k=8, per_expert_top_n=4, score="nope", min_active=1
             )
 
+    def test_write_normalization_divides_by_layer_norm(self):
+        """#41.2: features can be normalised by the layer's total FFN write."""
+        from hprobes.moe import _MoEFeatures, _design_from_features
+
+        feats = []
+        for _ in range(4):
+            feats.append({(0, 0): ([0], torch.full((1, 2), 6.0), torch.tensor([1.0]))})
+        art = _MoEFeatures(
+            feats=feats,
+            routings=[torch.tensor([[0]]) for _ in range(4)],
+            labels=np.array([0, 1, 0, 1]),
+            prompts=[f"p{i}" for i in range(4)],
+            per_sample=[{} for _ in range(4)],
+            write_norms=[{0: 3.0}, {0: 6.0}, {0: 3.0}, {0: 6.0}],
+            capture_meta={
+                "layers": [0],
+                "num_experts": 1,
+                "score": "mean_abs",
+                "per_expert_top_n": 2,
+                "top_k": 2,
+                "min_active": 1,
+            },
+        )
+        X_raw, _ = _design_from_features(
+            art, top_k=2, per_expert_top_n=2, score="mean_abs", min_active=1
+        )
+        X_norm, _ = _design_from_features(
+            art,
+            top_k=2,
+            per_expert_top_n=2,
+            score="mean_abs",
+            min_active=1,
+            normalize_write=True,
+        )
+        # raw feature value is 6.0 * gate 1.0; normalised divides by the layer norm
+        assert float(X_raw[0, 0]) == pytest.approx(6.0)
+        assert float(X_norm[0, 0]) == pytest.approx(2.0)  # 6 / 3
+        assert float(X_norm[1, 0]) == pytest.approx(1.0)  # 6 / 6
+
+    def test_normalization_off_by_default(self):
+        from hprobes.moe import _design_from_features
+
+        art = self._artifact()
+        X_default, _ = _design_from_features(
+            art, top_k=8, per_expert_top_n=4, score="mean_abs", min_active=1
+        )
+        X_explicit, _ = _design_from_features(
+            art,
+            top_k=8,
+            per_expert_top_n=4,
+            score="mean_abs",
+            min_active=1,
+            normalize_write=False,
+        )
+        assert np.array_equal(X_default, X_explicit)
+
+    def test_missing_write_norm_raises_when_normalizing(self):
+        """normalize_write=True must fail loud if the hook never fired."""
+        from hprobes.moe import _MoEFeatures, _design_from_features
+
+        art = _MoEFeatures(
+            feats=[{(0, 0): ([0], torch.ones(1, 2), torch.tensor([1.0]))}],
+            routings=[torch.tensor([[0]])],
+            labels=np.array([0]),
+            prompts=["p0"],
+            per_sample=[{}],
+            write_norms=[{}],
+            capture_meta={
+                "layers": [0],
+                "num_experts": 1,
+                "score": "mean_abs",
+                "per_expert_top_n": 2,
+                "top_k": 2,
+                "min_active": 1,
+            },
+        )
+        # a missing norm is not an error when normalization is off
+        _design_from_features(art, top_k=2, per_expert_top_n=2, score="mean_abs", min_active=1)
+        # ... but is an error when it is on
+        with pytest.raises(RuntimeError, match="no FFN write norm"):
+            _design_from_features(
+                art,
+                top_k=2,
+                per_expert_top_n=2,
+                score="mean_abs",
+                min_active=1,
+                normalize_write=True,
+            )
+
     def test_probe_recovers_planted_signal(self):
         from hprobes.moe import fit_moe_probe
 

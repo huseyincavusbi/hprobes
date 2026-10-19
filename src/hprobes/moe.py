@@ -619,6 +619,8 @@ class _MoEFeatures:
     prompts: List[str]
     per_sample: List[Dict[str, Any]]
     capture_meta: Dict[str, Any]
+    # Per sample: layer -> ||layer FFN write|| at the decision token (#41.2).
+    write_norms: List[Dict[int, float]] = field(default_factory=list)
 
 
 def _expert_sort_key(expert: Any) -> Tuple[int, int]:
@@ -640,12 +642,18 @@ def _design_from_features(
     score: str,
     min_active: int,
     gate_weighted: bool = True,
+    normalize_write: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Flatten decision-token features into a (n_samples, n_sel) dense matrix.
 
     Stage 1 ranks neurons within each (layer, expert) by the chosen score over
     the samples where that expert was active; stage 2 keeps the global top-k
     (``top_k=0`` keeps all candidates).
+
+    ``normalize_write`` divides each sample's feature values by the layer's
+    total FFN write norm at the decision token, mirroring dense CETT
+    (``|z| * col_norms / ||h||``) and making features comparable across
+    layers, tokens and models (#41.2).
     """
 
     if score not in _MOE_SCORES:
@@ -692,9 +700,25 @@ def _design_from_features(
     col_of = {fk: c for c, fk in enumerate(feature_index)}
 
     X = np.zeros((len(artifact.feats), len(feature_index)), dtype=np.float32)
+    if normalize_write:
+        missing = [
+            (si, li)
+            for si, wn in enumerate(artifact.write_norms)
+            for li in {k[0] for k in artifact.feats[si]}
+            if not wn.get(li)
+        ]
+        if missing:
+            si, li = missing[0]
+            raise RuntimeError(
+                f"normalize_write=True but sample {si} has no FFN write norm for layer {li}; "
+                "the block's mlp forward was not invoked. Disable normalize_write for this model."
+            )
     for si, feat in enumerate(artifact.feats):
+        wnorms = artifact.write_norms[si] if si < len(artifact.write_norms) else {}
         for key, (tokens, acts, gates) in feat.items():
             picks = per_expert_pick.get(key, [])
+            layer = key[0]
+            denom = float(wnorms.get(layer, 0.0)) if normalize_write else 0.0
             for j in picks:
                 col = col_of.get((key, j))
                 if col is None:
@@ -702,6 +726,8 @@ def _design_from_features(
                 val = float(acts[0, j])
                 if gate_weighted:
                     val *= float(gates[0])
+                if normalize_write and denom > 0.0:
+                    val /= denom
                 X[si, col] = val
 
     return X, {
@@ -803,6 +829,7 @@ def fit_moe_probe(
         per_expert_top_n=int(meta["per_expert_top_n"]),
         score=str(meta["score"]),
         min_active=int(meta["min_active"]),
+        normalize_write=bool(meta.get("normalize_write", False)),
     )
     names = [_feature_name(lyr, e, j) for (lyr, e), j in design["feature_index"]]
     if fusion == "concat":
