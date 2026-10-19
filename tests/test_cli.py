@@ -322,3 +322,239 @@ class TestParseTopK:
             _parse_top_k("-5")
         with pytest.raises(argparse.ArgumentTypeError):
             _parse_top_k("abc")
+
+
+class TestParseLayers:
+    def test_comma_separated_sorted_unique(self):
+        from hprobes.cli import _parse_layers
+
+        assert _parse_layers("8,0,8,4") == [0, 4, 8]
+
+    def test_all_and_empty_return_none(self):
+        from hprobes.cli import _parse_layers
+
+        assert _parse_layers("all") is None
+        assert _parse_layers("ALL") is None
+
+    def test_rejects_junk_and_negative(self):
+        import argparse
+
+        from hprobes.cli import _parse_layers
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_layers("0,x")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_layers("-1")
+
+
+class TestMoeCommand:
+    @staticmethod
+    def _parse(monkeypatch, argv):
+        import sys
+
+        from hprobes import cli
+
+        captured = {}
+        monkeypatch.setattr(cli, "cmd_moe", lambda args: captured.update(vars(args)))
+        monkeypatch.setattr(sys, "argv", ["hprobes"] + argv)
+        cli.main()
+        return captured
+
+    def test_defaults(self, monkeypatch):
+        args = self._parse(monkeypatch, ["moe", "--model", "m", "--data", "d.jsonl"])
+        assert args["top_k"] == 2000
+        assert args["readout"] == "logits"
+        assert args["score"] == "mean_abs"
+        assert args["routing_baseline"] is True
+        assert args["normalize_write"] is False
+        assert args["fusion"] == "concat"
+        assert args["layers"] is None
+        assert args["min_active"] == 2
+        assert args["per_expert_top_n"] == 64
+
+    def test_flags_wire_through(self, monkeypatch):
+        args = self._parse(
+            monkeypatch,
+            [
+                "moe",
+                "--model",
+                "m",
+                "--data",
+                "d.jsonl",
+                "--score",
+                "expected",
+                "--min-active",
+                "5",
+                "--per-expert-top-n",
+                "16",
+                "--top-k",
+                "0",
+                "--layers",
+                "8,0,4",
+                "--normalize-write",
+                "--no-routing-baseline",
+                "--fusion",
+                "neuron",
+            ],
+        )
+        assert args["score"] == "expected"
+        assert args["min_active"] == 5
+        assert args["per_expert_top_n"] == 16
+        assert args["top_k"] == 0
+        assert args["layers"] == [0, 4, 8]
+        assert args["normalize_write"] is True
+        assert args["routing_baseline"] is False
+        assert args["fusion"] == "neuron"
+
+    def test_top_k_auto_is_rejected(self, monkeypatch):
+        import sys
+
+        from hprobes import cli
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["hprobes", "moe", "--model", "m", "--data", "d.jsonl", "--top-k", "auto"],
+        )
+        with pytest.raises(SystemExit, match="dense-only"):
+            cli.main()
+
+    def test_readout_generate_is_rejected(self, monkeypatch):
+        import sys
+
+        from hprobes import cli
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["hprobes", "moe", "--model", "m", "--data", "d.jsonl", "--readout", "generate"],
+        )
+        with pytest.raises(SystemExit, match="logits"):
+            cli.main()
+
+    def test_cmd_moe_smoke_on_fake_model(self, monkeypatch, tmp_path, capsys):
+        import sys
+
+        import _fake_moe
+        from hprobes import cli
+        from test_probe import TOK
+
+        model = _fake_moe._FakeMoEModel()
+        samples = [
+            {"question": "Q0?", "options": ["aa", "bb"], "answer": 0},
+            {"question": "Q1?", "options": ["cc", "dd"], "answer": 1},
+        ]
+        monkeypatch.setattr(cli, "load_samples", lambda data, n: samples)
+        monkeypatch.setattr(cli, "_load_model", lambda args: (TOK, model))
+
+        out = tmp_path / "moe_run"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hprobes",
+                "moe",
+                "--model",
+                "fake/moe",
+                "--data",
+                "fake.jsonl",
+                "--samples",
+                "2",
+                "--layers",
+                "0",
+                "--per-expert-top-n",
+                "4",
+                "--min-active",
+                "1",
+                "--top-k",
+                "16",
+                "--no-routing-baseline",
+                "--fusion",
+                "neuron",
+                "--stability",
+                "--output",
+                str(out),
+            ],
+        )
+        cli.main()
+
+        out_text = capsys.readouterr().out
+        assert "--stability (dense-only; ignored in MoE mode)" in out_text
+
+        data = json.loads(out.with_suffix(".json").read_text())
+        assert data["mode"] == "moe"
+        assert data["n_samples"] == 2
+        assert data["config"]["score"] == "mean_abs"
+        assert data["config"]["layers"] == [0]
+        assert data["config"]["routing_baseline"] is False
+        assert data["config"]["fusion"] == "neuron"
+        assert data["moe"]["n_samples"] == 2
+
+
+class TestMoeExpertsImplementation:
+    def test_parser_default_and_override(self, monkeypatch):
+        args = TestMoeCommand._parse(monkeypatch, ["moe", "--model", "m", "--data", "d.jsonl"])
+        assert args["experts_implementation"] == "auto"
+        args = TestMoeCommand._parse(
+            monkeypatch,
+            [
+                "moe",
+                "--model",
+                "m",
+                "--data",
+                "d.jsonl",
+                "--experts-implementation",
+                "eager",
+            ],
+        )
+        assert args["experts_implementation"] == "eager"
+
+    @staticmethod
+    def _fake_transformers(captured):
+        import types
+
+        class _AutoModel:
+            @staticmethod
+            def from_pretrained(name, **kw):
+                captured.update(kw)
+                return types.SimpleNamespace(eval=lambda: None)
+
+        class _AutoTokenizer:
+            @staticmethod
+            def from_pretrained(name, **kw):
+                return object()
+
+        return types.SimpleNamespace(AutoModelForCausalLM=_AutoModel, AutoTokenizer=_AutoTokenizer)
+
+    @staticmethod
+    def _tiny_args(experts):
+        import argparse
+
+        return argparse.Namespace(
+            model="fake/model",
+            dtype="auto",
+            trust_remote_code=False,
+            device="cpu",
+            attn_implementation="auto",
+            experts_implementation=experts,
+        )
+
+    def test_load_model_passes_eager(self, monkeypatch):
+        import sys
+
+        from hprobes import cli
+
+        captured = {}
+        monkeypatch.setitem(sys.modules, "transformers", self._fake_transformers(captured))
+        cli._load_model(self._tiny_args("eager"))
+        assert captured["experts_implementation"] == "eager"
+
+    def test_load_model_omits_flag_for_auto(self, monkeypatch):
+        import sys
+
+        from hprobes import cli
+
+        captured = {}
+        monkeypatch.setitem(sys.modules, "transformers", self._fake_transformers(captured))
+        cli._load_model(self._tiny_args("auto"))
+        assert "experts_implementation" not in captured

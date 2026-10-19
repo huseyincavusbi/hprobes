@@ -49,6 +49,8 @@ nav:
   - API Reference:
     - HProbes: api/probe.md
     - CETT Functions: api/cett.md
+    - MoE Capture: api/moe.md
+    - Routing Analysis: api/routing.md
     - Cached Rows: api/rows.md
 
 markdown_extensions:

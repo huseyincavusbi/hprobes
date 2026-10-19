@@ -5,7 +5,7 @@ import json
 import re
 import string
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -220,6 +220,9 @@ def _load_model(args):
     attn = getattr(args, "attn_implementation", "auto")
     if attn not in ("auto", None):
         load_kwargs["attn_implementation"] = attn
+    experts = getattr(args, "experts_implementation", "auto")
+    if experts not in ("auto", None):
+        load_kwargs["experts_implementation"] = experts
     if _uses_mps(args.device):
         model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
         model = model.to("mps")
@@ -947,6 +950,138 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(sep + "\n")
 
 
+def cmd_moe(args: argparse.Namespace) -> None:
+    """Discover H-Neurons on MoE models (routed + shared experts, #41)."""
+    from hprobes import HProbes, __version__
+
+    sep = "─" * 68
+    print(
+        f"\nhprobes v{__version__}  |  model: {args.model}  |  samples: {'all' if args.samples == -1 else args.samples}"
+    )
+    print(sep)
+
+    if args.top_k == "auto":
+        raise SystemExit(
+            "hprobes moe: --top-k auto is dense-only; use 0 for all candidates or an integer"
+        )
+    if args.readout != "logits":
+        raise SystemExit(
+            "hprobes moe: fit_moe labels from the decision-token logits; "
+            "only --readout logits is supported"
+        )
+    dense_only = [
+        flag
+        for flag in (
+            "--alphas",
+            "--l2",
+            "--stability",
+            "--correlation",
+            "--cluster",
+            "--random-baseline",
+        )
+        if flag in sys.argv
+    ]
+    if dense_only:
+        print(f"  Note:        {', '.join(dense_only)} (dense-only; ignored in MoE mode)")
+
+    samples = load_samples(args.data, args.samples)
+    fmt, options_key, answer_key = _resolve_format(args, samples)
+    options_key = args.options_key or options_key
+    answer_key = args.answer_key or answer_key
+
+    print(f"  Mode:        MoE  (format={fmt or 'auto'}, score={args.score})")
+    print(f"  Dataset:     {Path(args.data).name}  ({len(samples)} samples)")
+    print(
+        f"  Keys:        question={args.question_key!r}  options={options_key!r}  "
+        f"answer={answer_key!r}"
+    )
+    print(
+        f"  Selection:   per_expert_top_n={args.per_expert_top_n}  "
+        f"min_active={args.min_active}  top_k={args.top_k}  "
+        f"normalize_write={args.normalize_write}"
+    )
+    print(
+        f"  Fusion:      {args.fusion}  routing_baseline={args.routing_baseline}  "
+        f"layers={args.layers if args.layers is not None else 'all'}"
+    )
+
+    out_path = args.output or _default_output_path(args.model, args.data)
+
+    print(f"  Loading {args.model}...", end="", flush=True)
+    tokenizer, model = _load_model(args)
+    print(" done")
+
+    print(f"  Fitting (l1_C={args.l1_c}, score={args.score})...", end="", flush=True)
+    probe = HProbes(
+        model,
+        tokenizer,
+        l1_C=args.l1_c,
+        layer_stride=args.layer_stride,
+        validation_split=args.validation_split,
+        seed=args.seed,
+        max_tokens=args.max_tokens,
+        batch_size=args.batch_size,
+        save_predictions=not args.no_predictions,
+        readout=args.readout,
+        solver=getattr(args, "solver", "auto"),
+    )
+    probe.fit_moe(
+        samples,
+        question_key=args.question_key,
+        options_key=options_key,
+        answer_key=answer_key,
+        layers=args.layers,
+        score=args.score,
+        per_expert_top_n=args.per_expert_top_n,
+        top_k=args.top_k,
+        min_active=args.min_active,
+        routing_baseline=args.routing_baseline,
+        fusion=args.fusion,
+        normalize_write=args.normalize_write,
+    )
+    print(" done")
+
+    m = probe.moe_ or {}
+    print(f"  Selected:    {m.get('n_selected', 0)} / {m.get('n_candidates', 0)} features")
+    print(
+        f"  LLR:         {float(m.get('llr', 0.0)):.2f}  (perm p={float(m.get('perm_p', 1.0)):.4f})"
+    )
+    baseline = m.get("routing_baseline")
+    if baseline:
+        print(
+            f"  Routing:     llr={float(baseline.get('llr', 0.0)):.2f}  "
+            f"(perm p={float(baseline.get('perm_p', 1.0)):.4f})"
+        )
+
+    json_path = Path(out_path).with_suffix(".json")
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "model": args.model,
+        "dataset": Path(args.data).name,
+        "n_samples": len(samples),
+        "mode": "moe",
+        "format": fmt,
+        "keys": {"question": args.question_key, "options": options_key, "answer": answer_key},
+        "config": {
+            "l1_C": args.l1_c,
+            "score": args.score,
+            "per_expert_top_n": args.per_expert_top_n,
+            "top_k": args.top_k,
+            "min_active": args.min_active,
+            "normalize_write": args.normalize_write,
+            "layers": args.layers,
+            "fusion": args.fusion,
+            "routing_baseline": args.routing_baseline,
+            "validation_split": args.validation_split,
+            "seed": args.seed,
+        },
+        "moe": probe.moe_,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, default=_json_default))
+    print(f"\n  Saved:       {json_path}")
+
+
 def cmd_responses(args: argparse.Namespace) -> None:
     from hprobes import HProbes, __version__
 
@@ -1277,6 +1412,32 @@ def _parse_top_k(value: str):
     return parsed
 
 
+def _parse_layers(value: str):
+    """Parse --layers: comma-separated non-negative indices, or 'all' -> None."""
+    if isinstance(value, str) and value.strip().lower() in ("", "all"):
+        return None
+    try:
+        layers = [int(part) for part in value.split(",") if part.strip()]
+    except (AttributeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --layers value: {value!r} (use comma-separated ints or 'all')"
+        )
+    if not layers:
+        return None
+    if any(layer < 0 for layer in layers):
+        raise argparse.ArgumentTypeError(f"--layers must be >= 0, got {layers}")
+    return sorted(set(layers))
+
+
+def _json_default(obj):
+    """Best-effort encoder for numpy scalars/arrays and paths in results JSON."""
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
+
+
 def _add_common_probe_args(p):
     """Add shared probe hyperparameter args to a subparser."""
     p.add_argument(
@@ -1487,6 +1648,115 @@ def main() -> None:
         help="Judge method: rule (normalized substring match) or refusal (uncertainty detection for NonExist). Default: rule.",
     )
 
+    # ── hprobes moe ────────────────────────────────────────────────────────────
+    moe_p = subparsers.add_parser(
+        "moe",
+        help="Discover H-Neurons on MoE models (routed + shared experts)",
+        description="Active-only per-expert CETT for MoE models: routed experts are replayed "
+        "read-only, always-on shared experts are captured and fused, and labels come from "
+        "the same forward's decision-token logits.",
+        epilog="--top-k is an integer for MoE: 0 keeps all candidates (default: 2000); "
+        "'auto' is dense-only.",
+    )
+    moe_p.add_argument("--model", required=True, help="HuggingFace model ID")
+    moe_p.add_argument(
+        "--data", required=True, help="Path to .jsonl, .json, or .parquet dataset file"
+    )
+    moe_p.add_argument(
+        "--samples", type=int, default=-1, help="Number of samples, -1 for all (default: -1)"
+    )
+    moe_p.add_argument(
+        "--format",
+        choices=["auto", "mmlu", "medqa", "medmcqa"],
+        default="auto",
+        help="MCQ dataset format (default: auto-detect)",
+    )
+    moe_p.add_argument(
+        "--question-key",
+        default="question",
+        dest="question_key",
+        help="Key for question text (default: question)",
+    )
+    moe_p.add_argument(
+        "--options-key",
+        default=None,
+        dest="options_key",
+        help="Options field override (default: from --format detection)",
+    )
+    moe_p.add_argument(
+        "--answer-key",
+        default=None,
+        dest="answer_key",
+        help="Answer field override (default: from --format detection)",
+    )
+    moe_p.add_argument(
+        "--output",
+        default=None,
+        help="Base path to save results JSON (default: auto-named in cwd)",
+    )
+    moe_p.add_argument(
+        "--score",
+        choices=["variance", "mean_abs", "conditional", "expected"],
+        default="mean_abs",
+        help="Per-expert neuron ranking score (default: mean_abs; 'conditional' is an "
+        "alias of 'mean_abs')",
+    )
+    moe_p.add_argument(
+        "--per-expert-top-n",
+        type=int,
+        default=64,
+        dest="per_expert_top_n",
+        help="Neurons kept per (layer, expert) before the global cap (default: 64)",
+    )
+    moe_p.add_argument(
+        "--min-active",
+        type=int,
+        default=2,
+        dest="min_active",
+        help="Minimum active rows for a neuron to be scorable (default: 2)",
+    )
+    moe_p.add_argument(
+        "--layers",
+        type=_parse_layers,
+        default=None,
+        help="Comma-separated layer indices to capture (default: every layer selected "
+        "by --layer-stride)",
+    )
+    moe_p.add_argument(
+        "--fusion",
+        choices=["concat", "neuron"],
+        default="concat",
+        help="concat = neuron features + routing indicators; neuron = neuron features only "
+        "(default: concat)",
+    )
+    moe_p.add_argument(
+        "--no-routing-baseline",
+        action="store_false",
+        dest="routing_baseline",
+        default=True,
+        help="Skip the routing-only control probe fitted alongside the main probe",
+    )
+    moe_p.add_argument(
+        "--normalize-write",
+        action="store_true",
+        dest="normalize_write",
+        help="Divide features by the layer's total FFN write norm at the decision token, "
+        "mirroring dense CETT (default: off)",
+    )
+    moe_p.add_argument(
+        "--experts-implementation",
+        choices=["auto", "eager"],
+        default="auto",
+        dest="experts_implementation",
+        help="transformers MoE experts dispatch. 'eager' matches the published capture "
+        "protocol and is required for some checkpoints (transformers >= 5.20 defaults to "
+        "a fast dispatch that MoECapture's read-only replay cannot follow); 'auto' keeps "
+        "the model default.",
+    )
+    _add_common_model_args(moe_p)
+    _add_common_probe_args(moe_p)
+    moe_p.set_defaults(top_k=2000, readout="logits")
+
     # ── hprobes responses ──────────────────────────────────────────────────────
     resp_p = subparsers.add_parser(
         "responses", help="Fit from pre-generated responses (open-ended / free-text)"
@@ -1667,6 +1937,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "run":
         cmd_run(args)
+    elif args.command == "moe":
+        cmd_moe(args)
     elif args.command == "responses":
         cmd_responses(args)
     elif args.command == "transfer":
