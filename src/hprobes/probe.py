@@ -534,6 +534,16 @@ def _select_cluster_representatives(
     return reps, info
 
 
+def _mlp_write_norms(output) -> torch.Tensor:
+    """Per-token L2 norms of a block's FFN write (#41.2).
+
+    Block outputs arrive as ``(batch, seq, hidden)`` or ``(tokens, hidden)``;
+    flatten over batch/seq so callers can index the decision position directly.
+    """
+    h = output[0] if isinstance(output, tuple) else output
+    return h.detach().float().norm(dim=-1).reshape(-1).cpu()
+
+
 class HProbes:
     """Discover and causally validate hallucination-associated FFN neurons in a transformer LLM.
 
@@ -1532,8 +1542,7 @@ class HProbes:
 
                 def make_write_hook(idx: int):
                     def hook(module, inputs, output):
-                        h = output[0] if isinstance(output, tuple) else output
-                        write_norm_cache[idx] = h.detach().float().norm(dim=-1).cpu()
+                        write_norm_cache[idx] = _mlp_write_norms(output)
 
                     return hook
 
