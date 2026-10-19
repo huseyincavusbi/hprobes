@@ -371,6 +371,10 @@ class TestMoeCommand:
         assert args["layers"] is None
         assert args["min_active"] == 2
         assert args["per_expert_top_n"] == 64
+        assert args["routing_analysis"] is False
+        assert args["n_perm"] == 200
+        assert args["counterfactual"] is False
+        assert args["doses"] is None
 
     def test_flags_wire_through(self, monkeypatch):
         args = self._parse(
@@ -405,6 +409,28 @@ class TestMoeCommand:
         assert args["normalize_write"] is True
         assert args["routing_baseline"] is False
         assert args["fusion"] == "neuron"
+
+    def test_routing_flags_wire_through(self, monkeypatch):
+        args = self._parse(
+            monkeypatch,
+            [
+                "moe",
+                "--model",
+                "m",
+                "--data",
+                "d.jsonl",
+                "--routing-analysis",
+                "--n-perm",
+                "10",
+                "--counterfactual",
+                "--doses",
+                "2,1",
+            ],
+        )
+        assert args["routing_analysis"] is True
+        assert args["n_perm"] == 10
+        assert args["counterfactual"] is True
+        assert args["doses"] == [1, 2]
 
     def test_top_k_auto_is_rejected(self, monkeypatch):
         import sys
@@ -472,6 +498,12 @@ class TestMoeCommand:
                 "--fusion",
                 "neuron",
                 "--stability",
+                "--routing-analysis",
+                "--n-perm",
+                "10",
+                "--counterfactual",
+                "--doses",
+                "1",
                 "--output",
                 str(out),
             ],
@@ -489,6 +521,11 @@ class TestMoeCommand:
         assert data["config"]["routing_baseline"] is False
         assert data["config"]["fusion"] == "neuron"
         assert data["moe"]["n_samples"] == 2
+        assert data["routing_analysis"]["n_samples"] == 2
+        assert "cett_cross_check" in data["routing_analysis"]
+        assert data["counterfactual"]["n_samples"] == 2
+        assert data["counterfactual"]["self_swap"]["flips"] == 0
+        assert data["counterfactual"]["self_swap"]["max_abs_entropy_delta"] == 0.0
 
 
 class TestMoeExpertsImplementation:
@@ -558,3 +595,25 @@ class TestMoeExpertsImplementation:
         monkeypatch.setitem(sys.modules, "transformers", self._fake_transformers(captured))
         cli._load_model(self._tiny_args("auto"))
         assert "experts_implementation" not in captured
+
+
+class TestParseDoses:
+    def test_comma_separated_sorted_unique(self):
+        from hprobes.cli import _parse_doses
+
+        assert _parse_doses("2,1,1") == [1, 2]
+        assert _parse_doses("1,2,5") == [1, 2, 5]
+
+    def test_rejects_zero_negative_and_junk(self):
+        import argparse
+
+        from hprobes.cli import _parse_doses
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_doses("0")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_doses("1,-2")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_doses("x")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_doses(",")
