@@ -523,6 +523,72 @@ class TestMoEProbeFit:
         assert _feature_name(2, 5, 3) == "L2:E5:N3"
         assert _feature_name(2, "shared", 3) == "L2:S:N3"
 
+    def test_conditional_matches_mean_abs_active_semantics(self):
+        """`conditional` is the active-row mean; `mean_abs` keeps its historical meaning."""
+        from hprobes.moe import _design_from_features
+
+        art = self._artifact()
+        Xa, da = _design_from_features(
+            art, top_k=16, per_expert_top_n=8, score="mean_abs", min_active=1
+        )
+        Xc, dc = _design_from_features(
+            art, top_k=16, per_expert_top_n=8, score="conditional", min_active=1
+        )
+        assert da["feature_index"] == dc["feature_index"]
+        assert np.array_equal(Xa, Xc)
+
+    def test_expected_downweights_rarely_routed_experts(self):
+        """`expected` scales an expert's ranking by its active fraction."""
+        from hprobes.moe import _MoEFeatures, _design_from_features
+
+        # expert 0 active in all 10 samples, expert 1 active in 1 of 10;
+        # both carry identical activation magnitudes -> expected prefers expert 0.
+        feats = []
+        for i in range(10):
+            routed = torch.full((1, 2), 3.0)
+            shared = torch.full((1, 2), 3.0)
+            d = {(0, 0): ([0], routed, torch.tensor([0.5]))}
+            if i == 0:
+                d[(0, 1)] = ([0], shared, torch.tensor([0.5]))
+            feats.append(d)
+        art = _MoEFeatures(
+            feats=feats,
+            routings=[torch.tensor([[0]]) for _ in range(10)],
+            labels=np.array([0, 1] * 5),
+            prompts=[f"p{i}" for i in range(10)],
+            per_sample=[{} for _ in range(10)],
+            capture_meta={
+                "layers": [0],
+                "num_experts": 2,
+                "score": "expected",
+                "per_expert_top_n": 1,
+                "top_k": 1,
+                "min_active": 1,
+            },
+        )
+        _, design = _design_from_features(
+            art, top_k=1, per_expert_top_n=1, score="expected", min_active=1
+        )
+        assert design["feature_index"][0][0] == (0, 0)
+
+    def test_top_k_zero_keeps_all_candidates(self):
+        from hprobes.moe import _design_from_features
+
+        art = self._artifact()
+        X, design = _design_from_features(
+            art, top_k=0, per_expert_top_n=8, score="mean_abs", min_active=1
+        )
+        assert len(design["feature_index"]) == design["n_candidates"]
+        assert X.shape == (60, design["n_candidates"])
+
+    def test_unknown_score_rejected(self):
+        from hprobes.moe import _design_from_features
+
+        with pytest.raises(ValueError, match="score must be"):
+            _design_from_features(
+                self._artifact(), top_k=8, per_expert_top_n=4, score="nope", min_active=1
+            )
+
     def test_probe_recovers_planted_signal(self):
         from hprobes.moe import fit_moe_probe
 

@@ -1470,7 +1470,18 @@ class HProbes:
         token); ``fusion="concat"`` also fits the fused neuron+routing probe.
         Results land in ``self.moe_``.
         """
-        from .moe import MoECapture, SharedExpertCapture, _MoEFeatures, fit_moe_probe
+        from .moe import (
+            _MOE_SCORES,
+            MoECapture,
+            SharedExpertCapture,
+            _MoEFeatures,
+            fit_moe_probe,
+        )
+
+        if score not in _MOE_SCORES:
+            raise ValueError(f"score must be one of {_MOE_SCORES}, got {score!r}")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative (0 = all features)")
 
         from .cett import _get_transformer_layers
 

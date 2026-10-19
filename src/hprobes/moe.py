@@ -35,6 +35,13 @@ import torch
 # either way; the distinction only matters when reconstructing contributions.
 GATE_APPLIED_INSIDE = {"olmoe"}
 
+# Neuron ranking modes for MoE feature selection (#41).
+#   variance     -- per-neuron variance over active rows
+#   mean_abs     -- mean|x| over active rows (historical default; == conditional)
+#   conditional  -- alias of mean_abs, kept for issue #41.7 vocabulary
+#   expected     -- sum|x| / n_tokens: expected contribution with structural zeros
+_MOE_SCORES = ("variance", "mean_abs", "conditional", "expected")
+
 
 @dataclass
 class MoESketch:
@@ -479,10 +486,10 @@ class MoESparseDataset:
         gate_weighted: bool = True,
         col_norms: Optional[Dict[Tuple[int, int], torch.Tensor]] = None,
     ):
-        if score not in ("variance", "mean_abs"):
-            raise ValueError(f"score must be 'variance' or 'mean_abs', got {score!r}")
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
+        if score not in _MOE_SCORES:
+            raise ValueError(f"score must be one of {_MOE_SCORES}, got {score!r}")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative (0 = all features)")
         if per_expert_top_n <= 0:
             raise ValueError("per_expert_top_n must be positive")
         self.captures = captures
@@ -502,6 +509,7 @@ class MoESparseDataset:
         candidates: List[Dict[str, Any]] = []
         for cap in self.captures:
             layer = cap.layer
+            n_tokens = max(int(cap.routing_table().shape[0]), 1)
             for expert, slot in enumerate(cap.sketch.ensure_layer(layer)):
                 n = slot["n"]
                 if n == 0 or n < self.min_active or slot["mean"] is None:
@@ -511,7 +519,12 @@ class MoESparseDataset:
                 mean_abs = mean.abs()
                 if self.score == "variance":
                     ranking = var
+                elif self.score == "expected":
+                    # expected contribution over ALL tokens (structural zeros count)
+                    ranking = mean_abs * (n / n_tokens)
                 else:
+                    # mean_abs (historical default) and conditional: mean|x| over
+                    # the rows where the expert was active.
                     ranking = mean_abs
                 k = min(self.per_expert_top_n, ranking.numel())
                 top_idx = torch.topk(ranking, k).indices.tolist()
@@ -631,8 +644,14 @@ def _design_from_features(
     """Flatten decision-token features into a (n_samples, n_sel) dense matrix.
 
     Stage 1 ranks neurons within each (layer, expert) by the chosen score over
-    the samples where that expert was active; stage 2 keeps the global top-k.
+    the samples where that expert was active; stage 2 keeps the global top-k
+    (``top_k=0`` keeps all candidates).
     """
+
+    if score not in _MOE_SCORES:
+        raise ValueError(f"score must be one of {_MOE_SCORES}, got {score!r}")
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative (0 = all features)")
 
     # Per (layer, expert): stacked activations + gates, sample index per row.
     grouped: Dict[Tuple[int, Any], Dict[str, Any]] = {}
@@ -646,6 +665,7 @@ def _design_from_features(
 
     per_expert_pick: Dict[Tuple[int, Any], List[int]] = {}
     candidates: List[Tuple[float, Tuple[int, Any], int]] = []
+    n_samples = max(len(artifact.feats), 1)
     for key, g in sorted(grouped.items(), key=lambda kv: (kv[0][0], _expert_sort_key(kv[0][1]))):
         A = torch.stack(g["acts"]).float()
         n = A.shape[0]
@@ -653,7 +673,12 @@ def _design_from_features(
             continue
         if score == "variance":
             ranking = A.var(dim=0)
+        elif score == "mean_abs":
+            # issue #41: expected contribution over ALL samples -- structural
+            # zeros (expert not routed) count in the denominator.
+            ranking = A.abs().sum(dim=0) / n_samples
         else:
+            # conditional: mean|x| over the rows where the expert was active.
             ranking = A.abs().mean(dim=0)
         k = min(per_expert_top_n, ranking.numel())
         idx = torch.topk(ranking, k).indices.tolist()
@@ -662,7 +687,7 @@ def _design_from_features(
             candidates.append((float(ranking[j]), key, j))
 
     candidates.sort(key=lambda c: (-c[0], c[1][0], _expert_sort_key(c[1][1]), c[2]))
-    chosen = candidates[:top_k]
+    chosen = candidates if top_k == 0 else candidates[:top_k]
     feature_index = [(key, j) for _, key, j in chosen]
     col_of = {fk: c for c, fk in enumerate(feature_index)}
 
@@ -757,6 +782,9 @@ def fit_moe_probe(
     routed-expert indicators). ``fusion="concat"`` in the default neuron-only
     mode appends the routing columns so the probe can use both; the separate
     routing-only result is returned alongside by the caller.
+
+    ``top_k=0`` in ``capture_meta`` keeps **all** candidates (no global cap),
+    matching the dense path's "0 = all features" convention.
     """
 
     meta = artifact.capture_meta
