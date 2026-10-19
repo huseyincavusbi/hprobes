@@ -1053,6 +1053,62 @@ def cmd_moe(args: argparse.Namespace) -> None:
             f"(perm p={float(baseline.get('perm_p', 1.0)):.4f})"
         )
 
+    if args.n_perm < 1:
+        raise SystemExit("hprobes moe: --n-perm must be >= 1")
+
+    routing_analysis = None
+    if args.routing_analysis:
+        print("\n  Routing analysis (permutation nulls; extra forwards)...", end="", flush=True)
+        routing_analysis = probe.moe_routing_analysis(
+            samples,
+            question_key=args.question_key,
+            options_key=options_key,
+            answer_key=answer_key,
+            layers=args.layers,
+            n_perm=args.n_perm,
+            seed=args.seed,
+        )
+        print(" done")
+        ge = routing_analysis.get("gate_entropy")
+        if ge:
+            print(
+                f"    gate entropy: Δ={ge['delta']:+.4f}  (perm p={ge['perm_p']:.3f})  "
+                f"Jaccard(between)={routing_analysis['jaccard'].get('between')}"
+            )
+        cc = routing_analysis.get("cett_cross_check")
+        if cc:
+            print(
+                f"    CETT overlap: {len(cc['overlap'])} experts  (Jaccard={cc['jaccard']:.3f}, "
+                f"{cc['n_shared_features']} shared features)"
+            )
+
+    counterfactual = None
+    if args.counterfactual:
+        print("\n  Counterfactual routing (extra forwards)...", end="", flush=True)
+        counterfactual = probe.counterfactual_routing(
+            samples,
+            question_key=args.question_key,
+            options_key=options_key,
+            answer_key=answer_key,
+            layers=args.layers,
+            doses=args.doses,
+            seed=args.seed,
+        )
+        print(" done")
+        corruption_by_dose = {row["dose"]: row for row in counterfactual["corruption"]}
+        for row in counterfactual["rescue"]:
+            corr = corruption_by_dose.get(row["dose"])
+            corr_txt = f"{corr['flip_rate']:.1%}" if corr else "n/a"
+            print(
+                f"    dose {row['dose']}: rescue {row['flip_rate']:.1%} "
+                f"(n={row['n_targets']})  corruption {corr_txt}"
+            )
+        swap = counterfactual["self_swap"]
+        print(
+            f"    self-swap gate: {swap['flips']}/{swap['n']} flips  "
+            f"max|Δentropy|={swap['max_abs_entropy_delta']:.2e}"
+        )
+
     json_path = Path(out_path).with_suffix(".json")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1078,6 +1134,10 @@ def cmd_moe(args: argparse.Namespace) -> None:
         },
         "moe": probe.moe_,
     }
+    if routing_analysis is not None:
+        payload["routing_analysis"] = routing_analysis
+    if counterfactual is not None:
+        payload["counterfactual"] = counterfactual
     json_path.write_text(json.dumps(payload, indent=2, default=_json_default))
     print(f"\n  Saved:       {json_path}")
 
@@ -1429,6 +1489,21 @@ def _parse_layers(value: str):
     return sorted(set(layers))
 
 
+def _parse_doses(value: str):
+    """Parse --doses: comma-separated positive ints (expert slots replaced)."""
+    try:
+        doses = [int(part) for part in value.split(",") if part.strip()]
+    except (AttributeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --doses value: {value!r} (use comma-separated positive ints)"
+        )
+    if not doses:
+        raise argparse.ArgumentTypeError("--doses requires at least one integer")
+    if any(dose < 1 for dose in doses):
+        raise argparse.ArgumentTypeError(f"--doses entries must be >= 1, got {doses}")
+    return sorted(set(doses))
+
+
 def _json_default(obj):
     """Best-effort encoder for numpy scalars/arrays and paths in results JSON."""
     if hasattr(obj, "tolist"):
@@ -1752,6 +1827,36 @@ def main() -> None:
         "protocol and is required for some checkpoints (transformers >= 5.20 defaults to "
         "a fast dispatch that MoECapture's read-only replay cannot follow); 'auto' keeps "
         "the model default.",
+    )
+    moe_p.add_argument(
+        "--routing-analysis",
+        action="store_true",
+        dest="routing_analysis",
+        help="After fitting, run the routing-vs-correctness analysis: per-layer usage "
+        "deltas with permutation nulls, gate entropy, routing churn, and the CETT x routing "
+        "cross-check (one extra forward per sample).",
+    )
+    moe_p.add_argument(
+        "--n-perm",
+        type=int,
+        default=200,
+        dest="n_perm",
+        help="Permutations for --routing-analysis nulls (default: 200)",
+    )
+    moe_p.add_argument(
+        "--counterfactual",
+        action="store_true",
+        dest="counterfactual",
+        help="After fitting, run counterfactual routing: matched-donor rescue/corruption, "
+        "frequency-matched random control, and the self-swap no-op gate (many extra "
+        "forwards; use --doses to bound the sweep).",
+    )
+    moe_p.add_argument(
+        "--doses",
+        type=_parse_doses,
+        default=None,
+        help="Comma-separated expert-slot doses for --counterfactual "
+        "(default: 1,2,5 capped at top-k)",
     )
     _add_common_model_args(moe_p)
     _add_common_probe_args(moe_p)
