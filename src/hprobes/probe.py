@@ -1457,6 +1457,7 @@ class HProbes:
         min_active: int = 2,
         routing_baseline: bool = True,
         fusion: str = "concat",
+        normalize_write: bool = False,
     ) -> "HProbes":
         """Discover H-Neurons on MoE models via active-only per-expert CETT (#41).
 
@@ -1464,6 +1465,10 @@ class HProbes:
         attached to every selected layer's experts module; prediction and
         label come from the same forward's logits (dense-equivalent protocol).
         Features are then selected two-stage and assembled sparse.
+
+        ``normalize_write`` divides feature values by each layer's total FFN
+        write norm at the decision token, mirroring dense CETT (#41.2). Off by
+        default so previously reported numbers stay comparable.
 
         ``routing_baseline`` fits the routing-only control probe on the same
         samples (features = per-token expert indicators at the decision
@@ -1517,12 +1522,30 @@ class HProbes:
                 cap_s.attach()
                 shared_captures.append(cap_s)
 
+        # Layer total-FFN-write norms (#41.2): hook each block's output so the
+        # probe can normalise like dense CETT (|z| * col_norms / ||h||). Only
+        # registered when requested -- no overhead for the default path.
+        write_norm_cache: Dict[int, torch.Tensor] = {}
+        write_handles = []
+        if normalize_write:
+            for li in self._layers:
+
+                def make_write_hook(idx: int):
+                    def hook(module, inputs, output):
+                        h = output[0] if isinstance(output, tuple) else output
+                        write_norm_cache[idx] = h.detach().float().norm(dim=-1).cpu()
+
+                    return hook
+
+                write_handles.append(blocks[li].mlp.register_forward_hook(make_write_hook(li)))
+
         # Per-sample forward; capture stays active only during the forward.
         feats: List[Dict[Tuple[int, int], Tuple[List[int], torch.Tensor, torch.Tensor]]] = []
         routings: List[torch.Tensor] = []
         labels: List[int] = []
         prompts: List[str] = []
         per_sample: List[Dict] = []
+        write_norms: List[Dict[int, float]] = []
         try:
             for sample in samples:
                 if self.readout in ("generate", "both"):
@@ -1556,6 +1579,19 @@ class HProbes:
                     if shared is not None:
                         feats_sample[(cap_s.layer, "shared")] = shared
                 feats.append(feats_sample)
+                if normalize_write:
+                    missing = [li for li in self._layers if li not in write_norm_cache]
+                    if missing:
+                        raise RuntimeError(
+                            "normalize_write=True but no FFN write norm was captured for "
+                            f"layer(s) {missing}; the block's mlp forward was not invoked. "
+                            "Disable normalize_write for this model."
+                        )
+                    write_norms.append(
+                        {li: float(write_norm_cache[li][decision_pos]) for li in self._layers}
+                    )
+                else:
+                    write_norms.append({})
                 routings.append(
                     torch.stack([cap.routing_table()[decision_pos] for cap in captures])
                 )
@@ -1564,6 +1600,8 @@ class HProbes:
                 h.remove()
             for cap_s in shared_captures:
                 cap_s.remove()
+            for h in write_handles:
+                h.remove()
 
         if not feats:
             raise ValueError("no valid samples — MoE extraction produced zero rows")
@@ -1574,6 +1612,7 @@ class HProbes:
             labels=np.array(labels),
             prompts=prompts,
             per_sample=per_sample,
+            write_norms=write_norms,
             capture_meta={
                 "layers": self._layers,
                 "num_experts": num_experts,
@@ -1583,6 +1622,7 @@ class HProbes:
                 "per_expert_top_n": per_expert_top_n,
                 "top_k": top_k,
                 "min_active": min_active,
+                "normalize_write": normalize_write,
             },
         )
         self.moe_ = fit_moe_probe(
