@@ -1,6 +1,6 @@
 # CLI Reference
 
-hprobes provides three CLI subcommands: `run`, `responses`, and `transfer`.
+hprobes provides six CLI subcommands: `run`, `moe`, `responses`, `transfer`, `compare`, and `edit`.
 
 ```bash
 hprobes --help
@@ -95,6 +95,83 @@ separately by the response pipeline). Disable with `--no-predictions`.
 Causal validation follows the same readout: with `generate`/`both`, each alpha's accuracy is
 measured on generated answers, and unparseable generations count as **incorrect** so the
 denominator stays fixed across alphas.
+
+## `hprobes moe`
+
+Fit H-Neurons on **Mixture-of-Experts** models (issue #41). Routed experts are replayed
+read-only with active-only per-expert CETT, always-on shared experts (Qwen2MoE / Qwen3.5 MoE
+style) are captured and fused into the same design, and correctness labels come from the
+same forward's decision-token logits.
+
+```bash
+hprobes moe \
+  --model allenai/OLMoE-1B-7B-0924 \
+  --data medqa.parquet \
+  --samples 400 \
+  --score variance \
+  --per-expert-top-n 64 \
+  --min-active 2 \
+  --top-k 2000 \
+  --experts-implementation eager
+```
+
+> **Eager experts protocol (research integrity).** `transformers >= 5.20` dispatches MoE
+> experts through fast kernels (`grouped_mm` / `batched_mm`) by default. The capture replays
+> the layer's `eager` expert loop, so `fit_moe` raises a guard error on models loaded with a
+> fast dispatch. Pass `--experts-implementation eager` to load the model exactly like the
+> published protocol (recommended). The default `auto` keeps the model's native dispatch.
+
+### Required Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--model` | HuggingFace model ID (e.g. `allenai/OLMoE-1B-7B-0924`) |
+| `--data` | Path to `.jsonl`, `.json`, or `.parquet` dataset file |
+
+### Optional Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--format` | `auto` | Dataset format: `auto`, `mmlu`, `medqa`, `medmcqa` |
+| `--samples` | `-1` (all) | Number of samples to use |
+| `--question-key` | `question` | Key for question text |
+| `--options-key` | from `--format` | Options field override |
+| `--answer-key` | from `--format` | Answer field override |
+| `--score` | `mean_abs` | Per-expert neuron ranking: `variance` (zeros counted), `mean_abs` (active-row mean \|z\|, historical default), `expected` (gate-weighted expected value), `conditional` (alias of `mean_abs`) |
+| `--per-expert-top-n` | `64` | Neurons kept per `(layer, expert)` before the global cap |
+| `--min-active` | `2` | Minimum active rows for a neuron to be scorable |
+| `--top-k` | `2000` | Global cap after per-expert ranking. `0` = all candidates. `auto` is dense-only |
+| `--layers` | all layers | Comma-separated layer indices (default: every layer selected by `--layer-stride`) |
+| `--fusion` | `concat` | `concat` = neuron features + routing indicators; `neuron` = neuron features only |
+| `--no-routing-baseline` | off | Skip the routing-only control probe fitted alongside the main probe |
+| `--normalize-write` | off | Divide features by the layer's total FFN write norm at the decision token, mirroring dense CETT |
+| `--experts-implementation` | `auto` | `eager` loads the published capture protocol; `auto` keeps the model default |
+| `--output` | auto-named | Base path for the results JSON |
+| `--device` / `--dtype` / `--attn-implementation` / `--trust-remote-code` | as `run` | Model-loading options |
+| `--l1-c` / `--solver` / `--seed` / `--layer-stride` / `--validation-split` / `--max-tokens` / `--batch-size` | as `run` | Probe options |
+| `--readout` | `logits` | `fit_moe` labels from the decision-token logits; any other value is rejected |
+| `--no-predictions` | off (predictions are written) | Skip the per-sample predictions sidecar |
+
+Dense-only validation options (`--alphas`, `--l2`, `--stability`, `--correlation`,
+`--cluster`, `--random-baseline`) are accepted for CLI parity but do not run in MoE mode;
+passing one prints a note and the flag is ignored.
+
+### Output
+
+`<output>.json` — MoE probe results:
+
+```json
+{
+  "mode": "moe",
+  "config": {"score": "variance", "top_k": 2000, "min_active": 2, "normalize_write": false},
+  "moe": {"n_samples": 400, "n_candidates": 11648, "n_selected": 25, "llr": 137.4,
+           "perm_p": 0.408, "feature_names": ["L5:E12:N1023"],
+           "routing_baseline": {"llr": 91.2, "perm_p": 0.537}}
+}
+```
+
+Feature names use `L{layer}:E{expert}:N{neuron}` for routed experts and
+`L{layer}:S:N{neuron}` for shared experts.
 
 ## `hprobes responses`
 
