@@ -1246,3 +1246,25 @@ class TestSolverFallback:
         data = json.loads(Path(json_path).read_text())
         assert data["config"]["solver"] == "saga"
         assert data["config"]["solver_used"] == "saga"
+
+
+class TestMoeWriteNorms:
+    """#70: write-norm hooks must index tokens, not the batch dimension."""
+
+    def test_3d_output_flattens_over_batch(self):
+        from hprobes.probe import _mlp_write_norms
+
+        x = torch.randn(1, 6, 8)
+        norms = _mlp_write_norms(x)
+        assert norms.shape == (6,)
+        assert torch.allclose(norms, x[0].norm(dim=-1).cpu())
+        # regression: decision positions > 0 must index tokens
+        assert float(norms[5]) == pytest.approx(float(x[0, 5].norm().cpu()))
+
+    def test_2d_and_tuple_outputs(self):
+        from hprobes.probe import _mlp_write_norms
+
+        x = torch.randn(6, 8)
+        assert _mlp_write_norms(x).shape == (6,)
+        assert _mlp_write_norms((x, None)).shape == (6,)
+        assert torch.equal(_mlp_write_norms(x), _mlp_write_norms((x, None)))
