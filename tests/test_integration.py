@@ -164,63 +164,52 @@ def test_score_on_batched_equals_single(gpt2_setup):
     assert r1["balanced_accuracy"] == pytest.approx(r2["balanced_accuracy"], abs=1e-6)
 
 
-def test_cli_run_command(gpt2_setup):
+def test_cli_run_command(gpt2_setup, tmp_path):
     """
     Verifies the 'hprobes run' CLI command works end-to-end.
     """
     _, _ = gpt2_setup  # Ensure downloaded
 
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", mode="w", delete=False) as f:
-        # Create a dummy dataset in MMLU format (list choices + int answer)
-        # We need at least 2 samples for a minimal fit attempt
-        items = [
-            {"question": "Is GPT-2 official?", "choices": ["No", "Yes"], "answer": 1},
-            {"question": "Is 1+1=2?", "choices": ["No", "Yes"], "answer": 1},
-        ]
-        for item in items:
-            f.write(json.dumps(item) + "\n")
-        f.flush()
-        data_path = f.name
+    # Create a dummy dataset in MMLU format (list choices + int answer);
+    # we need at least 2 samples for a minimal fit attempt.
+    items = [
+        {"question": "Is GPT-2 official?", "choices": ["No", "Yes"], "answer": 1},
+        {"question": "Is 1+1=2?", "choices": ["No", "Yes"], "answer": 1},
+    ]
+    data_path = tmp_path / "dataset.jsonl"
+    data_path.write_text("\n".join(json.dumps(item) for item in items) + "\n")
 
-    # hprobes run creates <output>.json and <output>.pkl (or similar)
-    output_base = "integration_test_output"
+    # hprobes run writes <output>.json/.pkl/.predictions.jsonl next to the
+    # base path; keep them inside tmp_path so the suite never pollutes the
+    # repository working directory.
+    output_base = str(tmp_path / "integration_test_output")
 
     import sys
 
-    try:
-        # Run CLI via subprocess
-        # Note: CLI uses --samples instead of --n
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "hprobes.cli",
-                "run",
-                "--model",
-                "openai-community/gpt2",
-                "--data",
-                data_path,
-                "--output",
-                output_base,
-                "--samples",
-                "2",
-                "--mcq",
-                "--format",
-                "mmlu",
-            ],
-            capture_output=True,
-            text=True,
-        )
+    # Run CLI via subprocess
+    # Note: CLI uses --samples instead of --n
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hprobes.cli",
+            "run",
+            "--model",
+            "openai-community/gpt2",
+            "--data",
+            str(data_path),
+            "--output",
+            output_base,
+            "--samples",
+            "2",
+            "--mcq",
+            "--format",
+            "mmlu",
+        ],
+        capture_output=True,
+        text=True,
+    )
 
-        assert result.returncode == 0, f"CLI failed with stderr: {result.stderr}"
-        # The CLI saves .json results
-        assert os.path.exists(f"{output_base}.json")
-
-    finally:
-        if os.path.exists(data_path):
-            os.remove(data_path)
-        # Cleanup any generated files
-        for ext in [".json", ".pkl", ".safetensors"]:
-            p = f"{output_base}{ext}"
-            if os.path.exists(p):
-                os.remove(p)
+    assert result.returncode == 0, f"CLI failed with stderr: {result.stderr}"
+    # The CLI saves .json results; every artifact stays in tmp_path
+    assert os.path.exists(f"{output_base}.json")
