@@ -163,6 +163,14 @@ class MoECapture:
         ``allow_eager_switch=True`` to switch a loaded model's config in
         place (a warning is emitted; every subsequent forward of the model
         then runs the eager loop).
+
+        CPU/disk-offloaded experts (accelerate ``device_map`` offload) are
+        supported when the module carries accelerate's device hook: the
+        wrapper materializes the weights through ``pre_forward`` for the
+        replay and offloads them again via ``post_forward``, mirroring
+        accelerate's own forward wrapper. Meta-device parameters without a
+        usable offload hook are rejected loudly instead of silently producing
+        NaN features.
         """
         config = getattr(experts_module, "config", None)
         impls = {
@@ -189,67 +197,113 @@ class MoECapture:
             for field_name in ("_experts_implementation", "_experts_implementation_internal"):
                 if hasattr(config, field_name):
                     setattr(config, field_name, "eager")
+
+        # CPU/disk offload (#68): accelerate keeps offloaded weights in a map
+        # and leaves meta tensors on the module, materializing them only inside
+        # its own forward wrapper. We replace that wrapper, so detect the hook
+        # up front and compose with it in the replay; refuse loudly when the
+        # weights cannot be materialized (silent NaNs otherwise).
+        offload_hook = getattr(experts_module, "_hf_hook", None)
+        hook_is_usable = bool(
+            offload_hook is not None
+            and callable(getattr(offload_hook, "pre_forward", None))
+            and callable(getattr(offload_hook, "post_forward", None))
+        )
+        meta_params = [
+            name for name, param in experts_module.named_parameters() if param.device.type == "meta"
+        ]
+        if meta_params and not (
+            hook_is_usable
+            and getattr(offload_hook, "offload", False)
+            and getattr(offload_hook, "weights_map", None) is not None
+        ):
+            raise ValueError(
+                "MoECapture cannot replay offloaded experts: parameters "
+                f"{meta_params} are on the meta device and the module has no usable "
+                "accelerate offload hook. Keep the MoE layers resident on GPU(s) "
+                "(a device_map without CPU/disk offload) or load them through "
+                "accelerate dispatch_model so offloading has a weights map."
+            )
+
         import types
 
         cap = self
         original_forward = experts_module.forward
 
         def wrapped_forward(self_mod, hidden_states, top_k_index, top_k_weights):
-            # Counterfactual routing (#42): swap the router's decisions at
-            # the requested positions before any consumer sees them.
-            ov = cap._routing_override
-            if ov is not None:
-                top_k_index = top_k_index.clone()
-                top_k_weights = top_k_weights.clone()
-                pos = ov["positions"].to(top_k_index.device)
-                top_k_index[pos] = ov["experts"].to(
-                    device=top_k_index.device, dtype=top_k_index.dtype
+            # accelerate offload (#68): its forward wrapper (which we replaced)
+            # would have materialized the offloaded weights here; do the same
+            # so the replay sees real tensors, and offload again afterwards.
+            if hook_is_usable:
+                args, _ = offload_hook.pre_forward(
+                    self_mod, hidden_states, top_k_index, top_k_weights
                 )
-                if ov["weights"] is not None:
-                    top_k_weights[pos] = ov["weights"].to(
-                        device=top_k_weights.device, dtype=top_k_weights.dtype
+                hidden_states, top_k_index, top_k_weights = args
+            try:
+                # Counterfactual routing (#42): swap the router's decisions at
+                # the requested positions before any consumer sees them.
+                ov = cap._routing_override
+                if ov is not None:
+                    top_k_index = top_k_index.clone()
+                    top_k_weights = top_k_weights.clone()
+                    pos = ov["positions"].to(top_k_index.device)
+                    top_k_index[pos] = ov["experts"].to(
+                        device=top_k_index.device, dtype=top_k_index.dtype
                     )
-            # Seed routing context: record_expert reads it per expert below.
-            cap._ctx = {
-                "top_k_index": top_k_index.detach(),
-                "top_k_weights": top_k_weights.detach(),
-                "token_norm": hidden_states.detach().float().norm(dim=-1).cpu(),
-            }
-            with torch.no_grad():
-                # num_experts + 1 mirrors the family one-hot: the extra class
-                # is a sentinel for dropped slots, skipped in the loop below.
-                expert_mask = torch.nn.functional.one_hot(
-                    top_k_index, num_classes=cap.num_experts + 1
-                )
-                expert_mask = expert_mask.permute(2, 1, 0)
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            final_hidden_states = torch.zeros_like(hidden_states)
-            for expert_idx in expert_hit:
-                expert_idx = int(expert_idx[0])
-                if expert_idx == cap.num_experts:
-                    continue
-                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-                current_state = hidden_states[token_idx]
-                gate, up = torch.nn.functional.linear(
-                    current_state, self_mod.gate_up_proj[expert_idx]
-                ).chunk(2, dim=-1)
-                act = self_mod.act_fn(gate) * up
-                iv = cap._intervention
-                if iv is not None and expert_idx == iv.get("expert"):
-                    names = iv["features"]
-                    if iv["ablate"]:
-                        act = act.clone()
-                        for j in names:
-                            act[:, j] = 0.0
-                    else:
-                        alpha = float(iv["alpha"])
-                        act = act.clone()
-                        for j in names:
-                            act[:, j] = act[:, j] * alpha
-                cap.record_expert(expert_idx, act, top_k_pos=top_k_pos, token_idx=token_idx)
-                out = torch.nn.functional.linear(act, self_mod.down_proj[expert_idx])
-                out = out * top_k_weights[token_idx, top_k_pos, None]
-                final_hidden_states.index_add_(0, token_idx, out.to(final_hidden_states.dtype))
+                    if ov["weights"] is not None:
+                        top_k_weights[pos] = ov["weights"].to(
+                            device=top_k_weights.device, dtype=top_k_weights.dtype
+                        )
+                # Seed routing context: record_expert reads it per expert below.
+                cap._ctx = {
+                    "top_k_index": top_k_index.detach(),
+                    "top_k_weights": top_k_weights.detach(),
+                    "token_norm": hidden_states.detach().float().norm(dim=-1).cpu(),
+                }
+                with torch.no_grad():
+                    # num_experts + 1 mirrors the family one-hot: the extra class
+                    # is a sentinel for dropped slots, skipped in the loop below.
+                    expert_mask = torch.nn.functional.one_hot(
+                        top_k_index, num_classes=cap.num_experts + 1
+                    )
+                    expert_mask = expert_mask.permute(2, 1, 0)
+                    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                final_hidden_states = torch.zeros_like(hidden_states)
+                for expert_idx in expert_hit:
+                    expert_idx = int(expert_idx[0])
+                    if expert_idx == cap.num_experts:
+                        continue
+                    top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+                    current_state = hidden_states[token_idx]
+                    gate, up = torch.nn.functional.linear(
+                        current_state, self_mod.gate_up_proj[expert_idx]
+                    ).chunk(2, dim=-1)
+                    act = self_mod.act_fn(gate) * up
+                    iv = cap._intervention
+                    if iv is not None and expert_idx == iv.get("expert"):
+                        names = iv["features"]
+                        if iv["ablate"]:
+                            act = act.clone()
+                            for j in names:
+                                act[:, j] = 0.0
+                        else:
+                            alpha = float(iv["alpha"])
+                            act = act.clone()
+                            for j in names:
+                                act[:, j] = act[:, j] * alpha
+                    cap.record_expert(expert_idx, act, top_k_pos=top_k_pos, token_idx=token_idx)
+                    out = torch.nn.functional.linear(act, self_mod.down_proj[expert_idx])
+                    out = out * top_k_weights[token_idx, top_k_pos, None]
+                    final_hidden_states.index_add_(0, token_idx, out.to(final_hidden_states.dtype))
+            except Exception:
+                if hook_is_usable:
+                    try:
+                        offload_hook.post_forward(self_mod, None)
+                    except Exception:
+                        pass
+                raise
+            if hook_is_usable:
+                return offload_hook.post_forward(self_mod, final_hidden_states)
             return final_hidden_states
 
         experts_module.forward = types.MethodType(wrapped_forward, experts_module)
