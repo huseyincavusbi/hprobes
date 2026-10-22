@@ -1268,3 +1268,95 @@ class TestMoeWriteNorms:
         assert _mlp_write_norms(x).shape == (6,)
         assert _mlp_write_norms((x, None)).shape == (6,)
         assert torch.equal(_mlp_write_norms(x), _mlp_write_norms((x, None)))
+
+
+class TestStabilityNJobs:
+    """Issue #48: bootstrap concurrency is scheduling-only (identical outcomes)."""
+
+    def test_resolver_preserves_legacy_heuristic(self):
+        from hprobes.probe import _resolve_stability_jobs
+
+        assert _resolve_stability_jobs(None, 100, 1000, 5) == -1
+        # boundary: exactly at cutoff stays parallel, one byte over goes sequential
+        n, p = 1024, 262144  # 1024*262144*8 == 2GiB exactly
+        assert _resolve_stability_jobs(None, n, p, 5) == -1
+        assert _resolve_stability_jobs(None, n + 1, p, 5) == 1
+
+    def test_resolver_int_passthrough_and_auto_budget(self, monkeypatch):
+        import hprobes.probe as probe_mod
+        from hprobes.probe import _resolve_stability_jobs
+
+        monkeypatch.setattr(probe_mod.os, "cpu_count", lambda: 8)
+        assert _resolve_stability_jobs(3, 100, 1000, 5) == 3
+        assert _resolve_stability_jobs(-1, 100, 1000, 5) == -1
+        # auto: tiny budget -> 1; huge budget -> capped at n_runs
+        assert _resolve_stability_jobs("auto", 100, 1000, 5, available_bytes=10**6) == 1
+        assert _resolve_stability_jobs("auto", 100, 1000, 5, available_bytes=10**15) == 5
+        # None falls back to real available RAM: always within [1, n_runs]
+        real = _resolve_stability_jobs("auto", 100, 1000, 5, available_bytes=None)
+        assert 1 <= real <= 5
+        with pytest.raises(ValueError, match="stability_n_jobs"):
+            _resolve_stability_jobs("bogus", 100, 1000, 5)
+
+    def test_auto_applies_calibration_and_cpu_cap(self, monkeypatch):
+        import hprobes.probe as probe_mod
+        from hprobes.probe import _resolve_stability_jobs
+
+        # 240 x 276480: analytic ~1.06 GB/fit, calibrated (x2.5) ~2.65 GB.
+        # 13 GiB * 0.5 safety -> floor(6.98 / 2.65) = 2 jobs.
+        monkeypatch.setattr(probe_mod.os, "cpu_count", lambda: 8)
+        assert _resolve_stability_jobs("auto", 240, 276480, 5, available_bytes=13 * 1024**3) == 2
+        # CPU cap: huge RAM must never exceed available cores.
+        monkeypatch.setattr(probe_mod.os, "cpu_count", lambda: 2)
+        assert _resolve_stability_jobs("auto", 100, 1000, 5, available_bytes=10**15) == 2
+
+    def test_constructor_validates(self):
+        with pytest.raises(ValueError, match="stability_n_jobs"):
+            HProbes(MODEL, TOK, stability_n_jobs="bogus")
+        assert HProbes(MODEL, TOK).stability_n_jobs is None
+        assert HProbes(MODEL, TOK, stability_n_jobs=2).stability_n_jobs == 2
+        assert HProbes(MODEL, TOK, stability_n_jobs="auto").stability_n_jobs == "auto"
+
+    def test_determinism_across_job_counts(self):
+        from hprobes.probe import _run_stability_check
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(60, 200))
+        y = (rng.random(60) < 0.5).astype(int)
+        if y.sum() in (0, 60):
+            y[:30] = 1
+        one = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=1)
+        two = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=2)
+        assert one == two
+
+
+class TestStabilityThreadingEngine:
+    """Issue #48: concurrency must stay deterministic at real fit sizes too.
+
+    The tiny-matrix tests cannot expose BLAS-level reordering (fits finish in
+    microseconds); this gate uses a matrix big enough that each fit takes real
+    milliseconds-seconds, which is where a bad engine would show drift.
+    """
+
+    @pytest.mark.slow
+    def test_determinism_at_demo_scale(self):
+        from hprobes.probe import _run_stability_check
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(300, 20000)).astype(np.float32)
+        y = (rng.random(300) < 0.5).astype(int)
+        one = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=1)
+        two = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=2)
+        assert one == two
+
+    def test_determinism_five_jobs(self):
+        from hprobes.probe import _run_stability_check
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(60, 200))
+        y = (rng.random(60) < 0.5).astype(int)
+        if y.sum() in (0, 60):
+            y[:30] = 1
+        one = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=1)
+        five = _run_stability_check(X, y, 1.0, n_runs=3, base_seed=0, n_jobs=5)
+        assert one == five
