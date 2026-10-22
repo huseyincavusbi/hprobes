@@ -144,7 +144,9 @@ def _resolve_stability_jobs(
 
     ``None`` reproduces the legacy heuristic exactly (all cores under the
     cutoff, sequential above). An int is passed straight to joblib.
-    ``"auto"`` fits as many runs concurrently as the RAM budget allows.
+    ``"auto"`` budgets by RAM and CPU count: the per-fit estimate is scaled by
+    ``_FIT_PEAK_CALIBRATION`` (real liblinear peaks run ~2.5x above the
+    analytic model) and the result never exceeds ``n_runs`` or ``os.cpu_count()``.
     """
     if n_jobs is None:
         return 1 if n_rows * n_features * 8 > _STABILITY_LEGACY_BYTES else -1
@@ -152,10 +154,12 @@ def _resolve_stability_jobs(
         return n_jobs
     if n_jobs == "auto":
         avail = available_bytes if available_bytes is not None else _available_ram_bytes()
-        per_fit = _estimate_peak_fit_bytes(n_rows, n_features, 1)
+        per_fit = _FIT_PEAK_CALIBRATION * _estimate_peak_fit_bytes(n_rows, n_features, 1)
         if avail is None or per_fit <= 0:
             return 1
-        return max(1, min(n_runs, int(avail * _STABILITY_JOBS_SAFETY // per_fit)))
+        budgeted = int(avail * _STABILITY_JOBS_SAFETY // per_fit)
+        cores = os.cpu_count() or 1
+        return max(1, min(n_runs, cores, budgeted))
     raise ValueError(f"stability_n_jobs must be an int, 'auto' or None, got {n_jobs!r}")
 
 
@@ -426,10 +430,26 @@ def _run_stability_check(
 
     n_jobs_resolved = _resolve_stability_jobs(n_jobs, X_train.shape[0], X_train.shape[1], n_runs)
     if n_jobs is not None:
+        live_jobs = n_jobs_resolved if n_jobs_resolved > 0 else n_runs
+        per_fit_gb = (
+            _FIT_PEAK_CALIBRATION
+            * _estimate_peak_fit_bytes(X_train.shape[0], X_train.shape[1], 1)
+            / 1e9
+        )
         print(
             f"[hprobes] stability bootstraps: {n_runs} runs x n_jobs={n_jobs_resolved} "
-            f"(est. peak {_estimate_peak_fit_bytes(X_train.shape[0], X_train.shape[1], n_jobs_resolved if n_jobs_resolved > 0 else n_runs) / 1e9:.1f} GB)"
+            f"(est. peak {per_fit_gb * live_jobs:.1f} GB)"
         )
+        avail = _available_ram_bytes()
+        if isinstance(n_jobs, int) and n_jobs > 1 and avail is not None:
+            safe_jobs = _resolve_stability_jobs(
+                "auto", X_train.shape[0], X_train.shape[1], n_runs, available_bytes=avail
+            )
+            if n_jobs > safe_jobs:
+                print(
+                    f"[hprobes] warning: stability_n_jobs={n_jobs} exceeds the calibrated "
+                    f"RAM budget (~{safe_jobs} jobs at this matrix size); swap/OOM risk"
+                )
     neuron_sets = Parallel(n_jobs=n_jobs_resolved, verbose=0)(
         delayed(_fit_one)(i) for i in range(n_runs)
     )

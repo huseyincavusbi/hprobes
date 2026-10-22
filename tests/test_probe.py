@@ -1282,9 +1282,11 @@ class TestStabilityNJobs:
         assert _resolve_stability_jobs(None, n, p, 5) == -1
         assert _resolve_stability_jobs(None, n + 1, p, 5) == 1
 
-    def test_resolver_int_passthrough_and_auto_budget(self):
+    def test_resolver_int_passthrough_and_auto_budget(self, monkeypatch):
+        import hprobes.probe as probe_mod
         from hprobes.probe import _resolve_stability_jobs
 
+        monkeypatch.setattr(probe_mod.os, "cpu_count", lambda: 8)
         assert _resolve_stability_jobs(3, 100, 1000, 5) == 3
         assert _resolve_stability_jobs(-1, 100, 1000, 5) == -1
         # auto: tiny budget -> 1; huge budget -> capped at n_runs
@@ -1295,6 +1297,18 @@ class TestStabilityNJobs:
         assert 1 <= real <= 5
         with pytest.raises(ValueError, match="stability_n_jobs"):
             _resolve_stability_jobs("bogus", 100, 1000, 5)
+
+    def test_auto_applies_calibration_and_cpu_cap(self, monkeypatch):
+        import hprobes.probe as probe_mod
+        from hprobes.probe import _resolve_stability_jobs
+
+        # 240 x 276480: analytic ~1.06 GB/fit, calibrated (x2.5) ~2.65 GB.
+        # 13 GiB * 0.5 safety -> floor(6.98 / 2.65) = 2 jobs.
+        monkeypatch.setattr(probe_mod.os, "cpu_count", lambda: 8)
+        assert _resolve_stability_jobs("auto", 240, 276480, 5, available_bytes=13 * 1024**3) == 2
+        # CPU cap: huge RAM must never exceed available cores.
+        monkeypatch.setattr(probe_mod.os, "cpu_count", lambda: 2)
+        assert _resolve_stability_jobs("auto", 100, 1000, 5, available_bytes=10**15) == 2
 
     def test_constructor_validates(self):
         with pytest.raises(ValueError, match="stability_n_jobs"):
