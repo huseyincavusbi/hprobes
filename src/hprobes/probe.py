@@ -1547,6 +1547,11 @@ class HProbes:
         label come from the same forward's logits (dense-equivalent protocol).
         Features are then selected two-stage and assembled sparse.
 
+        ``score`` selects the per-expert neuron ranking: ``mean_abs``
+        (default; ``sum|act|/n_samples`` with structural zeros), ``conditional``
+        (active-row mean), ``expected`` (gate-weighted expected contribution),
+        or ``variance`` (active-row variance).
+
         ``normalize_write`` divides feature values by each layer's total FFN
         write norm at the decision token, mirroring dense CETT (#41.2). Off by
         default so previously reported numbers stay comparable.

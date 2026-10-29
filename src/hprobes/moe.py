@@ -36,10 +36,10 @@ import torch
 GATE_APPLIED_INSIDE = {"olmoe"}
 
 # Neuron ranking modes for MoE feature selection (#41).
-#   variance     -- per-neuron variance over active rows
-#   mean_abs     -- mean|x| over active rows (historical default; == conditional)
-#   conditional  -- alias of mean_abs, kept for issue #41.7 vocabulary
-#   expected     -- sum|x| / n_tokens: expected contribution with structural zeros
+#   variance     -- per-neuron variance over active rows only
+#   mean_abs     -- sum|x| / n_samples: structural zeros count (historical default)
+#   conditional  -- mean|x| over active rows only
+#   expected     -- sum(|x| * gate) / n_samples: gate-weighted expected contribution
 _MOE_SCORES = ("variance", "mean_abs", "conditional", "expected")
 
 
@@ -520,11 +520,17 @@ def moe_col_norms(model: torch.nn.Module, layers: List[int]) -> Dict[Tuple[int, 
 
 
 class MoESparseDataset:
-    """Two-stage feature selection and sparse row assembly for MoE probes.
+    """Legacy two-stage feature selection and sparse row assembly for MoE probes.
+
+    .. deprecated::
+        This path is not used by :func:`fit_moe_probe`; new code should use
+        ``_design_from_features``. Its score semantics differ from
+        ``_design_from_features`` (notably ``mean_abs`` here is the active-row
+        mean) and are kept only for backward compatibility.
 
     Stage 1: per-expert neuron candidates, ranked within each expert by the
-    chosen score (variance or gate-weighted cumulative |activation|), floored
-    by ``n_active >= min_active`` to drop statistically-starved experts.
+    chosen score (this legacy path: variance or active-row mean |activation|),
+    floored by ``n_active >= min_active`` to drop statistically-starved experts.
     Stage 2: global top-k across all (layer, expert, neuron) candidates.
     Rows are then assembled sparse: a token contributes values only for its
     active experts' selected neurons; everything else is a structural zero.
@@ -700,9 +706,16 @@ def _design_from_features(
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Flatten decision-token features into a (n_samples, n_sel) dense matrix.
 
-    Stage 1 ranks neurons within each (layer, expert) by the chosen score over
-    the samples where that expert was active; stage 2 keeps the global top-k
-    (``top_k=0`` keeps all candidates).
+    Stage 1 ranks neurons within each (layer, expert) by the chosen score;
+    stage 2 keeps the global top-k (``top_k=0`` keeps all candidates).
+
+    Score semantics:
+
+    - ``variance`` -- variance over rows where the expert was active.
+    - ``mean_abs`` -- ``sum(|act|) / n_samples``; structural zeros count.
+    - ``conditional`` -- ``mean(|act|)`` over active rows only.
+    - ``expected`` -- ``sum(|act| * gate) / n_samples``; gate-weighted
+      expected contribution with structural zeros counted.
 
     ``normalize_write`` divides each sample's feature values by the layer's
     total FFN write norm at the decision token, mirroring dense CETT
@@ -736,12 +749,16 @@ def _design_from_features(
         if score == "variance":
             ranking = A.var(dim=0)
         elif score == "mean_abs":
-            # issue #41: expected contribution over ALL samples -- structural
-            # zeros (expert not routed) count in the denominator.
+            # historical default: expected contribution without gates;
+            # structural zeros (expert not routed) count in the denominator.
             ranking = A.abs().sum(dim=0) / n_samples
-        else:
-            # conditional: mean|x| over the rows where the expert was active.
+        elif score == "conditional":
+            # mean |activation| over the rows where the expert was active.
             ranking = A.abs().mean(dim=0)
+        else:
+            # expected: gate-weighted contribution over ALL samples.
+            gates = torch.as_tensor(g["gates"], dtype=A.dtype, device=A.device)
+            ranking = (A.abs() * gates[:, None]).sum(dim=0) / n_samples
         k = min(per_expert_top_n, ranking.numel())
         idx = torch.topk(ranking, k).indices.tolist()
         per_expert_pick[key] = idx

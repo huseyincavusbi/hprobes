@@ -137,7 +137,7 @@ hprobes moe \
 | `--question-key` | `question` | Key for question text |
 | `--options-key` | from `--format` | Options field override |
 | `--answer-key` | from `--format` | Answer field override |
-| `--score` | `mean_abs` | Per-expert neuron ranking: `variance` (zeros counted), `mean_abs` (active-row mean \|z\|, historical default), `expected` (gate-weighted expected value), `conditional` (alias of `mean_abs`) |
+| `--score` | `mean_abs` | Per-expert neuron ranking: `variance` (active-row variance), `mean_abs` (`sum\|z\|/n_samples`, structural zeros; historical default), `conditional` (active-row mean `\|z\|`), `expected` (gate-weighted `sum\|z\|*gate/n_samples`) |
 | `--per-expert-top-n` | `64` | Neurons kept per `(layer, expert)` before the global cap |
 | `--min-active` | `2` | Minimum active rows for a neuron to be scorable |
 | `--top-k` | `2000` | Global cap after per-expert ranking. `0` = all candidates. `auto` is dense-only |
