@@ -497,7 +497,7 @@ class TestMoeCommand:
                 "--no-routing-baseline",
                 "--fusion",
                 "neuron",
-                "--stability",
+                "--l2",
                 "--routing-analysis",
                 "--n-perm",
                 "10",
@@ -511,7 +511,7 @@ class TestMoeCommand:
         cli.main()
 
         out_text = capsys.readouterr().out
-        assert "--stability (dense-only; ignored in MoE mode)" in out_text
+        assert "--l2 (dense-only; ignored in MoE mode)" in out_text
 
         data = json.loads(out.with_suffix(".json").read_text())
         assert data["mode"] == "moe"
@@ -526,6 +526,65 @@ class TestMoeCommand:
         assert data["counterfactual"]["n_samples"] == 2
         assert data["counterfactual"]["self_swap"]["flips"] == 0
         assert data["counterfactual"]["self_swap"]["max_abs_entropy_delta"] == 0.0
+
+    def test_cmd_moe_stability_on_fake_model(self, monkeypatch, tmp_path):
+        import sys
+
+        import _fake_moe
+        from hprobes import cli
+        from test_probe import TOK
+
+        model = _fake_moe._FakeMoEModel()
+        samples = [
+            {
+                "question": f"Q{i}?",
+                "options": ["aa", "bb"],
+                "answer": i % 2,
+            }
+            for i in range(24)
+        ]
+        monkeypatch.setattr(cli, "load_samples", lambda data, n: samples)
+        monkeypatch.setattr(cli, "_load_model", lambda args: (TOK, model))
+
+        out = tmp_path / "moe_stability"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hprobes",
+                "moe",
+                "--model",
+                "fake/moe",
+                "--data",
+                "fake.jsonl",
+                "--samples",
+                "24",
+                "--layers",
+                "0",
+                "--per-expert-top-n",
+                "2",
+                "--min-active",
+                "1",
+                "--top-k",
+                "4",
+                "--no-routing-baseline",
+                "--fusion",
+                "neuron",
+                "--stability",
+                "--stability-n-jobs",
+                "1",
+                "--output",
+                str(out),
+            ],
+        )
+        cli.main()
+
+        data = json.loads(out.with_suffix(".json").read_text())
+        stability = data["moe"]["stability"]
+        assert data["config"]["stability"] is True
+        assert stability["n_runs"] == 5
+        assert len(stability["per_run_feature_sets"]) == 5
+        assert stability["n_features"] == len(data["moe"]["feature_names"])
 
 
 class TestSteerCommand:

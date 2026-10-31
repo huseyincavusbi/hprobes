@@ -974,7 +974,6 @@ def cmd_moe(args: argparse.Namespace) -> None:
         for flag in (
             "--alphas",
             "--l2",
-            "--stability",
             "--correlation",
             "--cluster",
             "--random-baseline",
@@ -1024,6 +1023,8 @@ def cmd_moe(args: argparse.Namespace) -> None:
         save_predictions=not args.no_predictions,
         readout=args.readout,
         solver=getattr(args, "solver", "auto"),
+        stability=args.stability,
+        stability_n_jobs=args.stability_n_jobs,
     )
     probe.fit_moe(
         samples,
@@ -1038,6 +1039,7 @@ def cmd_moe(args: argparse.Namespace) -> None:
         routing_baseline=args.routing_baseline,
         fusion=args.fusion,
         normalize_write=args.normalize_write,
+        stability=args.stability,
     )
     print(" done")
 
@@ -1051,6 +1053,12 @@ def cmd_moe(args: argparse.Namespace) -> None:
         print(
             f"  Routing:     llr={float(baseline.get('llr', 0.0)):.2f}  "
             f"(perm p={float(baseline.get('perm_p', 1.0)):.4f})"
+        )
+    stability = m.get("stability")
+    if stability:
+        print(
+            f"  Stability:   {stability['neurons_consistent_all_runs']} features across "
+            f"{stability['n_runs']} runs  |  Jaccard mean={stability['jaccard_mean']:.3f}"
         )
 
     if args.n_perm < 1:
@@ -1131,6 +1139,8 @@ def cmd_moe(args: argparse.Namespace) -> None:
             "routing_baseline": args.routing_baseline,
             "validation_split": args.validation_split,
             "seed": args.seed,
+            "stability": args.stability,
+            "stability_n_jobs": args.stability_n_jobs,
         },
         "moe": probe.moe_,
     }
@@ -1635,6 +1645,21 @@ def _parse_expert(value: str):
     return parsed
 
 
+def _parse_stability_jobs(value: str):
+    """Parse --stability-n-jobs: positive int or 'auto'."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --stability-n-jobs value: {value!r} (use a positive int or 'auto')"
+        )
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--stability-n-jobs must be >= 1 or 'auto', got {parsed}")
+    return parsed
+
+
 def _parse_layers(value: str):
     """Parse --layers: comma-separated non-negative indices, or 'all' -> None."""
     if isinstance(value, str) and value.strip().lower() in ("", "all"):
@@ -1778,7 +1803,8 @@ def _add_common_probe_args(p):
         "--stability",
         action="store_true",
         dest="stability",
-        help="Bootstrap L1 across random seeds to test H-Neuron selection stability",
+        help="Bootstrap stability: resample samples and refit L1 (dense); full-pipeline "
+        "design rebuild (MoE)",
     )
     p.add_argument(
         "--correlation",
@@ -1983,6 +2009,13 @@ def main() -> None:
         dest="normalize_write",
         help="Divide features by the layer's total FFN write norm at the decision token, "
         "mirroring dense CETT (default: off)",
+    )
+    moe_p.add_argument(
+        "--stability-n-jobs",
+        type=_parse_stability_jobs,
+        default=None,
+        dest="stability_n_jobs",
+        help="Bootstrap concurrency: int, 'auto', or omit for the legacy heuristic",
     )
     moe_p.add_argument(
         "--experts-implementation",

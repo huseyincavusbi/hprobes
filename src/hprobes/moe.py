@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -865,35 +865,17 @@ def _probe_metrics(X: np.ndarray, y: np.ndarray, l1_C: float, seed: int) -> Dict
     }
 
 
-def fit_moe_probe(
+def _moe_design_matrix(
     artifact: "_MoEFeatures",
-    l1_C: float = 1.0,
-    validation_split: float = 0.2,
-    seed: int = 42,
     fusion: str = "concat",
     routing_only: bool = False,
-) -> Dict[str, Any]:
-    """Fit a probe on decision-token MoE features (#41).
-
-    ``routing_only`` fits the routing control instead (features = per-layer
-    routed-expert indicators). ``fusion="concat"`` in the default neuron-only
-    mode appends the routing columns so the probe can use both; the separate
-    routing-only result is returned alongside by the caller.
-
-    ``top_k=0`` in ``capture_meta`` keeps **all** candidates (no global cap),
-    matching the dense path's "0 = all features" convention.
-    """
-
-    meta = artifact.capture_meta
-    y = np.asarray(artifact.labels)
-
+) -> Tuple[np.ndarray, List[str], Optional[Dict[str, Any]]]:
+    """Build a MoE probe design matrix and its feature names."""
     if routing_only:
         X, names = _routing_matrix(artifact)
-        metrics = _probe_metrics(X, y, l1_C, seed)
-        metrics["kind"] = "routing_only"
-        metrics["feature_names"] = names
-        return metrics
+        return X, names, None
 
+    meta = artifact.capture_meta
     X, design = _design_from_features(
         artifact,
         top_k=int(meta["top_k"]),
@@ -907,9 +889,206 @@ def fit_moe_probe(
         Xr, rnames = _routing_matrix(artifact)
         X = np.concatenate([X, Xr], axis=1)
         names = names + rnames
+    return X, names, design
+
+
+def _subset_moe_features(artifact: "_MoEFeatures", idx: np.ndarray) -> "_MoEFeatures":
+    """Subset a captured artifact by sample index."""
+    return _MoEFeatures(
+        feats=[artifact.feats[i] for i in idx],
+        routings=[artifact.routings[i] for i in idx],
+        labels=artifact.labels[idx],
+        prompts=[artifact.prompts[i] for i in idx],
+        per_sample=[artifact.per_sample[i] for i in idx],
+        write_norms=([artifact.write_norms[i] for i in idx] if artifact.write_norms else []),
+        capture_meta=dict(artifact.capture_meta),
+    )
+
+
+def _fit_selected_moe_features(
+    artifact: "_MoEFeatures",
+    l1_C: float,
+    seed: int,
+    fusion: str = "concat",
+    routing_only: bool = False,
+) -> set[str]:
+    """Fit the same L1 on a resampled artifact; return selected feature names."""
+    from sklearn.linear_model import LogisticRegression
+
+    y = np.asarray(artifact.labels)
+    if len(np.unique(y)) < 2:
+        raise ValueError(
+            "bootstrap resample contains a single class; increase sample count or disable stability"
+        )
+
+    X, names, _ = _moe_design_matrix(artifact, fusion=fusion, routing_only=routing_only)
+    if X.shape[1] == 0:
+        return set()
+
+    clf = LogisticRegression(
+        solver="liblinear",
+        l1_ratio=1,
+        C=l1_C,
+        max_iter=1000,
+        random_state=seed,
+    )
+    clf.fit(X, y)
+    return {names[int(j)] for j in np.where(clf.coef_[0] > 0)[0]}
+
+
+def _run_moe_stability_check(
+    artifact: "_MoEFeatures",
+    l1_C: float,
+    n_features: int,
+    fusion: str = "concat",
+    routing_only: bool = False,
+    n_runs: int = 5,
+    base_seed: int = 42,
+    n_jobs: Union[int, str, None] = None,
+) -> Dict[str, Any]:
+    """Full-pipeline bootstrap for MoE probes (#72).
+
+    Each replicate resamples sample indices with replacement, rebuilds the
+    two-stage design (per-expert scoring + top-n + global top-k), refits the
+    same L1, and records the selected named features. Rebuilding the design
+    is the point: it measures the full method, not just the final L1 on a
+    fixed design.
+    """
+    from joblib import Parallel, delayed
+
+    from .probe import (
+        _FIT_PEAK_CALIBRATION,
+        _available_ram_bytes,
+        _estimate_peak_fit_bytes,
+        _resolve_stability_jobs,
+    )
+
+    if n_runs < 1:
+        raise ValueError(f"n_runs must be >= 1, got {n_runs}")
+    n_samples = len(artifact.feats)
+
+    def _fit_one(seed_offset: int) -> set[str]:
+        rng = np.random.RandomState(base_seed + seed_offset)
+        idx = rng.choice(n_samples, size=n_samples, replace=True)
+        subset = _subset_moe_features(artifact, idx)
+        return _fit_selected_moe_features(
+            subset,
+            l1_C=l1_C,
+            seed=base_seed + seed_offset + 1,
+            fusion=fusion,
+            routing_only=routing_only,
+        )
+
+    n_jobs_resolved = _resolve_stability_jobs(n_jobs, n_samples, n_features, n_runs)
+    if n_jobs is not None:
+        live_jobs = n_jobs_resolved if n_jobs_resolved > 0 else n_runs
+        per_fit_gb = (
+            _FIT_PEAK_CALIBRATION * _estimate_peak_fit_bytes(n_samples, n_features, 1) / 1e9
+        )
+        print(
+            f"[hprobes] moe stability bootstraps: {n_runs} runs x "
+            f"n_jobs={n_jobs_resolved} (est. peak {per_fit_gb * live_jobs:.1f} GB)"
+        )
+        avail = _available_ram_bytes()
+        if isinstance(n_jobs, int) and n_jobs > 1 and avail is not None:
+            safe_jobs = _resolve_stability_jobs(
+                "auto", n_samples, n_features, n_runs, available_bytes=avail
+            )
+            if n_jobs > safe_jobs:
+                print(
+                    f"[hprobes] warning: stability_n_jobs={n_jobs} exceeds the "
+                    f"calibrated RAM budget (~{safe_jobs} jobs at this matrix size); "
+                    "swap/OOM risk"
+                )
+
+    feature_sets = Parallel(n_jobs=n_jobs_resolved, prefer="threads", verbose=0)(
+        delayed(_fit_one)(i) for i in range(n_runs)
+    )
+
+    features_per_run = [len(s) for s in feature_sets]
+    intersection_all = feature_sets[0]
+    for s in feature_sets[1:]:
+        intersection_all = intersection_all & s
+
+    jaccards = []
+    for i in range(len(feature_sets)):
+        for j in range(i + 1, len(feature_sets)):
+            union = len(feature_sets[i] | feature_sets[j])
+            jaccards.append(len(feature_sets[i] & feature_sets[j]) / union if union > 0 else 0.0)
+
+    if not any(features_per_run):
+        interpretation = "no MoE features selected across bootstrap runs"
+    elif len(intersection_all) >= 0.5 * features_per_run[0]:
+        interpretation = "selected MoE features consistent across bootstrap runs — robust selection"
+    else:
+        interpretation = (
+            "selected MoE features unstable across bootstrap runs — "
+            "possible sensitivity to data composition"
+        )
+
+    return {
+        "n_runs": n_runs,
+        "n_samples": n_samples,
+        "n_features": int(n_features),
+        "n_jobs": n_jobs_resolved,
+        "fusion": fusion,
+        "routing_only": routing_only,
+        "neurons_per_run": features_per_run,
+        "neurons_consistent_all_runs": len(intersection_all),
+        "jaccard_min": float(np.min(jaccards)) if jaccards else 0.0,
+        "jaccard_max": float(np.max(jaccards)) if jaccards else 0.0,
+        "jaccard_mean": float(np.mean(jaccards)) if jaccards else 0.0,
+        "per_run_feature_sets": [sorted(s) for s in feature_sets],
+        "interpretation": interpretation,
+    }
+
+
+def fit_moe_probe(
+    artifact: "_MoEFeatures",
+    l1_C: float = 1.0,
+    validation_split: float = 0.2,
+    seed: int = 42,
+    fusion: str = "concat",
+    routing_only: bool = False,
+    stability: bool = False,
+    stability_runs: int = 5,
+    stability_n_jobs: Union[int, str, None] = None,
+) -> Dict[str, Any]:
+    """Fit a probe on decision-token MoE features (#41).
+
+    ``routing_only`` fits the routing control instead (features = per-layer
+    routed-expert indicators). ``fusion="concat"`` in the default neuron-only
+    mode appends the routing columns so the probe can use both; the separate
+    routing-only result is returned alongside by the caller.
+
+    ``stability=True`` adds a full-pipeline bootstrap (#72): each replicate
+    resamples samples, rebuilds the design, refits L1, and records the named
+    selected features. ``stability_n_jobs`` uses the dense resolver.
+
+    ``top_k=0`` in ``capture_meta`` keeps **all** candidates (no global cap),
+    matching the dense path's "0 = all features" convention.
+    """
+
+    y = np.asarray(artifact.labels)
+    X, names, design = _moe_design_matrix(artifact, fusion=fusion, routing_only=routing_only)
     metrics = _probe_metrics(X, y, l1_C, seed)
-    metrics["kind"] = "neuron"
     metrics["feature_names"] = names
-    metrics["n_candidates"] = design["n_candidates"]
-    metrics["layers"] = meta["layers"]
+    if routing_only:
+        metrics["kind"] = "routing_only"
+    else:
+        metrics["kind"] = "neuron"
+        metrics["n_candidates"] = design["n_candidates"]
+        metrics["layers"] = artifact.capture_meta["layers"]
+
+    if stability:
+        metrics["stability"] = _run_moe_stability_check(
+            artifact,
+            l1_C=l1_C,
+            n_features=len(names),
+            fusion=fusion,
+            routing_only=routing_only,
+            n_runs=stability_runs,
+            base_seed=seed,
+            n_jobs=stability_n_jobs,
+        )
     return metrics

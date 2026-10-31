@@ -643,6 +643,71 @@ class TestMoEProbeFit:
         )
         assert design["feature_index"][0][0] == (0, 0)
 
+    def test_stability_block_contains_named_feature_sets(self):
+        from hprobes.moe import fit_moe_probe
+
+        out = fit_moe_probe(
+            self._artifact(),
+            stability=True,
+            stability_runs=3,
+            stability_n_jobs=1,
+        )
+        stability = out["stability"]
+        assert stability["n_runs"] == 3
+        assert len(stability["per_run_feature_sets"]) == 3
+        assert stability["neurons_per_run"] == [len(s) for s in stability["per_run_feature_sets"]]
+        assert stability["n_features"] == len(out["feature_names"])
+        assert all(
+            name.startswith("L")
+            for feature_set in stability["per_run_feature_sets"]
+            for name in feature_set
+        )
+
+    def test_stability_is_deterministic_across_n_jobs(self):
+        from hprobes.moe import _moe_design_matrix, _run_moe_stability_check
+
+        art = self._artifact()
+        _, names, _ = _moe_design_matrix(art, fusion="concat")
+        one = _run_moe_stability_check(art, l1_C=1.0, n_features=len(names), n_runs=3, n_jobs=1)
+        two = _run_moe_stability_check(art, l1_C=1.0, n_features=len(names), n_runs=3, n_jobs=2)
+        for key in (
+            "per_run_feature_sets",
+            "neurons_per_run",
+            "neurons_consistent_all_runs",
+            "jaccard_min",
+            "jaccard_max",
+            "jaccard_mean",
+        ):
+            assert one[key] == two[key]
+
+    def test_stability_single_class_guard(self):
+        from dataclasses import replace
+
+        from hprobes.moe import _run_moe_stability_check
+
+        art = replace(self._artifact(), labels=np.zeros(60, dtype=int))
+        with pytest.raises(ValueError, match="single class"):
+            _run_moe_stability_check(art, l1_C=1.0, n_features=16, n_runs=1, n_jobs=1)
+
+    def test_routing_only_stability_uses_routing_names(self):
+        from hprobes.moe import fit_moe_probe
+
+        out = fit_moe_probe(
+            self._artifact(),
+            routing_only=True,
+            stability=True,
+            stability_runs=2,
+            stability_n_jobs=1,
+        )
+        stability = out["stability"]
+        assert out["kind"] == "routing_only"
+        assert stability["n_features"] == len(out["feature_names"])
+        assert all(
+            ":N" not in name
+            for feature_set in stability["per_run_feature_sets"]
+            for name in feature_set
+        )
+
     def test_top_k_zero_keeps_all_candidates(self):
         from hprobes.moe import _design_from_features
 
