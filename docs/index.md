@@ -1,13 +1,18 @@
 # hprobes
 
-Discover and causally validate hallucination-associated FFN neurons (**H-Neurons**) in transformer LLMs.
+Discover and causally validate hallucination-associated FFN neurons (**H-Neurons**) in transformer LLMs, including dense and mixture-of-experts models.
 
-Based on [arXiv:2512.01797](https://arxiv.org/abs/2512.01797).
+Builds on [arXiv:2512.01797](https://arxiv.org/abs/2512.01797).
+
+Our paper: **Hallucination Neurons and Where to Find Them: An Investigation into the existence of Hallucination Neurons**, [arXiv:2609.29781](https://arxiv.org/abs/2609.29781), AIMLAI @ ECML-PKDD 2026.
 
 ## What It Does
 
 - Identifies a sparse set of FFN neurons whose CETT activations predict hallucination
-- Validates them causally via activation scaling
+- Supports dense and mixture-of-experts models (routed + shared experts)
+- Validates them causally via activation scaling, ablation, and routing counterfactuals
+- Provides inference-time steering (write-vectors, contrastive directions, ablation)
+- Reports bootstrap stability for dense and MoE probes
 - Provides production-ready hallucination risk scoring (`detect()` / `detect_batch()`)
 - Calibrates decision thresholds automatically using Youden's J statistic
 
@@ -43,8 +48,11 @@ risk = probe.detect("Which organ is most affected? A) Heart B) Lung C) Liver D) 
 | Step | Method | What It Does |
 |------|--------|--------------|
 | Discover | `fit()` | Extract CETT features, train L1 logistic regression, select H-Neurons |
+| Discover (MoE) | `fit_moe()` | Active-only per-expert CETT + shared experts; routing control |
 | Evaluate | `score()` | AUROC on held-out validation split + random neuron baseline |
 | Validate | `causal_validate()` | Scale H-Neuron activations to confirm causal role |
+| Validate (MoE) | `counterfactual_routing()` | Donor/random/self-swap routing interventions |
+| Steer | `SteeringController` | Write-vector, contrastive direction, α-scale, ablation |
 | Detect | `detect()` / `detect_batch()` | Production hallucination risk scoring (no labels needed) |
 | Transfer | `score_on()` | Score a saved probe on a different model or dataset |
 
@@ -52,6 +60,9 @@ risk = probe.detect("Which organ is most affected? A) Heart B) Lung C) Liver D) 
 
 ```bash
 hprobes run --model google/gemma-3-4b-it --data dataset.jsonl --samples 500
+hprobes moe --model allenai/OLMoE-1B-7B-0924 --data medqa.parquet --stability
+hprobes steer --model gpt2 --prompt "The capital of France is" \
+  --kind neuron_write --layer 6 --neuron 123 --dose 0.5
 hprobes transfer --probe results/probe --model google/gemma-3-4b --data dataset.jsonl
 hprobes responses --model google/gemma-3-4b-it --data responses.jsonl
 ```
