@@ -12,10 +12,12 @@ from hprobes.cett import (
     available_layers,
     forward_cett,
     forward_cett_batch,
+    forward_cett_dual_span_batch,
     forward_cett_span,
     get_mlp_down_proj,
     precompute_col_norms,
     scale_h_neurons,
+    scale_h_neurons_batch,
 )
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,35 @@ class _CausalLM(nn.Module):
         x = input_ids.float().unsqueeze(-1).expand(-1, -1, _H)
         for block in self.model.layers:
             x = block(x)
+
+        class _Out:
+            pass
+
+        out = _Out()
+        out.logits = self.lm_head(x)
+        return out
+
+
+class _SplitCausalLM(nn.Module):
+    """Causal LM with blocks on different devices; hidden states move between them."""
+
+    def __init__(self, devices):
+        super().__init__()
+        torch.manual_seed(0)
+        self._devices = list(devices)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_Block() for _ in self._devices])
+        self.lm_head = nn.Linear(_H, _V, bias=True)
+        for block, device in zip(self.model.layers, self._devices):
+            block.to(device)
+        self.lm_head.to(self._devices[-1])
+
+    def forward(self, input_ids=None, **kw):
+        x = input_ids.float().unsqueeze(-1).expand(-1, -1, _H)
+        x = x.to(self._devices[0])
+        for block, device in zip(self.model.layers, self._devices):
+            x = block(x.to(device))
+        x = x.to(self.lm_head.weight.device)
 
         class _Out:
             pass
@@ -246,6 +277,56 @@ class TestBatchedHeterogeneousDims:
         assert cett.shape == (2, 16 + 32)
         assert logits.shape == (2, _V)
         assert not torch.isnan(cett).any()
+
+
+_MPS_SPLIT_SKIP = pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires a CPU/MPS split"
+)
+
+
+class TestMultiDevice:
+    layers = [0, 1]
+
+    def _models(self):
+        ref = _CausalLM(n=2)
+        split = _SplitCausalLM(["cpu", "mps"])
+        split.load_state_dict(ref.state_dict())
+        return ref, split
+
+    @_MPS_SPLIT_SKIP
+    def test_batched_cett_matches_single_device(self):
+        ref, split = self._models()
+        tokens = _tok("ABCDE")
+        norms = precompute_col_norms(ref, self.layers)
+
+        ref_cett, ref_logits = forward_cett_batch(ref, tokens, self.layers, norms, [4])
+        cett, logits = forward_cett_batch(split, tokens, self.layers, norms, [4])
+
+        assert cett.device.type == "cpu" and logits.device.type == "cpu"
+        torch.testing.assert_close(cett, ref_cett, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(logits, ref_logits, rtol=1e-4, atol=1e-4)
+
+    @_MPS_SPLIT_SKIP
+    def test_dual_span_matches_single_device(self):
+        ref, split = self._models()
+        tokens = _tok("ABCDE")
+        norms = precompute_col_norms(ref, self.layers)
+
+        ref_ans, ref_other = forward_cett_dual_span_batch(ref, tokens, [(1, 3)], self.layers, norms)
+        ans, other = forward_cett_dual_span_batch(split, tokens, [(1, 3)], self.layers, norms)
+
+        torch.testing.assert_close(ans, ref_ans, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(other, ref_other, rtol=1e-4, atol=1e-4)
+
+    @_MPS_SPLIT_SKIP
+    def test_scale_batch_matches_single_device(self):
+        ref, split = self._models()
+        tokens = _tok("ABCDE")
+
+        ref_logits = scale_h_neurons_batch(ref, tokens, [(0, 0), (1, 0)], 0.5, self.layers)
+        logits = scale_h_neurons_batch(split, tokens, [(0, 0), (1, 0)], 0.5, self.layers)
+
+        torch.testing.assert_close(logits, ref_logits, rtol=1e-4, atol=1e-4)
 
 
 class TestColNorms:
