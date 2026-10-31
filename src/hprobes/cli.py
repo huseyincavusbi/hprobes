@@ -1773,8 +1773,11 @@ def main() -> None:
         "--score",
         choices=["variance", "mean_abs", "conditional", "expected"],
         default="mean_abs",
-        help="Per-expert neuron ranking score (default: mean_abs; 'conditional' is an "
-        "alias of 'mean_abs')",
+        help="Per-expert neuron ranking score (default: mean_abs). "
+        "'mean_abs' = sum|act|/n_samples (structural zeros); "
+        "'conditional' = mean|act| over active rows; "
+        "'expected' = gate-weighted sum|act|*gate/n_samples; "
+        "'variance' = variance over active rows.",
     )
     moe_p.add_argument(
         "--per-expert-top-n",
