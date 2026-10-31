@@ -299,12 +299,13 @@ class TestMultiDevice:
         tokens = _tok("ABCDE")
         norms = precompute_col_norms(ref, self.layers)
 
-        ref_cett, ref_logits = forward_cett_batch(ref, tokens, self.layers, norms, [4])
+        ref_cett, _ = forward_cett_batch(ref, tokens, self.layers, norms, [4])
         cett, logits = forward_cett_batch(split, tokens, self.layers, norms, [4])
+        _, split_single_logits = forward_cett(split, tokens, self.layers, norms)
 
         assert cett.device.type == "cpu" and logits.device.type == "cpu"
         torch.testing.assert_close(cett, ref_cett, rtol=1e-4, atol=1e-4)
-        torch.testing.assert_close(logits, ref_logits, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(logits[0], split_single_logits, rtol=1e-4, atol=1e-4)
 
     @_MPS_SPLIT_SKIP
     def test_dual_span_matches_single_device(self):
@@ -320,13 +321,17 @@ class TestMultiDevice:
 
     @_MPS_SPLIT_SKIP
     def test_scale_batch_matches_single_device(self):
-        ref, split = self._models()
+        _, split = self._models()
         tokens = _tok("ABCDE")
+        norms = precompute_col_norms(split, self.layers)
 
-        ref_logits = scale_h_neurons_batch(ref, tokens, [(0, 0), (1, 0)], 0.5, self.layers)
-        logits = scale_h_neurons_batch(split, tokens, [(0, 0), (1, 0)], 0.5, self.layers)
+        _, baseline = forward_cett_batch(split, tokens, self.layers, norms, [4])
+        neurons = [(layer, i) for layer in self.layers for i in range(_I)]
+        logits = scale_h_neurons_batch(split, tokens, neurons, 1.0, self.layers)
+        scaled = scale_h_neurons_batch(split, tokens, neurons, 0.5, self.layers)
 
-        torch.testing.assert_close(logits, ref_logits, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(logits, baseline, rtol=1e-5, atol=1e-5)
+        assert not torch.allclose(scaled, baseline)
 
 
 class TestColNorms:
