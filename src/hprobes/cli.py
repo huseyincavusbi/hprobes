@@ -1645,6 +1645,21 @@ def _parse_expert(value: str):
     return parsed
 
 
+def _parse_stability_jobs(value: str):
+    """Parse --stability-n-jobs: positive int or 'auto'."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --stability-n-jobs value: {value!r} (use a positive int or 'auto')"
+        )
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--stability-n-jobs must be >= 1 or 'auto', got {parsed}")
+    return parsed
+
+
 def _parse_layers(value: str):
     """Parse --layers: comma-separated non-negative indices, or 'all' -> None."""
     if isinstance(value, str) and value.strip().lower() in ("", "all"):
@@ -1997,6 +2012,7 @@ def main() -> None:
     )
     moe_p.add_argument(
         "--stability-n-jobs",
+        type=_parse_stability_jobs,
         default=None,
         dest="stability_n_jobs",
         help="Bootstrap concurrency: int, 'auto', or omit for the legacy heuristic",
