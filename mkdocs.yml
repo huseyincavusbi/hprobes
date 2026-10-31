@@ -45,6 +45,7 @@ nav:
     - How It Works: guide/how-it-works.md
     - Dataset Formats: guide/datasets.md
     - Production Scoring: guide/production.md
+    - Steering: guide/steering.md
     - CLI Reference: guide/cli.md
   - API Reference:
     - HProbes: api/probe.md
