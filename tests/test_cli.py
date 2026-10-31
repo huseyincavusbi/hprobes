@@ -528,6 +528,96 @@ class TestMoeCommand:
         assert data["counterfactual"]["self_swap"]["max_abs_entropy_delta"] == 0.0
 
 
+class TestSteerCommand:
+    def test_cmd_steer_fake_model(self, monkeypatch, tmp_path):
+        import sys
+
+        from hprobes import cli
+        from test_probe import TOK
+        from test_steering import _FakeModel
+
+        model = _FakeModel(vocab=256)
+        monkeypatch.setattr(cli, "_load_model", lambda args: (TOK, model))
+
+        out = tmp_path / "steer_run"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hprobes",
+                "steer",
+                "--model",
+                "fake/steer",
+                "--prompt",
+                "hello",
+                "--kind",
+                "neuron_write",
+                "--layer",
+                "0",
+                "--neuron",
+                "2",
+                "--dose",
+                "0.5",
+                "--max-new-tokens",
+                "3",
+                "--output",
+                str(out),
+            ],
+        )
+        cli.main()
+
+        data = json.loads(out.with_suffix(".json").read_text())
+        assert data["kind"] == "neuron_write"
+        assert data["layer"] == 0
+        assert data["neuron"] == 2
+        assert data["calls"] > 0
+        assert data["injected_norms"][0] == pytest.approx(0.5 * data["scale"])
+
+    def test_cmd_steer_moe_expert(self, monkeypatch, tmp_path):
+        import sys
+
+        from hprobes import cli
+        from test_probe import TOK
+        from test_steering import _FakeMoEModel
+
+        model = _FakeMoEModel()
+        monkeypatch.setattr(cli, "_load_model", lambda args: (TOK, model))
+
+        out = tmp_path / "steer_moe"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hprobes",
+                "steer",
+                "--model",
+                "fake/moe",
+                "--prompt",
+                "hello",
+                "--kind",
+                "neuron_write",
+                "--layer",
+                "0",
+                "--neuron",
+                "1",
+                "--expert",
+                "0",
+                "--dose",
+                "1.0",
+                "--max-new-tokens",
+                "2",
+                "--output",
+                str(out),
+            ],
+        )
+        cli.main()
+
+        data = json.loads(out.with_suffix(".json").read_text())
+        assert data["expert"] == 0
+        assert data["calls"] > 0
+        assert data["injected_norms"][0] > 0
+
+
 class TestMoeExpertsImplementation:
     def test_parser_default_and_override(self, monkeypatch):
         args = TestMoeCommand._parse(monkeypatch, ["moe", "--model", "m", "--data", "d.jsonl"])

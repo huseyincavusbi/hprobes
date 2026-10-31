@@ -182,6 +182,53 @@ deltas with permutation p-values, gate entropy, Jaccard churn, and `cett_cross_c
 the fitted probe); with `--counterfactual` it carries `counterfactual` (`rescue`,
 `corruption`, `random` rows per dose, `self_swap` gate, donor matching).
 
+## `hprobes steer`
+
+Apply one inference-time steering intervention and print baseline vs steered
+generation.
+
+```bash
+hprobes steer \
+  --model gpt2 \
+  --prompt "The capital of France is" \
+  --kind neuron_write \
+  --layer 6 \
+  --neuron 123 \
+  --dose 0.5 \
+  --max-new-tokens 16
+```
+
+```bash
+hprobes steer \
+  --model gpt2 \
+  --prompt "..." \
+  --kind direction \
+  --layer 6 \
+  --vector direction.npy \
+  --dose 1.0 \
+  --positions last
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--prompt` | required | Prompt text |
+| `--kind` | `neuron_write` | `neuron_write`, `direction`, `alpha_scale`, `ablation` |
+| `--layer` | required | Target layer index |
+| `--neuron` | — | Neuron index for neuron kinds |
+| `--expert` | — | Routed expert index or `shared` for MoE neuron_write |
+| `--vector` | — | 1-D `.npy`/JSON direction for `direction` |
+| `--dose` | `1.0` | Dose |
+| `--sign` | `1` | `+1` or `-1` |
+| `--positions` | `all` | `all` or `last` |
+| `--normalize` | `unit` | Direction normalization: `unit` or `none` |
+| `--scale` | auto | Residual norm; auto-calibrated for `neuron_write` |
+| `--chat-template` | off | Wrap prompt in the tokenizer chat template |
+| `--max-new-tokens` | `32` | Generated tokens |
+| `--output` | — | Optional JSON result path |
+
+For `neuron_write`, the auto scale is the median residual norm leaving the
+target layer, excluding token 0.
+
 ## `hprobes responses`
 
 Fit from pre-generated responses with judge labels (open-ended / free-text mode).
