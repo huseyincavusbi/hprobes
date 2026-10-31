@@ -103,9 +103,9 @@ save the baseline, steered text, hook count, and injected norms as JSON.
 
 Use the same dose and norm with:
 
-- a zero vector / `dose=0` for the bit-exact no-op gate,
+- `dose=0`, or a zero vector with `normalize="none"`, for the bit-exact no-op gate,
 - the sign flipped,
-- a random direction,
+- `random_direction(hidden_size, seed=...)`,
 - a norm-matched random direction,
 - a held-out vector-construction split.
 

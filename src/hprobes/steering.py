@@ -68,6 +68,17 @@ def contrastive_direction(
     return direction.detach().cpu()
 
 
+def random_direction(hidden_size: int, seed: int = 0, normalize: bool = True) -> torch.Tensor:
+    """Return a seeded random direction for norm-matched controls."""
+    if hidden_size < 1:
+        raise ValueError(f"hidden_size must be >= 1, got {hidden_size}")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    direction = torch.randn(hidden_size, generator=generator, dtype=torch.float32)
+    if normalize:
+        direction = direction / direction.norm()
+    return direction
+
+
 def median_residual_norm(
     model: torch.nn.Module,
     input_ids: torch.Tensor,

@@ -9,6 +9,7 @@ from .steering import (
     SteeringSpec,
     contrastive_direction,
     median_residual_norm,
+    random_direction,
     write_vector,
 )
 
@@ -22,6 +23,7 @@ __all__ = [
     "SteeringController",
     "write_vector",
     "contrastive_direction",
+    "random_direction",
     "median_residual_norm",
 ]
 __version__ = _metadata_version("hprobes")

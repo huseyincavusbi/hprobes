@@ -11,6 +11,7 @@ from hprobes.steering import (
     SteeringSpec,
     contrastive_direction,
     median_residual_norm,
+    random_direction,
     write_vector,
 )
 
@@ -132,6 +133,35 @@ def test_direction_noop_and_dose():
         steered = _base_logits(model, input_ids)
     assert not torch.equal(base, steered)
     assert controller.injected_norms[0] == pytest.approx(1.0)
+
+
+def test_zero_direction_with_normalize_none_is_noop():
+    model = _FakeModel()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    base = _base_logits(model, input_ids)
+    with SteeringController(
+        model,
+        [
+            SteeringSpec(
+                kind="direction",
+                layer=0,
+                vector=torch.zeros(4),
+                normalize="none",
+                dose=1.0,
+            )
+        ],
+    ):
+        zero = _base_logits(model, input_ids)
+    assert torch.equal(base, zero)
+
+
+def test_random_direction_is_seeded_and_unit_norm():
+    a = random_direction(8, seed=0)
+    b = random_direction(8, seed=0)
+    c = random_direction(8, seed=1)
+    assert a.norm() == pytest.approx(1.0)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
 
 
 def test_alpha_scale_and_ablation():
