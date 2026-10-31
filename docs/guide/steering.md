@@ -67,6 +67,38 @@ worth of the neuron direction.
 `median_residual_norm` implements the calibration pass. It is intended for a
 single prompt (batch size 1).
 
+## CLI
+
+Apply a normalized write-vector intervention:
+
+```bash
+hprobes steer \
+  --model gpt2 \
+  --prompt "The capital of France is" \
+  --kind neuron_write \
+  --layer 6 \
+  --neuron 123 \
+  --dose 0.5 \
+  --max-new-tokens 16
+```
+
+Apply a residual direction from a `.npy` or JSON file:
+
+```bash
+hprobes steer \
+  --model gpt2 \
+  --prompt "..." \
+  --kind direction \
+  --layer 6 \
+  --vector direction.npy \
+  --dose 1.0
+```
+
+For `neuron_write`, `--scale` is auto-calibrated from the prompt’s median
+residual norm when omitted. Use `--chat-template` for instruction-tuned models.
+`--positions last` edits only the decision/final token. Add `--output path` to
+save the baseline, steered text, hook count, and injected norms as JSON.
+
 ## Controls
 
 Use the same dose and norm with:

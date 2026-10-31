@@ -1142,6 +1142,147 @@ def cmd_moe(args: argparse.Namespace) -> None:
     print(f"\n  Saved:       {json_path}")
 
 
+def _load_steering_vector(path: str):
+    """Load a 1-D steering direction from .npy or JSON."""
+    import numpy as np
+    import torch
+
+    p = Path(path)
+    if p.suffix == ".npy":
+        arr = np.load(p)
+    elif p.suffix == ".json":
+        payload = json.loads(p.read_text())
+        if isinstance(payload, dict):
+            payload = payload.get("vector")
+        if payload is None:
+            raise SystemExit(f"{path}: JSON object has no 'vector' field")
+        arr = np.asarray(payload)
+    else:
+        raise SystemExit(f"--vector must be .npy or .json, got {p.suffix!r}")
+    if arr.ndim != 1:
+        raise SystemExit(f"--vector must be 1-D, got shape {arr.shape}")
+    return torch.as_tensor(arr, dtype=torch.float32)
+
+
+def cmd_steer(args: argparse.Namespace) -> None:
+    """Apply one inference-time steering spec and print baseline/steered text."""
+    import torch
+
+    from hprobes.steering import (
+        SteeringController,
+        SteeringSpec,
+        median_residual_norm,
+    )
+
+    sep = "─" * 68
+    print(f"\nhprobes steer  |  model: {args.model}  |  kind: {args.kind}")
+    print(sep)
+
+    if args.kind in ("neuron_write", "alpha_scale", "ablation") and args.neuron is None:
+        raise SystemExit(f"steer: --kind {args.kind} requires --neuron")
+    if args.kind == "direction" and not args.vector:
+        raise SystemExit("steer: --kind direction requires --vector")
+
+    tokenizer, model = _load_model(args)
+    device = next(model.parameters()).device
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompt = args.prompt
+    if args.chat_template:
+        if not getattr(tokenizer, "chat_template", None):
+            raise SystemExit("steer: tokenizer has no chat template")
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    prompt_len = int(inputs["input_ids"].shape[1])
+
+    with torch.inference_mode():
+        baseline = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    scale = args.scale
+    if args.kind == "neuron_write" and scale is None:
+        norms = median_residual_norm(model, inputs["input_ids"], layers=[args.layer])
+        if args.layer not in norms:
+            raise SystemExit(f"steer: no residual norm for layer {args.layer}")
+        scale = norms[args.layer]
+
+    spec_kwargs = {
+        "kind": args.kind,
+        "layer": args.layer,
+        "dose": args.dose,
+        "sign": args.sign,
+        "positions": args.positions,
+        "normalize": args.normalize,
+        "scale": scale,
+    }
+    if args.neuron is not None:
+        spec_kwargs["neuron"] = args.neuron
+    if args.vector:
+        spec_kwargs["vector"] = _load_steering_vector(args.vector)
+    spec = SteeringSpec(**spec_kwargs)
+
+    with SteeringController(model, [spec]) as controller:
+        with torch.inference_mode():
+            steered = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+    baseline_text = tokenizer.decode(baseline[0, prompt_len:], skip_special_tokens=True)
+    steered_text = tokenizer.decode(steered[0, prompt_len:], skip_special_tokens=True)
+
+    print(f"  Layer:       {args.layer}  neuron={args.neuron}  sign={args.sign}")
+    print(f"  Dose:        {args.dose}  scale={scale}  positions={args.positions}")
+    print(f"  Hooks:       {controller.calls} calls  injected={controller.injected_norms}")
+    print(f"\n  Baseline:\n{baseline_text}\n")
+    print(f"  Steered:\n{steered_text}\n")
+
+    if args.output:
+        json_path = Path(args.output).with_suffix(".json")
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model": args.model,
+            "prompt": prompt,
+            "kind": args.kind,
+            "layer": args.layer,
+            "neuron": args.neuron,
+            "dose": args.dose,
+            "sign": args.sign,
+            "positions": args.positions,
+            "normalize": args.normalize,
+            "scale": scale,
+            "vector_norm": (
+                float(spec_kwargs["vector"].norm()) if "vector" in spec_kwargs else None
+            ),
+            "baseline": baseline_text,
+            "steered": steered_text,
+            "calls": controller.calls,
+            "injected_norms": controller.injected_norms,
+        }
+        json_path.write_text(json.dumps(payload, indent=2, default=_json_default))
+        print(f"  Saved:       {json_path}")
+
+
 def cmd_responses(args: argparse.Namespace) -> None:
     from hprobes import HProbes, __version__
 
@@ -1866,6 +2007,69 @@ def main() -> None:
     moe_p.set_defaults(top_k=2000, readout="logits")
 
     # ── hprobes responses ──────────────────────────────────────────────────────
+    # ── hprobes steer ─────────────────────────────────────────────────────────
+    steer_p = subparsers.add_parser(
+        "steer",
+        help="Apply inference-time neuron or direction steering",
+        description="Add a normalized neuron write vector, a residual direction, "
+        "or an activation scale/ablation during generation.",
+    )
+    steer_p.add_argument("--prompt", required=True, help="Prompt text")
+    steer_p.add_argument("--model", required=True, help="HuggingFace model ID")
+    steer_p.add_argument(
+        "--kind",
+        choices=["neuron_write", "direction", "alpha_scale", "ablation"],
+        default="neuron_write",
+        help="Intervention kind (default: neuron_write)",
+    )
+    steer_p.add_argument("--layer", type=int, required=True, help="Target layer index")
+    steer_p.add_argument("--neuron", type=int, default=None, help="Target neuron index")
+    steer_p.add_argument(
+        "--vector",
+        default=None,
+        help="1-D direction vector for --kind direction (.npy or JSON list)",
+    )
+    steer_p.add_argument("--dose", type=float, default=1.0, help="Dose (default: 1.0)")
+    steer_p.add_argument(
+        "--sign",
+        type=int,
+        choices=[1, -1],
+        default=1,
+        help="Direction/write sign (default: +1)",
+    )
+    steer_p.add_argument(
+        "--positions",
+        choices=["all", "last"],
+        default="all",
+        help="Apply at all positions or only the final position (default: all)",
+    )
+    steer_p.add_argument(
+        "--normalize",
+        choices=["unit", "none"],
+        default="unit",
+        help="Direction normalization (default: unit)",
+    )
+    steer_p.add_argument(
+        "--scale",
+        type=float,
+        default=None,
+        help="Residual-norm scale; auto-calibrated for neuron_write when omitted",
+    )
+    steer_p.add_argument(
+        "--chat-template",
+        action="store_true",
+        help="Wrap the prompt in the tokenizer's chat template",
+    )
+    steer_p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=32,
+        dest="max_new_tokens",
+        help="Generated tokens (default: 32)",
+    )
+    steer_p.add_argument("--output", default=None, help="Optional JSON result path")
+    _add_common_model_args(steer_p)
+
     resp_p = subparsers.add_parser(
         "responses", help="Fit from pre-generated responses (open-ended / free-text)"
     )
@@ -2047,6 +2251,8 @@ def main() -> None:
         cmd_run(args)
     elif args.command == "moe":
         cmd_moe(args)
+    elif args.command == "steer":
+        cmd_steer(args)
     elif args.command == "responses":
         cmd_responses(args)
     elif args.command == "transfer":

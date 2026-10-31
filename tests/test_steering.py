@@ -51,6 +51,22 @@ class _FakeModel(nn.Module):
             hidden = layer(hidden)
         return SimpleNamespace(logits=hidden)
 
+    def generate(
+        self,
+        input_ids,
+        attention_mask=None,
+        max_new_tokens=4,
+        do_sample=False,
+        pad_token_id=None,
+        **kwargs,
+    ):
+        # Trigger the hooks once, then append deterministic dummy tokens.
+        self(input_ids=input_ids)
+        extra = torch.ones(
+            (input_ids.shape[0], max_new_tokens), dtype=input_ids.dtype, device=input_ids.device
+        )
+        return torch.cat([input_ids, extra], dim=1)
+
 
 def _base_logits(model, input_ids):
     with torch.inference_mode():
