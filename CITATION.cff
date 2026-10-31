@@ -1,0 +1,43 @@
+cff-version: 1.2.0
+message: "If you use hprobes, please cite the software and the paper below."
+title: hprobes
+version: 0.12.0
+date-released: 2026-10-31
+license: MIT
+repository-code: "https://github.com/huseyincavusbi/hprobes"
+keywords:
+  - hallucination
+  - interpretability
+  - neurons
+  - probing
+  - mixture-of-experts
+
+authors:
+  - family-names: Cavus
+    given-names: Huseyin
+  - family-names: Sabu
+    given-names: Sebin
+  - family-names: Spear
+    given-names: Joshua
+  - family-names: Singh Kawatra
+    given-names: Jaskaran
+  - family-names: Rajendran
+    given-names: Pavithra
+
+preferred-citation:
+  type: article
+  title: "Hallucination Neurons and Where to Find Them: An Investigation into the existence of Hallucination Neurons"
+  authors:
+    - family-names: Cavus
+      given-names: Huseyin
+    - family-names: Sabu
+      given-names: Sebin
+    - family-names: Spear
+      given-names: Joshua
+    - family-names: Singh Kawatra
+      given-names: Jaskaran
+    - family-names: Rajendran
+      given-names: Pavithra
+  year: 2026
+  doi: "10.48550/arXiv.2609.29781"
+  url: "https://arxiv.org/abs/2609.29781"
