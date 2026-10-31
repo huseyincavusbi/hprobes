@@ -193,6 +193,13 @@ class SteeringController:
             self._register_direction(spec)
             return
 
+        block = _get_transformer_layers(self.model)[spec.layer]
+        if spec.kind == "neuron_write" and hasattr(block, "post_feedforward_layernorm"):
+            raise NotImplementedError(
+                "neuron_write is not implemented for post-FFN-norm layers (Gemma); "
+                "use kind='direction' for residual steering"
+            )
+
         down_proj = get_mlp_down_proj(self.model, spec.layer)
         neuron = int(spec.neuron)  # type: ignore[arg-type]
         if spec.kind == "neuron_write":

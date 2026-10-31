@@ -257,3 +257,13 @@ def test_invalid_specs_rejected():
         SteeringSpec(kind="direction", layer=0)
     with pytest.raises(ValueError, match="sign"):
         SteeringSpec(kind="direction", layer=0, vector=torch.ones(4), sign=2)
+
+
+def test_gemma_like_neuron_write_is_rejected():
+    model = _FakeModel()
+    model.model.layers[0].post_feedforward_layernorm = nn.Identity()
+    with pytest.raises(NotImplementedError, match="post-FFN-norm"):
+        SteeringController(
+            model,
+            [SteeringSpec(kind="neuron_write", layer=0, neuron=2, dose=1.0)],
+        )

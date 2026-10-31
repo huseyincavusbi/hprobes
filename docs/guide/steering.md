@@ -118,9 +118,10 @@ Use the same dose and norm with:
 - Routed-expert write-vector steering is not implemented in this slice. For a
   routed-only MoE, use a residual `direction` or the MoE capture/routing tools.
 - Gemma applies a post-feedforward norm after the MLP. The true residual write
-  direction is the normed column, not the raw `down_proj` column. Use
-  `direction` for Gemma residual steering until the Gemma write-column
-  correction is implemented.
+  direction is the normed column, not the raw `down_proj` column.
+  `neuron_write` raises `NotImplementedError` for post-FFN-norm layers; use
+  `direction` for Gemma residual steering until the write-column correction is
+  implemented.
 - The hook is inference-time only; no weights are modified.
 
 ## No-op gate
