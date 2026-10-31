@@ -71,6 +71,30 @@ class _Model(nn.Module):
         return torch.cat([input_ids, extra], dim=1)
 
 
+class _SplitModel(_Model):
+    """_Model with its blocks distributed across devices."""
+
+    def __init__(self, devices):
+        super().__init__()
+        self._devices = list(devices)
+        for block, device in zip(self.model.layers, self._devices):
+            block.to(device)
+        self.lm_head.to(self._devices[-1])
+
+    def forward(self, input_ids=None, attention_mask=None, **kw):
+        x = input_ids.float().unsqueeze(-1).expand(-1, -1, _H)
+        for block, device in zip(self.model.layers, self._devices):
+            x = block(x.to(device))
+        x = x.to(self.lm_head.weight.device)
+
+        class _Out:
+            pass
+
+        out = _Out()
+        out.logits = self.lm_head(x)
+        return out
+
+
 class _TokenizerOutput(dict):
     """Dict subclass with .to() so detect_batch() can call tokenizer(...).to(device)."""
 
@@ -288,6 +312,16 @@ class TestFitAndScore:
         p = HProbes(MODEL, TOK, l1_C=0.5)
         p.fit_from_responses(samples)
         assert p.is_fitted_
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires a CPU/MPS split")
+class TestMultiDeviceFit:
+    def test_fit_with_split_model(self):
+        model = _SplitModel(["cpu", "mps", "mps", "mps"])
+        probe = HProbes(model, TOK, l1_C=10, readout="logits")
+        probe.fit(SAMPLES, options_key="options", answer_key="answer")
+        assert probe.is_fitted_
+        assert 0.0 <= probe.accuracy_ <= 1.0
 
 
 class TestSaveLoadTransfer:

@@ -104,6 +104,8 @@ def _batched_token_rows(
     t: torch.Tensor, batch_idx: torch.Tensor, token_pos: torch.Tensor, seq_len: int
 ) -> torch.Tensor:
     """Select (batch, position) rows; supports flattened 2D MoE activations."""
+    batch_idx = batch_idx.to(t.device)
+    token_pos = token_pos.to(t.device)
     if t.dim() == 3:
         return t[batch_idx, token_pos]
     return t[batch_idx * seq_len + token_pos]
@@ -533,7 +535,10 @@ def forward_cett_dual_span_batch(
     for layer_idx in layers:
         z = z_cache[layer_idx].float()
         h = h_cache[layer_idx].float()
-        col_norm = col_norms[layer_idx].to(device)
+        layer_device = z.device
+        answer_mask_l = answer_mask.to(layer_device)
+        other_mask_l = other_mask.to(layer_device)
+        col_norm = col_norms[layer_idx].to(layer_device)
 
         h_norm = torch.norm(h, dim=-1, keepdim=True) + 1e-8
         cett_per_token = (torch.abs(z) * col_norm.unsqueeze(0).unsqueeze(0)) / h_norm
@@ -541,31 +546,31 @@ def forward_cett_dual_span_batch(
         if aggregation == "max":
             inf = torch.finfo(cett_per_token.dtype).min
             ans_agg = torch.where(
-                answer_mask.unsqueeze(-1),
+                answer_mask_l.unsqueeze(-1),
                 cett_per_token,
                 torch.full_like(cett_per_token, inf),
             ).amax(dim=1)
             oth_agg = torch.where(
-                other_mask.unsqueeze(-1),
+                other_mask_l.unsqueeze(-1),
                 cett_per_token,
                 torch.full_like(cett_per_token, inf),
             ).amax(dim=1)
             # Samples with an empty answer/non-answer span → zero vector
             ans_agg = torch.where(
-                answer_mask.any(dim=1, keepdim=True), ans_agg, torch.zeros_like(ans_agg)
+                answer_mask_l.any(dim=1, keepdim=True), ans_agg, torch.zeros_like(ans_agg)
             )
             oth_agg = torch.where(
-                other_mask.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
+                other_mask_l.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
             )
         else:
-            ans_agg = (cett_per_token * answer_mask.unsqueeze(-1)).sum(dim=1) / answer_mask.sum(
+            ans_agg = (cett_per_token * answer_mask_l.unsqueeze(-1)).sum(dim=1) / answer_mask_l.sum(
                 dim=1, keepdim=True
             ).clamp(min=1)
-            oth_agg = (cett_per_token * other_mask.unsqueeze(-1)).sum(dim=1) / other_mask.sum(
+            oth_agg = (cett_per_token * other_mask_l.unsqueeze(-1)).sum(dim=1) / other_mask_l.sum(
                 dim=1, keepdim=True
             ).clamp(min=1)
             oth_agg = torch.where(
-                other_mask.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
+                other_mask_l.any(dim=1, keepdim=True), oth_agg, torch.zeros_like(oth_agg)
             )
 
         cett_answer_parts.append(ans_agg.cpu())
@@ -625,15 +630,19 @@ def forward_cett_batch(
         for h in handles:
             h.remove()
 
-    logits_matrix = out.logits[batch_idx, token_pos_t].detach().float().cpu()
+    logits = out.logits
+    logits_matrix = (
+        logits[batch_idx.to(logits.device), token_pos_t.to(logits.device)].detach().float().cpu()
+    )
 
     cett_parts = []
     for li in layers:
         z = z_cache[li]
         h = h_cache[li]
         h_norm = torch.norm(h, dim=-1, keepdim=True) + 1e-8
-        cett_parts.append((torch.abs(z) * col_norms[li].to(device).unsqueeze(0)) / h_norm)
-    cett_matrix = torch.cat(cett_parts, dim=1).cpu()
+        col_norm = col_norms[li].to(z.device)
+        cett_parts.append(((torch.abs(z) * col_norm.unsqueeze(0)) / h_norm).cpu())
+    cett_matrix = torch.cat(cett_parts, dim=1)
 
     return cett_matrix, logits_matrix
 
@@ -701,8 +710,9 @@ def forward_cett_at_token_batch(
         z = z_cache[li]
         h = h_cache[li]
         h_norm = torch.norm(h, dim=-1, keepdim=True) + 1e-8
-        cett_parts.append((torch.abs(z) * col_norms[li].to(device).unsqueeze(0)) / h_norm)
-    cett_matrix = torch.cat(cett_parts, dim=1).cpu()
+        col_norm = col_norms[li].to(z.device)
+        cett_parts.append(((torch.abs(z) * col_norm.unsqueeze(0)) / h_norm).cpu())
+    cett_matrix = torch.cat(cett_parts, dim=1)
 
     return cett_matrix
 
@@ -724,7 +734,6 @@ def scale_h_neurons_batch(
     logits_matrix : (B, vocab_size,) float32 CPU
     """
     batch_size = batch_tokens["input_ids"].shape[0]
-    device = batch_tokens["input_ids"].device
 
     neurons_by_layer: Dict[int, List[int]] = {}
     for layer_idx, neuron_idx in h_neurons:
@@ -754,8 +763,10 @@ def scale_h_neurons_batch(
         for h in handles:
             h.remove()
 
-    last_positions = batch_tokens["attention_mask"].sum(dim=1) - 1
-    logits = out.logits[torch.arange(batch_size, device=device), last_positions]
+    out_logits = out.logits
+    logits_device = out_logits.device
+    last_positions = (batch_tokens["attention_mask"].sum(dim=1) - 1).to(logits_device)
+    logits = out_logits[torch.arange(batch_size, device=logits_device), last_positions]
     return logits.detach().float().cpu()
 
 
