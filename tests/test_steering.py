@@ -113,6 +113,25 @@ def test_neuron_write_changes_output_and_norm_is_dose():
     assert controller.injected_norms[0] == pytest.approx(1.0)
 
 
+def test_neuron_write_sign_flip_is_symmetric():
+    model = _FakeModel()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    base = _base_logits(model, input_ids)
+
+    with SteeringController(
+        model,
+        [SteeringSpec(kind="neuron_write", layer=0, neuron=2, dose=1.0, sign=1)],
+    ):
+        plus = _base_logits(model, input_ids)
+    with SteeringController(
+        model,
+        [SteeringSpec(kind="neuron_write", layer=0, neuron=2, dose=1.0, sign=-1)],
+    ):
+        minus = _base_logits(model, input_ids)
+
+    assert torch.allclose(plus - base, -(minus - base), atol=1e-6)
+
+
 def test_direction_noop_and_dose():
     model = _FakeModel()
     input_ids = torch.tensor([[1, 2, 3, 4]])
