@@ -10,6 +10,7 @@ from .steering import (
     contrastive_direction,
     median_residual_norm,
     random_direction,
+    residual_write_vector,
     write_vector,
 )
 
@@ -22,6 +23,7 @@ __all__ = [
     "SteeringSpec",
     "SteeringController",
     "write_vector",
+    "residual_write_vector",
     "contrastive_direction",
     "random_direction",
     "median_residual_norm",

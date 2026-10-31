@@ -12,6 +12,7 @@ from hprobes.steering import (
     contrastive_direction,
     median_residual_norm,
     random_direction,
+    residual_write_vector,
     write_vector,
 )
 
@@ -62,6 +63,105 @@ class _FakeModel(nn.Module):
         **kwargs,
     ):
         # Trigger the hooks once, then append deterministic dummy tokens.
+        self(input_ids=input_ids)
+        extra = torch.ones(
+            (input_ids.shape[0], max_new_tokens), dtype=input_ids.dtype, device=input_ids.device
+        )
+        return torch.cat([input_ids, extra], dim=1)
+
+
+class _FakeRMSNorm(nn.Module):
+    def __init__(self, dim: int, offset: float = 0.5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((dim,), offset))
+
+    def forward(self, x):
+        return x * (1.0 + self.weight)
+
+
+class _FakeGemmaLayer(_FakeLayer):
+    def __init__(self, d_model: int = 4, d_ff: int = 6, seed: int = 0):
+        super().__init__(d_model=d_model, d_ff=d_ff, seed=seed)
+        self.post_feedforward_layernorm = _FakeRMSNorm(d_model)
+        self.register_buffer("layer_scalar", torch.tensor([2.0]))
+
+    def forward(self, x):
+        residual = x
+        hidden = self.post_feedforward_layernorm(self.mlp(x))
+        return (residual + hidden) * self.layer_scalar
+
+
+class _FakeGemmaModel(nn.Module):
+    def __init__(self, d_model: int = 4, d_ff: int = 6):
+        super().__init__()
+        torch.manual_seed(0)
+        self.config = SimpleNamespace(model_type="gemma3")
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_FakeGemmaLayer(d_model, d_ff)])
+        self.embed = nn.Embedding(20, d_model)
+
+    def forward(self, input_ids):
+        hidden = self.embed(input_ids)
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        return SimpleNamespace(logits=hidden)
+
+
+class _FakeStackedExperts(nn.Module):
+    def __init__(self, num_experts: int = 2, d_model: int = 4, d_ff: int = 6):
+        super().__init__()
+        torch.manual_seed(0)
+        self.down_proj = nn.Parameter(torch.randn(num_experts, d_model, d_ff) * 0.1)
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        out = torch.zeros_like(hidden_states)
+        for expert in range(self.down_proj.shape[0]):
+            mask = (top_k_index == expert).any(dim=-1)
+            if mask.any():
+                out[mask] += self.down_proj[expert].sum(dim=1) * 0.01
+        return out
+
+
+class _FakeMoELayer(nn.Module):
+    def __init__(self, d_model: int = 4, d_ff: int = 6):
+        super().__init__()
+        self.mlp = nn.Module()
+        self.mlp.experts = _FakeStackedExperts(d_model=d_model, d_ff=d_ff)
+
+    def forward(self, hidden_states):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        rows = flat.shape[0]
+        top_k = torch.zeros(rows, 2, dtype=torch.long)
+        top_k[:, 0] = torch.arange(rows) % 2
+        top_k[:, 1] = top_k[:, 0]
+        weights = torch.full((rows, 2), 0.5)
+        out = self.mlp.experts(flat, top_k, weights).reshape_as(hidden_states)
+        return hidden_states + out
+
+
+class _FakeMoEModel(nn.Module):
+    def __init__(self, d_model: int = 4, d_ff: int = 6, vocab: int = 256):
+        super().__init__()
+        torch.manual_seed(0)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_FakeMoELayer(d_model, d_ff)])
+        self.embed = nn.Embedding(vocab, d_model)
+
+    def forward(self, input_ids):
+        hidden = self.embed(input_ids)
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        return SimpleNamespace(logits=hidden)
+
+    def generate(
+        self,
+        input_ids,
+        attention_mask=None,
+        max_new_tokens=4,
+        do_sample=False,
+        pad_token_id=None,
+        **kwargs,
+    ):
         self(input_ids=input_ids)
         extra = torch.ones(
             (input_ids.shape[0], max_new_tokens), dtype=input_ids.dtype, device=input_ids.device
@@ -278,11 +378,71 @@ def test_invalid_specs_rejected():
         SteeringSpec(kind="direction", layer=0, vector=torch.ones(4), sign=2)
 
 
-def test_gemma_like_neuron_write_is_rejected():
-    model = _FakeModel()
-    model.model.layers[0].post_feedforward_layernorm = nn.Identity()
-    with pytest.raises(NotImplementedError, match="post-FFN-norm"):
-        SteeringController(
-            model,
-            [SteeringSpec(kind="neuron_write", layer=0, neuron=2, dose=1.0)],
-        )
+def test_gemma_like_neuron_write_uses_residual_path():
+    model = _FakeGemmaModel()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    base = _base_logits(model, input_ids)
+
+    raw = write_vector(model, 0, 2)
+    residual = residual_write_vector(model, 0, 2)
+    assert torch.allclose(residual, raw * 1.5)
+
+    with SteeringController(
+        model,
+        [SteeringSpec(kind="neuron_write", layer=0, neuron=2, dose=0.0)],
+    ):
+        zero = _base_logits(model, input_ids)
+    assert torch.equal(base, zero)
+
+    with SteeringController(
+        model,
+        [SteeringSpec(kind="neuron_write", layer=0, neuron=2, dose=1.0)],
+    ) as controller:
+        steered = _base_logits(model, input_ids)
+    assert not torch.equal(base, steered)
+    assert controller.calls > 0
+
+
+def test_routed_expert_write_noop_and_active_mask():
+    model = _FakeMoEModel()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    base = _base_logits(model, input_ids)
+
+    with SteeringController(
+        model,
+        [
+            SteeringSpec(
+                kind="neuron_write",
+                layer=0,
+                neuron=1,
+                expert=0,
+                dose=0.0,
+                scale=1.0,
+            )
+        ],
+    ):
+        zero = _base_logits(model, input_ids)
+    assert torch.equal(base, zero)
+
+    with SteeringController(
+        model,
+        [
+            SteeringSpec(
+                kind="neuron_write",
+                layer=0,
+                neuron=1,
+                expert=0,
+                dose=1.0,
+                scale=1.0,
+            )
+        ],
+    ) as controller:
+        steered = _base_logits(model, input_ids)
+
+    # Expert 0 is active on even rows only in the fake router.
+    assert torch.equal(base[:, 1, :], steered[:, 1, :])
+    assert torch.equal(base[:, 3, :], steered[:, 3, :])
+    assert not torch.equal(base[:, 0, :], steered[:, 0, :])
+    assert not torch.equal(base[:, 2, :], steered[:, 2, :])
+    assert controller.calls > 0
+    assert controller.injected_norms[0] == pytest.approx(1.0)

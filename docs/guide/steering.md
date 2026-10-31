@@ -12,7 +12,6 @@ from hprobes import (
     SteeringController,
     SteeringSpec,
     median_residual_norm,
-    write_vector,
 )
 
 # Calibrate the median residual norm leaving the target layer(s).
@@ -40,10 +39,13 @@ spec.
 
 | kind | fields | effect |
 |---|---|---|
-| `neuron_write` | `layer`, `neuron`, `sign`, `dose`, `scale` | add `sign × dose × scale / ‖W_down[:,n]‖` to the neuron activation before `down_proj` |
+| `neuron_write` | `layer`, `neuron`, `expert`, `sign`, `dose`, `scale` | add `sign × dose × scale / ‖W_down[:,n]‖` to the neuron activation before `down_proj` (dense/shared) or the corrected residual write (Gemma) |
 | `direction` | `layer`, `vector`, `sign`, `dose`, `normalize`, `scale` | add `sign × dose × scale × unit(vector)` to the residual leaving `layer` |
 | `alpha_scale` | `layer`, `neuron`, `dose` | multiply one neuron’s activation by `dose` |
 | `ablation` | `layer`, `neuron` | set one neuron’s activation to zero |
+
+`expert` is optional: an integer targets a routed expert in a stacked
+`experts.down_proj`; `"shared"` targets `mlp.shared_expert.down_proj`.
 
 `positions` is `all` (default) or `last`. `last` edits only the final position
 of each forward pass, which is the decision token during prefill and the new
@@ -115,13 +117,18 @@ Use the same dose and norm with:
 
 - `neuron_write` uses `get_mlp_down_proj`, which covers `down_proj`,
   `c_proj`, `fc2`, and shared experts.
-- Routed-expert write-vector steering is not implemented in this slice. For a
-  routed-only MoE, use a residual `direction` or the MoE capture/routing tools.
-- Gemma applies a post-feedforward norm after the MLP. The true residual write
-  direction is the normed column, not the raw `down_proj` column.
-  `neuron_write` raises `NotImplementedError` for post-FFN-norm layers; use
-  `direction` for Gemma residual steering until the write-column correction is
-  implemented.
+- Routed experts: set `expert=<int>` for models with stacked
+  `experts.down_proj` of shape `(n_experts, hidden, intermediate)`. The write
+  vector is added after the gate, only on tokens where that expert is active.
+  ModuleList-style experts and post-FFN-norm MoE blocks are not implemented.
+- Shared experts: set `expert="shared"` to target
+  `mlp.shared_expert.down_proj`.
+- Gemma applies a post-feedforward norm after the MLP. `neuron_write` uses
+  `residual_write_vector`, which applies the post-FFN norm scale, then injects
+  at the post-FFN norm output and divides by the learned layer scalar. The raw
+  `write_vector` remains available for inspection.
+- Gemma 3 uses the `1 + weight` norm scale; Gemma 4 uses `weight`. This follows
+  the public neuron-explorer write-column convention.
 - The hook is inference-time only; no weights are modified.
 
 ## No-op gate

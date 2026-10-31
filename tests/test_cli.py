@@ -573,6 +573,50 @@ class TestSteerCommand:
         assert data["calls"] > 0
         assert data["injected_norms"][0] == pytest.approx(0.5 * data["scale"])
 
+    def test_cmd_steer_moe_expert(self, monkeypatch, tmp_path):
+        import sys
+
+        from hprobes import cli
+        from test_probe import TOK
+        from test_steering import _FakeMoEModel
+
+        model = _FakeMoEModel()
+        monkeypatch.setattr(cli, "_load_model", lambda args: (TOK, model))
+
+        out = tmp_path / "steer_moe"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hprobes",
+                "steer",
+                "--model",
+                "fake/moe",
+                "--prompt",
+                "hello",
+                "--kind",
+                "neuron_write",
+                "--layer",
+                "0",
+                "--neuron",
+                "1",
+                "--expert",
+                "0",
+                "--dose",
+                "1.0",
+                "--max-new-tokens",
+                "2",
+                "--output",
+                str(out),
+            ],
+        )
+        cli.main()
+
+        data = json.loads(out.with_suffix(".json").read_text())
+        assert data["expert"] == 0
+        assert data["calls"] > 0
+        assert data["injected_norms"][0] > 0
+
 
 class TestMoeExpertsImplementation:
     def test_parser_default_and_override(self, monkeypatch):

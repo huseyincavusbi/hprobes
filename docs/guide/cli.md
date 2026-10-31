@@ -215,6 +215,7 @@ hprobes steer \
 | `--kind` | `neuron_write` | `neuron_write`, `direction`, `alpha_scale`, `ablation` |
 | `--layer` | required | Target layer index |
 | `--neuron` | — | Neuron index for neuron kinds |
+| `--expert` | — | Routed expert index or `shared` for MoE neuron_write |
 | `--vector` | — | 1-D `.npy`/JSON direction for `direction` |
 | `--dose` | `1.0` | Dose |
 | `--sign` | `1` | `+1` or `-1` |

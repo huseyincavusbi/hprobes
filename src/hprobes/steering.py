@@ -8,7 +8,7 @@ forward hooks and are active only inside a :class:`SteeringController` context.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 import torch
 
@@ -26,14 +26,45 @@ def _as_tensor(output: Any) -> torch.Tensor:
     return output
 
 
-def write_vector(model: torch.nn.Module, layer: int, neuron: int) -> torch.Tensor:
-    """Return one MLP neuron's write column as a CPU float32 vector.
+def write_vector(
+    model: torch.nn.Module,
+    layer: int,
+    neuron: int,
+    expert: Optional[Union[int, str]] = None,
+) -> torch.Tensor:
+    """Return one MLP neuron's raw write column as a CPU float32 vector.
 
-    Works for dense MLPs (``down_proj`` / ``c_proj`` / ``fc2``) and shared
-    experts. Routed-expert steering is not implemented in this slice.
+    ``expert=None`` targets a dense MLP or a shared-expert fallback.
+    ``expert="shared"`` targets ``mlp.shared_expert.down_proj``.
+    An integer targets a routed expert in a stacked ``experts.down_proj``
+    parameter of shape ``(n_experts, hidden, intermediate)``.
     """
-    down_proj = get_mlp_down_proj(model, layer)
-    weight = getattr(down_proj, "weight", None)
+    block = _get_transformer_layers(model)[layer]
+    mlp = getattr(block, "mlp", None)
+    down_proj = None
+    weight = None
+
+    if expert == "shared":
+        shared = getattr(mlp, "shared_expert", None)
+        down_proj = getattr(shared, "down_proj", None)
+    elif isinstance(expert, int):
+        experts = getattr(mlp, "experts", None)
+        stacked = getattr(experts, "down_proj", None)
+        if stacked is None or stacked.dim() != 3:
+            raise NotImplementedError(
+                "routed expert steering requires stacked experts.down_proj "
+                "with shape (n_experts, hidden, intermediate)"
+            )
+        if expert < 0 or expert >= stacked.shape[0]:
+            raise IndexError(
+                f"expert {expert} out of range for layer {layer} (n_experts {stacked.shape[0]})"
+            )
+        weight = stacked[expert]
+    else:
+        down_proj = get_mlp_down_proj(model, layer)
+
+    if weight is None:
+        weight = getattr(down_proj, "weight", None)
     if weight is None or weight.dim() != 2:
         raise ValueError(
             f"down projection at layer {layer} has no 2-D weight; got {type(down_proj).__name__}"
@@ -43,6 +74,82 @@ def write_vector(model: torch.nn.Module, layer: int, neuron: int) -> torch.Tenso
             f"neuron {neuron} out of range for layer {layer} (width {weight.shape[1]})"
         )
     return weight[:, neuron].detach().float().cpu()
+
+
+def _down_proj_for(
+    model: torch.nn.Module, layer: int, expert: Optional[Union[int, str]] = None
+) -> torch.nn.Module:
+    if expert is None:
+        return get_mlp_down_proj(model, layer)
+    if expert == "shared":
+        block = _get_transformer_layers(model)[layer]
+        shared = getattr(getattr(block, "mlp", None), "shared_expert", None)
+        down_proj = getattr(shared, "down_proj", None)
+        if down_proj is None:
+            raise NotImplementedError(f"layer {layer} has no shared_expert.down_proj")
+        return down_proj
+    raise ValueError("routed experts use the expert forward hook, not down_proj")
+
+
+def _model_type_name(model: torch.nn.Module) -> str:
+    config = getattr(model, "config", None)
+    name = str(getattr(config, "model_type", "") or "")
+    text_config = getattr(config, "text_config", None)
+    text_name = str(getattr(text_config, "model_type", "") or "")
+    return f"{name} {text_name}".lower()
+
+
+def _post_ffn_scale(model: torch.nn.Module, block: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Return the post-feedforward norm scale for Gemma-style layers."""
+    norm = getattr(block, "post_feedforward_layernorm", None)
+    weight = getattr(norm, "weight", None)
+    if weight is None:
+        return None
+    scale = weight.detach().float().cpu()
+    class_name = type(block).__name__.lower()
+    name = _model_type_name(model)
+    if "gemma4" in name or "gemma4" in class_name:
+        return scale
+    if "gemma" in name or "gemma" in class_name:
+        return 1.0 + scale
+    return scale
+
+
+def _layer_scalar(block: torch.nn.Module) -> float:
+    scalar = getattr(block, "layer_scalar", None)
+    if scalar is None or getattr(scalar, "numel", lambda: 0)() != 1:
+        return 1.0
+    value = float(scalar.detach().float().cpu())
+    return value if value != 0 else 1.0
+
+
+def residual_write_vector(
+    model: torch.nn.Module,
+    layer: int,
+    neuron: int,
+    expert: Optional[Union[int, str]] = None,
+) -> torch.Tensor:
+    """Return the write vector that reaches the residual stream.
+
+    For standard pre-norm MLPs this is the raw ``W_down[:, n]`` column. For
+    Gemma-style layers it applies the post-feedforward norm scale. The learned
+    layer scalar is applied separately at injection time.
+    """
+    block = _get_transformer_layers(model)[layer]
+    if expert is not None and _post_ffn_scale(model, block) is not None:
+        raise NotImplementedError(
+            "expert write steering is not implemented for post-FFN-norm layers"
+        )
+    vector = write_vector(model, layer, neuron, expert=expert)
+    scale = _post_ffn_scale(model, block)
+    if scale is None:
+        return vector
+    if scale.numel() != vector.numel():
+        raise ValueError(
+            f"post-FFN scale width {scale.numel()} does not match write vector "
+            f"width {vector.numel()}"
+        )
+    return scale * vector
 
 
 def contrastive_direction(
@@ -129,11 +236,13 @@ class SteeringSpec:
     """One steering intervention.
 
     ``neuron_write`` adds ``sign * dose * scale / ||W_down[:, n]||`` to the
-    neuron's activation before ``down_proj`` (which is equivalent to adding
-    the normalized write vector to the MLP output). ``direction`` adds
+    neuron's activation before ``down_proj`` on standard pre-norm MLPs. On
+    post-FFN-norm layers (Gemma) it injects the corrected residual write vector
+    at the post-FFN norm output. ``direction`` adds
     ``sign * dose * scale * unit(vector)`` to the residual leaving ``layer``.
     ``alpha_scale`` multiplies one neuron's activation by ``dose``;
-    ``ablation`` sets it to zero.
+    ``ablation`` sets it to zero. For MoE, ``expert`` selects a routed expert
+    (stacked ``experts.down_proj``) or ``"shared"``.
     """
 
     kind: SteeringKind
@@ -141,6 +250,7 @@ class SteeringSpec:
     dose: float = 1.0
     sign: int = 1
     neuron: Optional[int] = None
+    expert: Optional[Union[int, str]] = None
     vector: Optional[torch.Tensor] = None
     positions: SteeringPosition = "all"
     normalize: SteeringNormalize = "unit"
@@ -163,6 +273,11 @@ class SteeringSpec:
             raise ValueError(f"{self.kind} requires neuron")
         if self.kind == "direction" and self.vector is None:
             raise ValueError("direction requires vector")
+        if self.expert is not None:
+            if self.kind != "neuron_write":
+                raise ValueError("expert is only supported for neuron_write")
+            if not (isinstance(self.expert, int) or self.expert == "shared"):
+                raise ValueError("expert must be an int or 'shared'")
 
 
 class SteeringController:
@@ -194,23 +309,37 @@ class SteeringController:
             return
 
         block = _get_transformer_layers(self.model)[spec.layer]
-        if spec.kind == "neuron_write" and hasattr(block, "post_feedforward_layernorm"):
-            raise NotImplementedError(
-                "neuron_write is not implemented for post-FFN-norm layers (Gemma); "
-                "use kind='direction' for residual steering"
-            )
-
-        down_proj = get_mlp_down_proj(self.model, spec.layer)
         neuron = int(spec.neuron)  # type: ignore[arg-type]
+        if spec.kind == "neuron_write" and isinstance(spec.expert, int):
+            self._register_routed_expert_write(spec, block)
+            return
         if spec.kind == "neuron_write":
-            weight = write_vector(self.model, spec.layer, neuron)
-            weight_norm = weight.norm()
-            if not torch.isfinite(weight_norm) or weight_norm == 0:
+            vector = residual_write_vector(self.model, spec.layer, neuron, expert=spec.expert)
+            vector_norm = vector.norm()
+            if not torch.isfinite(vector_norm) or vector_norm == 0:
                 raise ValueError(f"invalid write vector at L{spec.layer} N{neuron}")
-            delta = spec.sign * spec.dose * self._scale_for(spec) / weight_norm
-            self.injected_norms.append(abs(float(delta)) * float(weight_norm))
+            delta = spec.sign * spec.dose * self._scale_for(spec) / vector_norm * vector
 
-            def pre_hook(module, args, delta=delta, neuron=neuron, positions=spec.positions):
+            if _post_ffn_scale(self.model, block) is not None:
+                delta = delta / _layer_scalar(block)
+                self.injected_norms.append(spec.dose * self._scale_for(spec))
+                self._register_residual(block.post_feedforward_layernorm, delta, spec.positions)
+                return
+
+            down_proj = _down_proj_for(self.model, spec.layer, spec.expert)
+            # Standard pre-norm MLP: adding to the neuron activation before
+            # down_proj is equivalent to adding delta * W_down[:, n] to the
+            # MLP output.
+            activation_delta = spec.sign * spec.dose * self._scale_for(spec) / vector_norm
+            self.injected_norms.append(abs(float(activation_delta)) * float(vector_norm))
+
+            def pre_hook(
+                module,
+                args,
+                delta=activation_delta,
+                neuron=neuron,
+                positions=spec.positions,
+            ):
                 z = args[0].clone()
                 if z.dim() == 3:
                     if positions == "last":
@@ -224,25 +353,76 @@ class SteeringController:
                 self.calls += 1
                 return (z,) + tuple(args[1:])
 
-        else:
-            alpha = 0.0 if spec.kind == "ablation" else float(spec.dose)
-            self.injected_norms.append(0.0)
+            self.handles.append(down_proj.register_forward_pre_hook(pre_hook))
+            return
 
-            def pre_hook(module, args, alpha=alpha, neuron=neuron, positions=spec.positions):
-                z = args[0].clone()
-                if z.dim() == 3:
-                    if positions == "last":
-                        z[:, -1, neuron] *= alpha
-                    else:
-                        z[..., neuron] *= alpha
-                elif z.dim() == 2:
-                    z[:, neuron] *= alpha
+        down_proj = _down_proj_for(self.model, spec.layer, spec.expert)
+        alpha = 0.0 if spec.kind == "ablation" else float(spec.dose)
+        self.injected_norms.append(0.0)
+
+        def pre_hook(module, args, alpha=alpha, neuron=neuron, positions=spec.positions):
+            z = args[0].clone()
+            if z.dim() == 3:
+                if positions == "last":
+                    z[:, -1, neuron] *= alpha
                 else:
-                    raise RuntimeError(f"unexpected down_proj input shape: {tuple(z.shape)}")
-                self.calls += 1
-                return (z,) + tuple(args[1:])
+                    z[..., neuron] *= alpha
+            elif z.dim() == 2:
+                z[:, neuron] *= alpha
+            else:
+                raise RuntimeError(f"unexpected down_proj input shape: {tuple(z.shape)}")
+            self.calls += 1
+            return (z,) + tuple(args[1:])
 
         self.handles.append(down_proj.register_forward_pre_hook(pre_hook))
+
+    def _register_routed_expert_write(self, spec: SteeringSpec, block: torch.nn.Module) -> None:
+        if _post_ffn_scale(self.model, block) is not None:
+            raise NotImplementedError(
+                "expert write steering is not implemented for post-FFN-norm layers"
+            )
+        experts = getattr(getattr(block, "mlp", None), "experts", None)
+        stacked = getattr(experts, "down_proj", None)
+        if stacked is None or stacked.dim() != 3:
+            raise NotImplementedError(
+                "routed expert steering requires stacked experts.down_proj "
+                "with shape (n_experts, hidden, intermediate)"
+            )
+        expert = int(spec.expert)  # type: ignore[arg-type]
+        neuron = int(spec.neuron)  # type: ignore[arg-type]
+        vector = write_vector(self.model, spec.layer, neuron, expert=expert)
+        vector_norm = vector.norm()
+        if not torch.isfinite(vector_norm) or vector_norm == 0:
+            raise ValueError(f"invalid expert write vector at L{spec.layer} E{expert} N{neuron}")
+        delta = spec.sign * spec.dose * self._scale_for(spec) / vector_norm * vector
+        self.injected_norms.append(float(delta.norm()))
+
+        def hook(module, args, output, delta=delta, expert=expert):
+            hidden = _as_tensor(output).clone()
+            if hidden.dim() != 2:
+                raise RuntimeError(
+                    "routed expert steering expects a 2-D experts output "
+                    f"(n_tokens, hidden); got {tuple(hidden.shape)}"
+                )
+            if len(args) < 2 or not torch.is_tensor(args[1]):
+                raise RuntimeError("experts forward must expose top_k_index as its second argument")
+            top_k = args[1]
+            mask = top_k == expert
+            if mask.dim() > 1:
+                mask = mask.any(dim=-1)
+            if spec.positions == "last":
+                last = torch.zeros_like(mask)
+                last[-1] = True
+                mask = mask & last
+            if mask.any():
+                key = delta.to(device=hidden.device, dtype=hidden.dtype)
+                hidden[mask] += key
+            self.calls += 1
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+
+        self.handles.append(experts.register_forward_hook(hook))
 
     def _register_direction(self, spec: SteeringSpec) -> None:
         vector = spec.vector
@@ -256,11 +436,13 @@ class SteeringController:
             vector = vector / norm
         delta = spec.sign * spec.dose * self._scale_for(spec) * vector
         self.injected_norms.append(float(delta.norm()))
-
         blocks = _get_transformer_layers(self.model)
-        block = blocks[spec.layer]
+        self._register_residual(blocks[spec.layer], delta, spec.positions)
 
-        def hook(module, args, output, delta=delta, positions=spec.positions):
+    def _register_residual(
+        self, block: torch.nn.Module, delta: torch.Tensor, positions: SteeringPosition
+    ) -> None:
+        def hook(module, args, output, delta=delta, positions=positions):
             hidden = _as_tensor(output).clone()
             if hidden.dim() == 3:
                 if positions == "last":

@@ -1235,11 +1235,17 @@ def cmd_steer(args: argparse.Namespace) -> None:
     }
     if args.neuron is not None:
         spec_kwargs["neuron"] = args.neuron
+    if args.expert is not None:
+        spec_kwargs["expert"] = args.expert
     if args.vector:
         spec_kwargs["vector"] = _load_steering_vector(args.vector)
-    spec = SteeringSpec(**spec_kwargs)
+    try:
+        spec = SteeringSpec(**spec_kwargs)
+        controller = SteeringController(model, [spec])
+    except (ValueError, IndexError, NotImplementedError) as exc:
+        raise SystemExit(f"steer: {exc}")
 
-    with SteeringController(model, [spec]) as controller:
+    with controller:
         with torch.inference_mode():
             steered = model.generate(
                 **inputs,
@@ -1266,6 +1272,7 @@ def cmd_steer(args: argparse.Namespace) -> None:
             "kind": args.kind,
             "layer": args.layer,
             "neuron": args.neuron,
+            "expert": args.expert,
             "dose": args.dose,
             "sign": args.sign,
             "positions": args.positions,
@@ -1610,6 +1617,21 @@ def _parse_top_k(value: str):
         raise argparse.ArgumentTypeError(f"invalid --top-k value: {value!r} (use an int or 'auto')")
     if parsed < 0:
         raise argparse.ArgumentTypeError(f"--top-k must be >= 0 or 'auto', got {parsed}")
+    return parsed
+
+
+def _parse_expert(value: str):
+    """Parse --expert: non-negative int or 'shared'."""
+    if isinstance(value, str) and value.strip().lower() == "shared":
+        return "shared"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --expert value: {value!r} (use a non-negative int or 'shared')"
+        )
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"--expert must be >= 0 or 'shared', got {parsed}")
     return parsed
 
 
@@ -2024,6 +2046,12 @@ def main() -> None:
     )
     steer_p.add_argument("--layer", type=int, required=True, help="Target layer index")
     steer_p.add_argument("--neuron", type=int, default=None, help="Target neuron index")
+    steer_p.add_argument(
+        "--expert",
+        type=_parse_expert,
+        default=None,
+        help="Routed expert index or 'shared' for MoE neuron_write",
+    )
     steer_p.add_argument(
         "--vector",
         default=None,
