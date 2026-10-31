@@ -27,6 +27,7 @@ dependencies = [
 Homepage = "https://github.com/huseyincavusbi/hprobes"
 Repository = "https://github.com/huseyincavusbi/hprobes"
 Issues = "https://github.com/huseyincavusbi/hprobes/issues"
+Paper = "https://arxiv.org/abs/2609.29781"
 
 [dependency-groups]
 dev = [
