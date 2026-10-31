@@ -145,6 +145,8 @@ hprobes moe \
 | `--fusion` | `concat` | `concat` = neuron features + routing indicators; `neuron` = neuron features only |
 | `--no-routing-baseline` | off | Skip the routing-only control probe fitted alongside the main probe |
 | `--normalize-write` | off | Divide features by the layer's total FFN write norm at the decision token, mirroring dense CETT |
+| `--stability` | off | Full-pipeline bootstrap: resample samples, rebuild the MoE design, refit L1, report named-feature stability |
+| `--stability-n-jobs` | legacy heuristic | Bootstrap concurrency: int, `auto`, or omit for the legacy heuristic |
 | `--routing-analysis` | off | After fitting: routing-vs-correctness analysis — per-layer usage deltas with permutation nulls, gate entropy, routing churn, and the CETT × routing cross-check (one extra forward per sample) |
 | `--n-perm` | `200` | Permutations for the `--routing-analysis` nulls |
 | `--counterfactual` | off | After fitting: counterfactual routing — matched-donor rescue/corruption, frequency-matched random control, self-swap no-op gate (many extra forwards; bound the sweep with `--doses`) |
@@ -156,9 +158,15 @@ hprobes moe \
 | `--readout` | `logits` | `fit_moe` labels from the decision-token logits; any other value is rejected |
 | `--no-predictions` | off (predictions are written) | Skip the per-sample predictions sidecar |
 
-Dense-only validation options (`--alphas`, `--l2`, `--stability`, `--correlation`,
+Dense-only validation options (`--alphas`, `--l2`, `--correlation`,
 `--cluster`, `--random-baseline`) are accepted for CLI parity but do not run in MoE mode;
 passing one prints a note and the flag is ignored.
+
+`--stability` runs a full-pipeline MoE bootstrap: each replicate resamples samples with
+replacement, rebuilds the two-stage design (per-expert scoring + top-n + global top-k),
+refits the same L1, and records the selected feature names. The result includes
+`neurons_per_run`, `neurons_consistent_all_runs`, Jaccard min/max/mean, and
+`per_run_feature_sets`.
 
 ### Output
 

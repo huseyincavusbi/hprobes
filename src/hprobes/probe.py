@@ -1539,6 +1539,8 @@ class HProbes:
         routing_baseline: bool = True,
         fusion: str = "concat",
         normalize_write: bool = False,
+        stability: Optional[bool] = None,
+        stability_runs: int = 5,
     ) -> "HProbes":
         """Discover H-Neurons on MoE models via active-only per-expert CETT (#41).
 
@@ -1560,6 +1562,9 @@ class HProbes:
         samples (features = per-token expert indicators at the decision
         token); ``fusion="concat"`` also fits the fused neuron+routing probe.
         Results land in ``self.moe_``.
+
+        ``stability`` enables the full-pipeline bootstrap (#72); ``None`` uses
+        the probe's constructor setting. ``stability_runs`` defaults to 5.
         """
         from .moe import (
             _MOE_SCORES,
@@ -1573,6 +1578,9 @@ class HProbes:
             raise ValueError(f"score must be one of {_MOE_SCORES}, got {score!r}")
         if top_k < 0:
             raise ValueError("top_k must be non-negative (0 = all features)")
+        if stability_runs < 1:
+            raise ValueError(f"stability_runs must be >= 1, got {stability_runs}")
+        do_stability = self.stability if stability is None else bool(stability)
 
         from .cett import _get_transformer_layers
 
@@ -1716,6 +1724,9 @@ class HProbes:
             validation_split=self.validation_split,
             seed=self.seed,
             fusion=fusion,
+            stability=do_stability,
+            stability_runs=stability_runs,
+            stability_n_jobs=self.stability_n_jobs,
         )
         if routing_baseline:
             self.moe_["routing_baseline"] = fit_moe_probe(

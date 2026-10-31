@@ -497,7 +497,7 @@ class TestMoeCommand:
                 "--no-routing-baseline",
                 "--fusion",
                 "neuron",
-                "--stability",
+                "--l2",
                 "--routing-analysis",
                 "--n-perm",
                 "10",
@@ -511,7 +511,7 @@ class TestMoeCommand:
         cli.main()
 
         out_text = capsys.readouterr().out
-        assert "--stability (dense-only; ignored in MoE mode)" in out_text
+        assert "--l2 (dense-only; ignored in MoE mode)" in out_text
 
         data = json.loads(out.with_suffix(".json").read_text())
         assert data["mode"] == "moe"
