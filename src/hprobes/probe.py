@@ -36,6 +36,17 @@ _NOT_FITTED_MSG = "Call fit() before using this method."
 _MCQ_LETTERS = list("ABCDEFGHIJ")
 
 
+def _welford_update_state(
+    n: int, mean: np.ndarray, M2: np.ndarray, vec: np.ndarray
+) -> Tuple[int, np.ndarray, np.ndarray]:
+    """Update Welford state in place; shared by serial and sharded extraction."""
+    n += 1
+    delta = vec.astype(np.float64) - mean
+    mean += delta / n
+    M2 += delta * (vec.astype(np.float64) - mean)
+    return n, mean, M2
+
+
 def _normalize_text(text: str) -> str:
     """Lowercase and strip punctuation/whitespace for option-text matching."""
     cleaned = re.sub(r"[^a-z0-9 ]+", " ", str(text).lower())
@@ -889,6 +900,51 @@ class HProbes:
         artifact.validate()
         return artifact
 
+    def extract_features_parallel(
+        self,
+        samples: List[Dict],
+        model_factory: Callable[[str], Tuple[torch.nn.Module, Any]],
+        world_size: Optional[int] = None,
+        devices: Optional[List[str]] = None,
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        prompt_fn: Optional[Callable[[Dict], str]] = None,
+        answer_cue: str = "\n\nAnswer:",
+        label_fn: Optional[Callable[[str, str, Dict], int]] = None,
+    ) -> CETTRows:
+        """Extract CETT rows with one model replica per process/device (#25).
+
+        ``model_factory(device)`` must return ``(model, tokenizer)`` and be
+        picklable (a top-level function or ``functools.partial``); it is called
+        once per worker. Sharding is deterministic (``samples[i::world_size]``)
+        and the merged artifact is reconstructed in global sample order, so
+        ``world_size=2`` matches ``world_size=1`` row-for-row at
+        ``batch_size=1``.
+
+        ``world_size=None`` uses one worker per visible CUDA device, or serial
+        extraction when no CUDA device is available. Use a config-only parent
+        probe (``HProbes(None, None, ...)``) so the parent model does not stay
+        resident while worker replicas load.
+        """
+        from .parallel import run_parallel_extraction
+
+        return run_parallel_extraction(
+            self,
+            samples,
+            model_factory,
+            world_size,
+            devices,
+            {
+                "question_key": question_key,
+                "options_key": options_key,
+                "answer_key": answer_key,
+                "prompt_fn": prompt_fn,
+                "answer_cue": answer_cue,
+                "label_fn": label_fn,
+            },
+        )
+
     def fit_on_features(
         self,
         artifact: CETTRows,
@@ -1123,6 +1179,36 @@ class HProbes:
             label_fn=label_fn,
         )
         return self.fit_on_features(artifact, options_key=options_key)
+
+    def fit_parallel(
+        self,
+        samples: List[Dict],
+        model_factory: Callable[[str], Tuple[torch.nn.Module, Any]],
+        world_size: Optional[int] = None,
+        devices: Optional[List[str]] = None,
+        *,
+        top_k: Optional[int] = None,
+        question_key: str = "question",
+        options_key: str = "options",
+        answer_key: str = "answer",
+        prompt_fn: Optional[Callable[[Dict], str]] = None,
+        answer_cue: str = "\n\nAnswer:",
+        label_fn: Optional[Callable[[str, str, Dict], int]] = None,
+    ) -> "HProbes":
+        """Sharded extraction followed by central fitting (#25)."""
+        artifact = self.extract_features_parallel(
+            samples,
+            model_factory,
+            world_size=world_size,
+            devices=devices,
+            question_key=question_key,
+            options_key=options_key,
+            answer_key=answer_key,
+            prompt_fn=prompt_fn,
+            answer_cue=answer_cue,
+            label_fn=label_fn,
+        )
+        return self.fit_on_features(artifact, options_key=options_key, top_k=top_k)
 
     def extract_features_from_responses(
         self,
@@ -3709,7 +3795,6 @@ class HProbes:
         return None
 
     def _welford_update(self, vec: np.ndarray):
-        self._welford_n += 1
-        delta = vec.astype(np.float64) - self._welford_mean
-        self._welford_mean += delta / self._welford_n
-        self._welford_M2 += delta * (vec.astype(np.float64) - self._welford_mean)
+        self._welford_n, self._welford_mean, self._welford_M2 = _welford_update_state(
+            self._welford_n, self._welford_mean, self._welford_M2, vec
+        )
